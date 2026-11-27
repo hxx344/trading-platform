@@ -112,7 +112,7 @@
 只在替身应答与真实 systemd 的一次性 runner 上验证过，没有接过真实账户。用户在服务器上执行 `sudo bash install.sh --set-dex-keys` 录入后确认，结果回填本节与 [dexspread.md](dexspread.md)：
 
 - 实盘准备页「场所账户」变为已就绪，「账户资金」里三个场所的可用余额、权益、持仓数与各场所官方页面一致。
-- Lighter RH 的保证金是否就是 USDG 余额；Hyperliquid 统一账户模式下按盘 `io` 读到的保证金是否等于可用于 Entropy 的资金。
+- Lighter RH 的保证金是否就是 USDG 余额；Hyperliquid 统一账户模式下按盘 `io` 读到的保证金是否等于可用于 Entropy 的资金（**2026-11-27 已在主网公开接口核实**：`io` 盘保证金币种确为 USDC；`unifiedAccount` 模式下可用资金与权益存放在统一账本 `spotClearinghouseState` 的 USDC 中，`clearinghouseState(dex: 'io')` 无持仓时返回 `0.0`、有持仓时 `withdrawable` 也常为 `0.0`。已在 `v0.108.1` 按 `userAbstraction` 分流读取修复，见 [dexspread.md](dexspread.md) 第 15 节；Lighter RH 仍待实测）。
 - 录入、修改、移除时只有 DEX 价差服务重启，其他页面不断线；手动删除 `keys.env` 后一分钟内准备页显示账户已停用。
 
 ## 待实测：DEX 价差实盘下单（dexspread.md 第 13 节，v0.102.0）

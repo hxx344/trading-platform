@@ -276,9 +276,13 @@ const fetchImpl = async (input: string | URL | Request, init?: RequestInit): Pro
   }
   if (url.includes('hyperliquid.xyz/info') && typeof init?.body === 'string') {
     const req = JSON.parse(init.body) as { type?: string };
+    if (req.type === 'userAbstraction') return Response.json('unifiedAccount');
+    if (req.type === 'spotClearinghouseState') {
+      return Response.json({ balances: [{ coin: 'USDC', token: 0, total: '512.40', hold: '32.30' }, { coin: 'HYPE', token: 150, total: '0.02', hold: '0' }] });
+    }
     if (req.type === 'clearinghouseState') {
       return Response.json({
-        marginSummary: { accountValue: '512.40', totalMarginUsed: '18.20' }, withdrawable: '480.10',
+        marginSummary: { accountValue: '0.0', totalMarginUsed: '18.20' }, withdrawable: '0.0',
         assetPositions: [{ type: 'oneWay', position: { coin: 'io:NVDA', szi: '-0.2', positionValue: '36.40', entryPx: '183.50', unrealizedPnl: '0.30', liquidationPx: '240.00', leverage: { type: 'isolated', value: 5 } } }],
       });
     }

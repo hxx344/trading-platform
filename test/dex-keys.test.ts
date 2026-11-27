@@ -9,7 +9,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DEX_KEYS_ENV, configuredVenues, decodeDexKeysFile, decodeDexKeysValue, encodeDexKeys, guardedAccounts, parseDexAccounts, takeDexKeys, type DexAccounts, type DexAccountsState } from '../src/dex/keys.ts';
 import { parseKeysInput, planKeys, readKeysFile, writeKeysFile } from '../src/dex/keys-setup.ts';
-import { fetchAccount, parseEntropyAccount, parseLighterAccount } from '../src/varlighter/accounts.ts';
+import { fetchAccount, parseEntropyAccount, parseEntropyUnifiedBalance, parseLighterAccount } from '../src/varlighter/accounts.ts';
 import { ACCOUNT_STALE_MS, READY_FUNDING_USD, createVarLighterEngine } from '../src/varlighter/engine.ts';
 import { openVarLighterStore } from '../src/varlighter/store.ts';
 import type { SocketLike } from '../src/varlighter/feeds.ts';
@@ -162,14 +162,79 @@ test('账户应答解析：只留非零持仓，账户身份对不上或缺字�
   assert.throws(() => parseEntropyAccount({ ...entropyAnswer(), assetPositions: [{ position: null }] }), /持仓格式无效/);
 });
 
+test('统一账户现货账本解析：提取 USDC 可用余额与非零资产，缺条目按零处理，格式异常或负值拒绝', () => {
+  assert.deepEqual(
+    parseEntropyUnifiedBalance({
+      balances: [
+        { coin: 'USDC', token: 0, total: '1000.10000064', hold: '0.0', entryNtl: '0.0' },
+        { coin: 'HYPE', token: 150, total: '0.00189129', hold: '0.0' },
+        { coin: 'DUST', token: 7, total: '0', hold: '0' },
+      ],
+    }),
+    {
+      collateral: 1000.10000064,
+      available: 1000.10000064,
+      assets: [
+        { symbol: 'USDC', balance: 1000.10000064, locked: 0 },
+        { symbol: 'HYPE', balance: 0.00189129, locked: 0 },
+      ],
+    },
+  );
+  assert.deepEqual(
+    parseEntropyUnifiedBalance({ balances: [{ coin: 'USDC', token: 0, total: '1000', hold: '250.5' }] }),
+    { collateral: 1000, available: 749.5, assets: [{ symbol: 'USDC', balance: 1000, locked: 250.5 }] },
+  );
+  assert.deepEqual(
+    parseEntropyUnifiedBalance({ balances: [{ coin: 'USDC', token: 0, total: '100', hold: '120' }] }),
+    { collateral: 100, available: 0, assets: [{ symbol: 'USDC', balance: 100, locked: 120 }] },
+    '冻结大于总额时可用余额钳制为 0',
+  );
+  assert.deepEqual(
+    parseEntropyUnifiedBalance({ balances: [{ coin: 'USDT0', token: 268, total: '500', hold: '0' }, { coin: 'HYPE', token: 150, total: '2', hold: '0.5' }] }),
+    { collateral: 0, available: 0, assets: [{ symbol: 'USDT0', balance: 500, locked: 0 }, { symbol: 'HYPE', balance: 2, locked: 0.5 }] },
+  );
+  assert.deepEqual(parseEntropyUnifiedBalance({ balances: [] }), { collateral: 0, available: 0, assets: [] });
+
+  const manyTokens = Array.from({ length: 205 }, (_, i) => ({ coin: `T${i + 1}`, token: i + 1, total: '1', hold: '0' }));
+  manyTokens.push({ coin: 'USDC', token: 0, total: '88', hold: '8' });
+  const capped = parseEntropyUnifiedBalance({ balances: manyTokens });
+  assert.equal(capped.collateral, 88);
+  assert.equal(capped.available, 80);
+  assert.equal(capped.assets.length, 200);
+  assert.deepEqual(capped.assets[0], { symbol: 'USDC', balance: 88, locked: 8 });
+
+  for (const bad of [
+    null,
+    {},
+    { balances: null },
+    { balances: [null] },
+    { balances: [{ coin: 'USDC', token: 0, total: '10', hold: '0' }, { coin: 'USDC', token: 0, total: '20', hold: '0' }] },
+    { balances: [{ coin: 'USDT0', token: 0, total: '100', hold: '0' }] },
+    { balances: [{ coin: 'USDC', token: 0, total: '', hold: '0' }] },
+    { balances: [{ coin: 'USDC', token: 0, total: '10', hold: 'bad' }] },
+    { balances: [{ coin: 'USDC', token: 0, total: '-1', hold: '0' }] },
+    { balances: [{ coin: 'USDC', token: 0, total: '10', hold: '-0.1' }] },
+  ]) {
+    assert.throws(() => parseEntropyUnifiedBalance(bad), /统一账户/);
+  }
+});
+
 const silent = (): SocketLike => { const s: SocketLike = { readyState: 0, onopen: null, onmessage: null, onclose: null, onerror: null, send() {}, close() { s.readyState = 3; } }; return s; };
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } });
 
-test('账户读取：Lighter 两套账户走各自的接口，Entropy 的地址放在请求体里', async () => {
+test('账户读取：Lighter 两套账户走各自的接口，Entropy 按账户模式读取且地址放在请求体里', async () => {
   const seen: { url: string; body: string | null }[] = [];
+  let mode: unknown = 'default';
   const fetchImpl = (async (url: string, init: RequestInit) => {
-    seen.push({ url, body: typeof init.body === 'string' ? init.body : null });
-    return url.includes('hyperliquid') ? json(entropyAnswer()) : json(lighterAnswer(url.includes('api.rh.') ? ALL.rh!.accountIndex : ALL.lighter!.accountIndex));
+    const rawBody = typeof init.body === 'string' ? init.body : null;
+    seen.push({ url, body: rawBody });
+    if (url.includes('hyperliquid')) {
+      const req = JSON.parse(rawBody ?? '{}') as { type?: string };
+      if (req.type === 'clearinghouseState') return json(entropyAnswer());
+      if (req.type === 'userAbstraction') return json(mode);
+      throw new Error(`不应请求 ${req.type}`);
+    }
+    return json(lighterAnswer(url.includes('api.rh.') ? ALL.rh!.accountIndex : ALL.lighter!.accountIndex));
   }) as unknown as typeof fetch;
   const signal = new AbortController().signal;
   assert.equal((await fetchAccount(fetchImpl, signal, 'lighter', ALL)).available, 250.5);
@@ -179,9 +244,72 @@ test('账户读取：Lighter 两套账户走各自的接口，Entropy 的地址�
     { url: 'https://mainnet.zklighter.elliot.ai/api/v1/account?by=index&value=12345', body: null },
     { url: 'https://api.rh.lighter.xyz/api/v1/account?by=index&value=281474976710654', body: null },
     { url: 'https://api.hyperliquid.xyz/info', body: JSON.stringify({ type: 'clearinghouseState', user: ADDRESS.toLowerCase(), dex: 'io' }) },
+    { url: 'https://api.hyperliquid.xyz/info', body: JSON.stringify({ type: 'userAbstraction', user: ADDRESS.toLowerCase() }) },
   ]);
+  mode = 'disabled';
+  assert.equal((await fetchAccount(fetchImpl, signal, 'entropy', ALL)).available, 80);
   await assert.rejects(fetchAccount(fetchImpl, signal, 'rh', { lighter: ALL.lighter }), /没有配置账户/);
-  assert.equal(seen.length, 3, '没有配置的场所不发请求');
+  assert.equal(seen.length, 6, '没有配置的场所不发请求');
+});
+
+test('Entropy 统一账户读取与模式拒绝：unifiedAccount 从现货账本取余额并保留 io 持仓，非支持模式与读取失败均拒绝', async () => {
+  const calls: string[] = [];
+  let mode: unknown = 'unifiedAccount';
+  let spotResponse: () => Response = () => json({
+    balances: [
+      { coin: 'USDC', token: 0, total: '1000.1', hold: '140.35' },
+      { coin: 'HYPE', token: 150, total: '0.5', hold: '0' },
+    ],
+  });
+  let modeResponse: () => Response = () => json(mode);
+  const fetchImpl = (async (_url: string, init: RequestInit) => {
+    const req = JSON.parse(String(init.body)) as { type: string };
+    calls.push(req.type);
+    if (req.type === 'clearinghouseState') {
+      return json({
+        marginSummary: { accountValue: '0.0', totalNtlPos: '52.5', totalRawUsd: '0.0', totalMarginUsed: '10' },
+        withdrawable: '0.0',
+        assetPositions: [{ type: 'oneWay', position: { coin: 'io:NVDA', szi: '-0.3', positionValue: '52.5' } }],
+      });
+    }
+    if (req.type === 'userAbstraction') return modeResponse();
+    if (req.type === 'spotClearinghouseState') return spotResponse();
+    return json({}, 404);
+  }) as unknown as typeof fetch;
+  const signal = new AbortController().signal;
+
+  const snap = await fetchAccount(fetchImpl, signal, 'entropy', ALL);
+  assert.deepEqual(calls, ['clearinghouseState', 'userAbstraction', 'spotClearinghouseState']);
+  assert.equal(snap.collateral, 1000.1);
+  assert.equal(snap.equity, 1000.1);
+  assert.equal(snap.available, 859.75);
+  assert.equal(snap.marginUsed, 10);
+  assert.equal(snap.positions.length, 1);
+  assert.equal(snap.positions[0]!.symbol, 'io:NVDA');
+  assert.deepEqual(snap.assets, [{ symbol: 'USDC', balance: 1000.1, locked: 140.35 }, { symbol: 'HYPE', balance: 0.5, locked: 0 }]);
+
+  for (const [badMode, expected] of [
+    ['portfolioMargin', /portfolioMargin/],
+    ['dexAbstraction', /dexAbstraction/],
+    ['futureMode', /暂不支持的 Entropy 账户模式（futureMode）/],
+    [null, /模式应答格式无效/],
+    [123, /模式应答格式无效/],
+  ] as const) {
+    calls.length = 0;
+    mode = badMode;
+    await assert.rejects(fetchAccount(fetchImpl, signal, 'entropy', ALL), expected);
+    assert.equal(calls.includes('spotClearinghouseState'), false, `模式 ${String(badMode)} 不应请求现货账本`);
+  }
+
+  mode = 'unifiedAccount';
+  spotResponse = () => json({}, 500);
+  await assert.rejects(fetchAccount(fetchImpl, signal, 'entropy', ALL), /HTTP 500/);
+
+  spotResponse = () => json({ balances: 'bad' });
+  await assert.rejects(fetchAccount(fetchImpl, signal, 'entropy', ALL), /统一账户应答格式无效/);
+
+  modeResponse = () => json({}, 500);
+  await assert.rejects(fetchAccount(fetchImpl, signal, 'entropy', ALL), /HTTP 500/);
 });
 
 test('实盘准备页：没有录入时待接入；录入后显示各场所余额，余额不足、读数过期、文件被删都不算就绪', async t => {
@@ -189,11 +317,21 @@ test('实盘准备页：没有录入时待接入；录入后显示各场所余�
   let clock = Date.parse('2026-11-27T15:00:00Z');
   let state: DexAccountsState = { accounts: {}, problem: null };
   let entropyAvailable = '80.0', failing = false;
+  let entropyMode: unknown = 'default';
+  let entropyClearinghouse: () => unknown = () => entropyAnswer(entropyAvailable);
+  let entropySpot: () => unknown = () => ({ balances: [{ coin: 'USDC', token: 0, total: '1000.10', hold: '0.0' }] });
   const requests: string[] = [];
-  const fetchImpl = (async (url: string) => {
+  const fetchImpl = (async (url: string, init: RequestInit) => {
     requests.push(url);
     if (failing) return json({}, 500);
-    return url.includes('hyperliquid') ? json(entropyAnswer(entropyAvailable)) : json(lighterAnswer(url.includes('api.rh.') ? ALL.rh!.accountIndex : ALL.lighter!.accountIndex));
+    if (url.includes('hyperliquid')) {
+      const req = JSON.parse(String(init.body)) as { type: string };
+      if (req.type === 'clearinghouseState') return json(entropyClearinghouse());
+      if (req.type === 'userAbstraction') return json(entropyMode);
+      if (req.type === 'spotClearinghouseState') return json(entropySpot());
+      return json({}, 404);
+    }
+    return json(lighterAnswer(url.includes('api.rh.') ? ALL.rh!.accountIndex : ALL.lighter!.accountIndex));
   }) as unknown as typeof fetch;
   const engine = createVarLighterEngine({ store: openVarLighterStore(path.join(dir, 'varlighter.sqlite')), fetchImpl, connect: silent, now: () => clock, accounts: () => state });
   t.after(() => { engine.close(); rmSync(dir, { recursive: true, force: true }); });
@@ -218,7 +356,7 @@ test('实盘准备页：没有录入时待接入；录入后显示各场所余�
   assert.equal(item('funding').status, 'warn');
   assert.match(item('funding').detail, /Lighter 还没有读到；Entropy 还没有读到/);
   await engine.refreshAccounts(() => signal);
-  assert.equal(requests.length, 2);
+  assert.equal(requests.length, 3);
   assert.match(item('funding').detail, /^Lighter 可用 250\.50、权益 300\.25 USDC，持仓 1 个；Entropy 可用 80\.00、权益 120\.50 USDC，持仓 1 个；可用余额至少 100 才算就绪，未达到：Lighter RH、Entropy$/);
   const text = JSON.stringify(engine.views.readiness());
   assert.ok(!text.includes('12345') && !text.includes(ADDRESS.toLowerCase().slice(2)), '页面与只读接口不带账户编号和地址');
@@ -269,4 +407,22 @@ test('实盘准备页：没有录入时待接入；录入后显示各场所余�
   assert.equal(requests.length, before, '吊销后不再发请求');
   state = { accounts: ALL, problem: null };
   assert.match(item('funding').detail, /Lighter 还没有读到/, '吊销期间清掉了旧读数');
+
+  // 统一账户模式：io 盘返回 0 时从现货账本读出 USDC 余额；不支持的模式在读数过期后降级告警。
+  entropyMode = 'unifiedAccount';
+  entropyClearinghouse = () => ({ marginSummary: { accountValue: '0.0', totalMarginUsed: '0' }, withdrawable: '0.0', assetPositions: [] });
+  await engine.refreshAccounts(() => signal);
+  assert.equal(item('accounts').status, 'ok');
+  assert.equal(item('funding').status, 'ok');
+  assert.match(item('funding').detail, /Entropy 可用 1000\.10、权益 1000\.10 USDC，持仓 0 个/);
+
+  entropyMode = 'portfolioMargin';
+  clock += ACCOUNT_STALE_MS;
+  await engine.refreshAccounts(() => signal);
+  assert.equal(item('funding').status, 'ok', '旧读数仍在时限内');
+  clock += 1;
+  assert.equal(item('funding').status, 'warn');
+  assert.match(item('funding').detail, /portfolioMargin/);
+  assert.equal(item('accounts').status, 'warn');
+  assert.match(item('accounts').detail, /读不到 Entropy（/);
 });

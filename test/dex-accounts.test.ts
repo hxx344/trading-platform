@@ -269,6 +269,7 @@ test('引擎与接口：汇总完整性、凭据切换使在途读取失效（L0
     if (url.includes('hyperliquid.xyz/info')) {
       const body = JSON.parse(String(init.body)) as { type: string };
       if (body.type === 'clearinghouseState') return json({ marginSummary: { accountValue: '200', totalMarginUsed: '20' }, withdrawable: '180', assetPositions: [{ type: 'oneWay', position: { coin: 'io:NVDA', szi: '-0.5', positionValue: '90', unrealizedPnl: '-2' } }] });
+      if (body.type === 'userAbstraction') return json('default');
       if (body.type === 'userFillsByTime') return json([{ tid: 9, coin: 'io:NVDA', px: '180', sz: '0.5', side: 'A', dir: 'Open Short', crossed: true, fee: '0.04', feeToken: 'USDC', closedPnl: '0', time: clock - 1000 }]);
       if (body.type === 'userFunding') return json([{ time: clock - 500, hash: '0x9', delta: { type: 'funding', coin: 'io:NVDA', usdc: '0.02', szi: '-0.5', fundingRate: '0.0001' } }]);
     }
@@ -348,6 +349,7 @@ test('L049：慢应答时账户资产与历史时间戳均记录请求发起时�
     if (body.type === 'clearinghouseState') {
       return json({ marginSummary: { accountValue: '150', totalMarginUsed: '0' }, withdrawable: '150', assetPositions: [] });
     }
+    if (body.type === 'userAbstraction') return json('default');
     return json([]);
   }) as unknown as typeof fetch;
   const store = openVarLighterStore(path.join(dir, 'varlighter.sqlite'));
@@ -419,6 +421,7 @@ test('并发竞争与下采样：每场所序号防止旧读取/旧失败覆盖�
         if (entropyHold) await new Promise<void>(resolve => { releaseEntropy = resolve; });
         return json({ marginSummary: { accountValue: '250', totalMarginUsed: '0' }, withdrawable: '250', assetPositions: [] });
       }
+      if (body.type === 'userAbstraction') return json('default');
       if (body.type === 'userFillsByTime') {
         entropyHistCall++;
         const callNo = entropyHistCall;
@@ -476,4 +479,59 @@ test('并发竞争与下采样：每场所序号防止旧读取/旧失败覆盖�
   const afterKeyRemoval = engine.views.accounts();
   assert.equal(afterKeyRemoval.venues.find(item => item.venue === 'lighter')!.configured, false);
   assert.equal(afterKeyRemoval.venues.find(item => item.venue === 'entropy')!.equity, 250, '移除 lighter 凭据不丢弃无关场所 entropy 的在途读取');
+});
+
+test('账户资产视图：Entropy 统一账户从现货账本汇总权益、可用余额与现货明细，写入快照且不泄露地址', async t => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'dex-acc-unified-'));
+  let clock = T0;
+  const fetchImpl = (async (url: string, init: RequestInit) => {
+    if (url.includes('hyperliquid.xyz/info')) {
+      const body = JSON.parse(String(init.body)) as { type: string };
+      if (body.type === 'clearinghouseState') {
+        return json({
+          marginSummary: { accountValue: '0.0', totalMarginUsed: '20' },
+          withdrawable: '0.0',
+          assetPositions: [{ type: 'oneWay', position: { coin: 'io:NVDA', szi: '-0.5', positionValue: '90', unrealizedPnl: '-2' } }],
+        });
+      }
+      if (body.type === 'userAbstraction') return json('unifiedAccount');
+      if (body.type === 'spotClearinghouseState') {
+        return json({
+          balances: [
+            { coin: 'USDC', token: 0, total: '1000.10', hold: '140.35' },
+            { coin: 'HYPE', token: 150, total: '0.5', hold: '0' },
+          ],
+        });
+      }
+      if (body.type === 'userFillsByTime' || body.type === 'userFunding') return json([]);
+    }
+    return json({}, 404);
+  }) as unknown as typeof fetch;
+
+  const store = openVarLighterStore(path.join(dir, 'varlighter.sqlite'));
+  const engine = createVarLighterEngine({
+    store, fetchImpl, connect: silent, now: () => clock,
+    accounts: () => ({ accounts: { entropy: { address: ADDRESS } }, problem: null }),
+    signerProblem: () => null,
+  });
+  t.after(() => { engine.close(); rmSync(dir, { recursive: true, force: true }); });
+  const signalFor = () => new AbortController().signal;
+
+  await engine.refreshAccounts(signalFor);
+  clock += ACCOUNT_SNAPSHOT_GAP_MS;
+  await engine.refreshAccounts(signalFor);
+
+  const view = engine.views.accounts();
+  const entropy = view.venues.find(item => item.venue === 'entropy')!;
+  assert.equal(entropy.configured, true);
+  assert.equal(entropy.error, null);
+  assert.equal(entropy.equity, 1000.1);
+  assert.equal(entropy.collateral, 1000.1);
+  assert.equal(entropy.available, 859.75);
+  assert.equal(entropy.marginUsed, 20);
+  assert.equal(entropy.positionsCount, 1);
+  assert.deepEqual(entropy.assets, [{ symbol: 'USDC', balance: 1000.1, locked: 140.35 }, { symbol: 'HYPE', balance: 0.5, locked: 0 }]);
+  assert.equal(view.equityCurve.length, 2);
+  assert.deepEqual(view.equityCurve.map(point => point.equity), [1000.1, 1000.1]);
+  assert.equal(JSON.stringify(view).toLowerCase().includes(ADDRESS.slice(2).toLowerCase()), false, '账户资产视图不得泄露钱包地址');
 });

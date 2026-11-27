@@ -1,5 +1,5 @@
-// 实盘场所账户的只读与历史读取（docs/dexspread.md 第 12、14 节）：保证金、权益、可用余额、持仓、成交、资金费与盈亏曲线。
-// 账户余额/持仓及 Entropy 历史均为公开接口，只需要账户编号或地址；Lighter 成交、资金费与盈亏需要 API 凭据鉴权令牌。
+// 实盘场所账户的只读与历史读取（docs/dexspread.md 第 12、14、15 节）：保证金、权益、可用余额、持仓、成交、资金费与盈亏曲线。
+// 账户余额/持仓及 Entropy 历史均为公开接口，只需要账户编号或地址（Entropy 会按 userAbstraction 区分标准与统一账户）；Lighter 成交、资金费与盈亏需要 API 凭据鉴权令牌。
 // 应答里的账户身份与请求的不一致时按读取失败处理，不采用；错误文本统一经 scrub 脱敏，不泄露编号、地址或密钥。
 import type { DexAccounts, KeyVenue } from '../dex/keys.ts';
 import { ENTROPY_ENDPOINTS, LIGHTER_ENDPOINTS, readJson, type FetchLike } from './feeds.ts';
@@ -217,6 +217,46 @@ export function parseEntropyAccount(value: unknown): AccountSnapshot {
   return { collateral, available, positions, equity: collateral, marginUsed, unrealizedPnl, assets: [] };
 }
 
+const ENTROPY_SEPARATE_MODES = new Set(['default', 'disabled']);
+const ENTROPY_MAX_ASSETS = 200;
+
+export function parseEntropyUnifiedBalance(value: unknown): { collateral: number; available: number; assets: AccountAsset[] } {
+  if (!isRecord(value) || !Array.isArray(value.balances)) throw new Error('统一账户应答格式无效');
+  let usdc: Record<string, unknown> | null = null;
+  const others: AccountAsset[] = [];
+  for (const item of value.balances as unknown[]) {
+    if (!isRecord(item)) throw new Error('统一账户应答的余额格式无效');
+    if (item.token === 0) {
+      if (usdc !== null || item.coin !== 'USDC') throw new Error('统一账户应答格式无效');
+      usdc = item;
+      continue;
+    }
+    if (others.length >= ENTROPY_MAX_ASSETS) continue;
+    const symbol = typeof item.coin === 'string' && item.coin.trim() ? item.coin.trim().slice(0, 40) : null;
+    if (!symbol) continue;
+    const balance = optionalNumber(item.total) ?? 0;
+    const locked = optionalNumber(item.hold) ?? 0;
+    if (balance === 0 && locked === 0) continue;
+    others.push({ symbol, balance, locked });
+  }
+  if (!usdc) return { collateral: 0, available: 0, assets: others };
+  const total = amount(usdc.total, '统一账户权益');
+  const hold = amount(usdc.hold, '统一账户冻结余额');
+  if (total < 0 || hold < 0) throw new Error('统一账户应答的余额格式无效');
+  const assets: AccountAsset[] = total === 0 && hold === 0 ? others : [{ symbol: 'USDC', balance: total, locked: hold }, ...others].slice(0, ENTROPY_MAX_ASSETS);
+  return { collateral: total, available: Math.max(0, total - hold), assets };
+}
+
+function parseEntropyMode(mode: unknown): 'separate' | 'unified' {
+  if (typeof mode !== 'string') throw new Error('Entropy 账户模式应答格式无效');
+  if (ENTROPY_SEPARATE_MODES.has(mode)) return 'separate';
+  if (mode === 'unifiedAccount') return 'unified';
+  if (mode === 'portfolioMargin') throw new Error('Entropy 账户处于组合保证金模式（portfolioMargin），暂不支持读取可用余额；请改用统一账户或标准模式');
+  if (mode === 'dexAbstraction') throw new Error('Entropy 账户处于旧版 DEX 抽象模式（dexAbstraction），暂不支持；请在 Hyperliquid 切换为统一账户或标准模式');
+  if (/^[a-zA-Z0-9_-]{1,32}$/.test(mode)) throw new Error(`暂不支持的 Entropy 账户模式（${mode}）`);
+  throw new Error('Entropy 账户模式应答格式无效');
+}
+
 export function parseEntropyTrades(value: unknown, dex: string = ENTROPY_ENDPOINTS.dex): AccountTrade[] {
   if (!Array.isArray(value)) throw new Error('Entropy 成交应答格式无效');
   const prefix = `${dex}:`;
@@ -384,7 +424,21 @@ export async function fetchAccount(fetchImpl: FetchLike, signal: AbortSignal, ve
     const account = accounts.entropy;
     if (!account) throw new Error('没有配置账户');
     // 账户地址放在请求体里，不进地址栏。
-    return parseEntropyAccount(await readJson(fetchImpl, ENTROPY_ENDPOINTS.info, signal, ACCOUNT_LIMIT, {}, { type: 'clearinghouseState', user: account.address, dex: ENTROPY_ENDPOINTS.dex }));
+    const [state, mode] = await Promise.all([
+      readJson(fetchImpl, ENTROPY_ENDPOINTS.info, signal, ACCOUNT_LIMIT, {}, { type: 'clearinghouseState', user: account.address, dex: ENTROPY_ENDPOINTS.dex }),
+      readJson(fetchImpl, ENTROPY_ENDPOINTS.info, signal, ACCOUNT_LIMIT, {}, { type: 'userAbstraction', user: account.address }),
+    ]);
+    const base = parseEntropyAccount(state);
+    if (parseEntropyMode(mode) === 'separate') return base;
+    const spot = await readJson(fetchImpl, ENTROPY_ENDPOINTS.info, signal, ACCOUNT_LIMIT, {}, { type: 'spotClearinghouseState', user: account.address });
+    const unified = parseEntropyUnifiedBalance(spot);
+    return {
+      ...base,
+      collateral: unified.collateral,
+      equity: unified.collateral,
+      available: unified.available,
+      assets: unified.assets,
+    };
   }
   const account = accounts[venue];
   if (!account) throw new Error('没有配置账户');

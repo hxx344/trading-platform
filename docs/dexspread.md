@@ -563,7 +563,7 @@ DEX 这一步在 `activate` 里的位置是：**执行面健康之后、控制�
 **账户只读**（`src/varlighter/accounts.ts`）：
 
 - Lighter 主网与 RH：`GET /api/v1/account?by=index&value=<编号>`，公开接口，不需要签名。应答里的账户编号与请求的不一致时拒绝采用。
-- Entropy：`POST /info`，`{ type: 'clearinghouseState', user, dex: 'io' }`，同样公开。
+- Entropy：`POST /info`，`{ type: 'clearinghouseState', user, dex: 'io' }`，同样公开（统一账户模式的后续适配见第 15 节）。
 - 引擎每 60 秒读一次，三个场所并行、各用各的 20 秒时限（一个场所不应答不影响另外两个），三分钟没读到算过期。读到的只有保证金、可用余额、持仓，放在内存里，不落库。
 - 编号与地址不进准备页的视图、只读令牌的输出、日志与报错：视图里只有场所名、余额与持仓数。
 
@@ -582,7 +582,7 @@ DEX 这一步在 `activate` 里的位置是：**执行面健康之后、控制�
 
 **待实测**（[live-results.md](live-results.md)）：
 
-- Hyperliquid 统一账户模式下，按盘（`dex: 'io'`）读到的保证金是否等于可用于 Entropy 的资金。
+- Hyperliquid 统一账户模式下，按盘（`dex: 'io'`）读到的保证金是否等于可用于 Entropy 的资金（已实测证实不等：无持仓时返回 `0.0`、有持仓时 `withdrawable` 仍常为 `0.0`，由第 15 节修复）。
 - RH 账户接口的 `collateral` 是否就是 USDG 余额；Lighter 对已平仓市场返回的空仓条目长什么样（解析已先跳过数量为零的条目）。
 - 三个账户接口在服务器出口上的限流余量（每分钟各一次，远低于 12.2 的限额）。
 
@@ -704,3 +704,20 @@ DEX 这一步在 `activate` 里的位置是：**执行面健康之后、控制�
 - **测试**：`test/dex-accounts.test.ts`（完整账户解析、Entropy `io:` 过滤与有界翻页/截断、Lighter 归属/角色/`fee` 口径/401 重试/无鉴权零请求、SQLite 快照按哈希隔离与清理、汇总完整性、L089 在途失效、10 秒刷新冷却、隐私脱敏与只读令牌拒绝）、`test/dex-keys.test.ts`、`web/test/varlighter-form.test.mjs`。
 - **浏览器**：`scripts/dev-varlighter.ts` 替身后端 1280×800 与 390×844 走查（见 [frontend.md](frontend.md)）。
 - **审查记录**：[reviews/2026-11-27-dexspread-accounts.md](reviews/2026-11-27-dexspread-accounts.md)。
+
+## 15 Entropy 统一账户余额读取（R3，v0.108.1，回滚版本 v0.108.0）
+
+2026-11-27 实测 Hyperliquid 公开接口确认：当 Entropy 账户启用统一账户模式（`unifiedAccount`）时，闲置 USDC 集中存放在统一账本（`spotClearinghouseState` 的 `token === 0`），按 HIP-3 盘查 `clearinghouseState(dex: 'io')` 在无持仓时 `accountValue` 与 `withdrawable` 均返回 `0.0`，有持仓时 `withdrawable` 也常为 `0.0`。因此准备页「两边账户资金」、实盘开仓前余额校验与「账户资产」页签都会把统一账户误判为可用 `0.00 USDC`。
+
+- **要改变的用户可见行为**：`src/varlighter/accounts.ts` 的 `fetchAccount` 读取 Entropy 账户时，使用同一超时信号并行读取 `clearinghouseState(dex: 'io')` 与 `userAbstraction`：
+  - `default` / `disabled`（标准分账模式）：沿用原口径，直接返回 `io` 盘 `clearinghouseState` 的权益、可用余额与持仓。
+  - `unifiedAccount`（统一账户模式）：再以同一信号读取 `spotClearinghouseState`，从中提取 `USDC`（`token === 0`）的 `total` 作为 `collateral` 与 `equity`、`Math.max(0, total - hold)` 作为 `available`（并提取非零现货余额进 `assets` 供账户资产页展示）；`positions`、`marginUsed`、`unrealizedPnl` 仍取自 `io` 盘 `clearinghouseState`。
+  - `portfolioMargin`（组合保证金）、`dexAbstraction`（旧版 DEX 抽象）与未识别模式：直接读取失败并给出明确原因，不静默返回 `0.00`；实盘准备页与账户资产页照既有时限降级提示，开仓前检查照常拦截。
+- **影响面**：改动仅涉及 `src/varlighter/accounts.ts`、对应单元测试（`test/dex-keys.test.ts`、`test/dex-accounts.test.ts`）、本地预览脚本 `scripts/dev-varlighter.ts` 及文档；不改动 `live.ts`、`engine.ts`、实盘下单签名与平仓路径、凭据文件格式、`varlighter.sqlite` 库结构、前端组件与部署安装脚本。
+- **失败与回滚**：
+  - `userAbstraction`、`clearinghouseState` 或统一账户下的 `spotClearinghouseState` 任一失败或字段无效（包括 `token === 0` 重复、币种非 `USDC`、负值）时整个读取失败，不回退使用 `0.00` 或旧值覆盖时限之外的状态。
+  - 回滚版本为 `v0.108.0`：库结构与配置无变更，直接回退即可。
+- **本次不做**：
+  - 不对 `portfolioMargin` 做多币种抵押率/可借余额换算；暂不读取或折算 `USDT0` 作为 `io` 盘保证金（`meta(dex: 'io')` 核实 `collateralToken` 为 `0` 即 `USDC`）。
+  - 不改变实盘下单/平仓/对账状态机。
+- **验证**：`test/dex-keys.test.ts`（`parseEntropyUnifiedBalance` 正常/空条目/超 200 项截断/异常拒绝、`default`/`disabled`/`unifiedAccount` 读取、`portfolioMargin`/`dexAbstraction`/未知模式/现货账本失败拒绝、准备页端到端）；`test/dex-accounts.test.ts`（统一账户资产视图、快照写入与 D4 不泄露地址）；审查记录见 [reviews/2026-11-27-entropy-unified-account.md](reviews/2026-11-27-entropy-unified-account.md)。

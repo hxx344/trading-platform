@@ -1,6 +1,6 @@
 /* 复制自 project-aggregation 工作台 modules/crossex/src/position-actions.css（提交 7745181）。规则内容不改；只保留本页用到的规则，
-   整份包在 .aster-desk .crossex-page 里（:root / body 改为 &），只作用于 CrossEx 页。 */
-.aster-desk .crossex-page {
+   整份包在 .crossex-page 里（:root / body 改为 &），只作用于 CrossEx 页。 */
+.crossex-page {
 .position-action-dialog{width:min(790px,calc(100vw - 36px))}
 .position-action-dialog .dialog-content{display:grid;gap:18px;min-width:0}
 .position-action-current,.position-action-input,.position-action-estimates{display:grid;gap:12px;min-width:0}

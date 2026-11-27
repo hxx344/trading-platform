@@ -1,8 +1,9 @@
 // 实盘（docs/dexspread.md 第 13 节）：按场所录入下单凭据、实盘总开关与配对、限额、实盘持仓与成交。
 // 凭据只往服务器写、不回读：页面只知道每个场所「已录入」与否，输入框提交后立即清空。
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { KeyRound, LoaderCircle, Play, Save, Trash2, X } from 'lucide-react';
 import { api } from '../api.ts';
+import { useDialogGuard } from '../AppDialog.tsx';
 import { Callout, StatePanel, TableEmpty } from '../StateViews.tsx';
 import { useLiveResource } from '../use-live-resource.ts';
 import type { LiveLimits, LivePosition, LiveState } from '../../../src/varlighter/live.ts';
@@ -50,19 +51,27 @@ export function VarLighterLive({ onExpired }: { onExpired: () => void }) {
 }
 
 function ResumeBar({ view, onChanged }: { view: LiveView; onChanged: () => Promise<void> }) {
+  const dialog = useDialogGuard();
+  const haltRef = useRef(view.halt);
+  haltRef.current = view.halt;
   const write = useWrite();
-  const resume = () => {
-    if (!confirm('确认已在交易所核对过账户持仓，恢复实盘开仓？')) return;
+  const writeBusyRef = useRef(write.busy);
+  writeBusyRef.current = write.busy;
+  const resume = async () => {
+    if (writeBusyRef.current !== null || !haltRef.current) return;
+    if (!await dialog.confirm('确认已在交易所核对过账户持仓，恢复实盘开仓？', { title: '恢复实盘开仓', confirmLabel: '确认恢复', tone: 'danger' })) return;
+    if (!dialog.isAlive() || writeBusyRef.current !== null || !haltRef.current) return;
     void write.run('resume', () => api(`${LIVE_PATH}/resume`, { body: {} }), () => { void onChanged(); return '实盘已恢复'; });
   };
   return <Callout tone="error">实盘已停止，不再开新仓：{view.halt}
-    <div className="vl-live-inline"><button type="button" className="button secondary" disabled={write.busy !== null} onClick={resume}>{write.busy ? <LoaderCircle size={14} className="spin" aria-hidden="true" /> : <Play size={14} aria-hidden="true" />}核对后恢复</button>
+    <div className="vl-live-inline"><button type="button" className="button secondary" disabled={write.busy !== null} onClick={() => void resume()}>{write.busy ? <LoaderCircle size={14} className="spin" aria-hidden="true" /> : <Play size={14} aria-hidden="true" />}核对后恢复</button>
       {write.message ? <span className={write.message.tone === 'success' ? 'muted' : 'vl-down'}>{write.message.text}</span> : null}</div>
   </Callout>;
 }
 
 /** 总开关、实盘配对与限额：一起保存。 */
 function SwitchPanel({ view, onChanged }: { view: LiveView; onChanged: () => Promise<void> }) {
+  const dialog = useDialogGuard();
   const write = useWrite();
   const saved = view.settings;
   const savedText = JSON.stringify(saved);
@@ -72,6 +81,14 @@ function SwitchPanel({ view, onChanged }: { view: LiveView; onChanged: () => Pro
   // 服务端的设置变了（别处保存、或本次保存成功）时用新值重填。
   useEffect(() => { if (savedText !== base) { setPairs(saved.pairs); setLimits(limitsForm(saved.limits)); setBase(savedText); } }, [savedText, base, saved]);
   const parsed = parseLimits(limits);
+  const pairsRef = useRef(pairs);
+  pairsRef.current = pairs;
+  const parsedRef = useRef(parsed);
+  parsedRef.current = parsed;
+  const savedOnRef = useRef(saved.on);
+  savedOnRef.current = saved.on;
+  const writeBusyRef = useRef(write.busy);
+  writeBusyRef.current = write.busy;
   const known = new Set(view.candidates.map(item => item.key));
   const gone = pairs.filter(key => !known.has(key));
   const dirty = JSON.stringify([...pairs].sort()) !== JSON.stringify(saved.pairs) || (parsed.ok && JSON.stringify(parsed.value) !== JSON.stringify(saved.limits)) || !parsed.ok;
@@ -79,11 +96,20 @@ function SwitchPanel({ view, onChanged }: { view: LiveView; onChanged: () => Pro
   // 总开关只在点「打开实盘」「关闭实盘」时才提交；保存配对与限额不带它，免得用几秒前的视图把别处刚改的开关改回去。
   const send = (body: Record<string, unknown>, done: string) => { void write.run('settings', () => api(`${LIVE_PATH}/settings`, { body }), () => { void onChanged(); return done; }); };
   const save = (done: string) => { if (parsed.ok) send({ pairs, limits: parsed.value }, done); };
-  const turnOn = () => {
-    if (!pairs.length) return;
-    const lines = pairs.map(key => `${pairLabel(key).symbol}（${pairLabel(key).short}）`).join('、');
-    if (!confirm(`打开实盘？打开后，下列配对的模拟盘每次开仓，都会在两个交易所下真实订单：${lines}。单笔不超过 ${limits.perTradeUsd} 美元，同时不超过 ${limits.maxOpen} 笔。`)) return;
-    if (parsed.ok) send({ on: true, pairs, limits: parsed.value }, '实盘已打开：跟随模拟盘信号下真实订单');
+  const turnOn = async () => {
+    if (!pairs.length || !parsed.ok || writeBusyRef.current !== null) return;
+    const confirmedPairs = [...pairs];
+    const confirmedLimits = parsed.value;
+    const samePairs = (a: readonly string[], b: readonly string[]) => JSON.stringify([...a].sort()) === JSON.stringify([...b].sort());
+    const lines = confirmedPairs.map(key => `${pairLabel(key).symbol}（${pairLabel(key).short}）`).join('、');
+    if (!await dialog.confirm(`打开实盘？打开后，下列配对的模拟盘每次开仓，都会在两个交易所下真实订单：${lines}。单笔不超过 ${limits.perTradeUsd} 美元，同时不超过 ${limits.maxOpen} 笔。`, { title: '确认打开实盘', confirmLabel: '确认打开', tone: 'danger' })) return;
+    if (!dialog.isAlive() || writeBusyRef.current !== null || savedOnRef.current) return;
+    const latestPairs = pairsRef.current, latestParsed = parsedRef.current;
+    if (!latestParsed.ok || !samePairs(latestPairs, confirmedPairs) || JSON.stringify(latestParsed.value) !== JSON.stringify(confirmedLimits)) {
+      void dialog.alert('实盘配对或限额在确认期间已更新，已取消打开，请核对后再试', { title: '配置已变更', tone: 'warning' });
+      return;
+    }
+    send({ on: true, pairs: confirmedPairs, limits: confirmedLimits }, '实盘已打开：跟随模拟盘信号下真实订单');
   };
   return <section className="panel" aria-label="实盘开关">
     <div className="panel-heading"><h2>实盘</h2><span className="muted">跟随模拟盘：模拟盘在勾选的配对上开仓、平仓时，两个交易所同步下真实订单</span></div>
@@ -91,7 +117,7 @@ function SwitchPanel({ view, onChanged }: { view: LiveView; onChanged: () => Pro
       {saved.on ? view.halt ? <Badge tone="bad">已停止</Badge> : <Badge tone="ok">实盘运行中</Badge> : <Badge tone="warn">实盘关闭</Badge>}
       {saved.on
         ? <button type="button" className="button secondary" disabled={write.busy !== null} onClick={() => send({ on: false }, '实盘已关闭：不再开新仓，已有实盘持仓仍会跟随模拟盘平仓')}>关闭实盘</button>
-        : <button type="button" className="button primary" disabled={write.busy !== null || !parsed.ok || !pairs.length} onClick={turnOn}><Play size={14} aria-hidden="true" />打开实盘</button>}
+        : <button type="button" className="button primary" disabled={write.busy !== null || !parsed.ok || !pairs.length} onClick={() => void turnOn()}><Play size={14} aria-hidden="true" />打开实盘</button>}
       <span className="muted">{saved.on ? '关闭只停开新仓，已有实盘持仓照常跟随平仓' : pairs.length ? '打开前先确认两边账户有足够保证金' : '先在下面勾选实盘配对'}</span>
     </div>
     <section className="vl-metrics" aria-label="实盘汇总">
@@ -143,10 +169,15 @@ function KeysPanel({ view, onChanged }: { view: LiveView; onChanged: () => Promi
   </section>;
 }
 function KeyForm({ venue, configured, onChanged }: { venue: KeyVenue; configured: boolean; onChanged: () => Promise<void> }) {
+  const dialog = useDialogGuard();
+  const configuredRef = useRef(configured);
+  configuredRef.current = configured;
   const spec = KEY_FIELDS[venue];
   const empty = Object.fromEntries(spec.fields.map(field => [field.key, ''])) as Record<string, string>;
   const [form, setForm] = useState(empty);
   const write = useWrite();
+  const writeBusyRef = useRef(write.busy);
+  writeBusyRef.current = write.busy;
   const filled = spec.fields.every(field => form[field.key]!.trim());
   const submit = () => {
     const body = { venue, ...Object.fromEntries(spec.fields.map(field => [field.key, form[field.key]!.trim()])) };
@@ -154,8 +185,10 @@ function KeyForm({ venue, configured, onChanged }: { venue: KeyVenue; configured
     setForm(value => ({ ...value, privateKey: '' }));
     void write.run('set', () => api(`${LIVE_PATH}/keys`, { body }), () => { setForm(empty); void onChanged(); return `${spec.title} 的凭据已保存`; });
   };
-  const remove = () => {
-    if (!confirm(`移除 ${spec.title} 的下单凭据？移除后这个场所不能再下单。`)) return;
+  const remove = async () => {
+    if (writeBusyRef.current !== null || !configuredRef.current) return;
+    if (!await dialog.confirm(`移除 ${spec.title} 的下单凭据？移除后这个场所不能再下单。`, { title: '移除下单凭据', confirmLabel: '确认移除', tone: 'danger' })) return;
+    if (!dialog.isAlive() || writeBusyRef.current !== null || !configuredRef.current) return;
     void write.run('remove', () => api(`${LIVE_PATH}/keys/remove`, { body: { venue } }), () => { void onChanged(); return `${spec.title} 的凭据已移除`; });
   };
   return <form className="vl-live-key" autoComplete="off" onSubmit={event => { event.preventDefault(); if (filled && write.busy === null) submit(); }}>
@@ -166,16 +199,23 @@ function KeyForm({ venue, configured, onChanged }: { venue: KeyVenue; configured
         onChange={event => setForm(value => ({ ...value, [field.key]: event.target.value }))} />{field.hint ? <small>{field.hint}</small> : null}</label>)}
     <div className="vl-live-inline">
       <button type="submit" className="button primary" disabled={!filled || write.busy !== null}>{write.busy === 'set' ? <LoaderCircle size={14} className="spin" aria-hidden="true" /> : <KeyRound size={14} aria-hidden="true" />}{configured ? '替换' : '保存'}</button>
-      {configured ? <button type="button" className="button secondary" disabled={write.busy !== null} onClick={remove}><Trash2 size={14} aria-hidden="true" />移除</button> : null}
+      {configured ? <button type="button" className="button secondary" disabled={write.busy !== null} onClick={() => void remove()}><Trash2 size={14} aria-hidden="true" />移除</button> : null}
     </div>
     {write.message ? <Callout tone={write.message.tone}>{write.message.text}</Callout> : null}
   </form>;
 }
 
 function PositionsPanel({ view, onChanged }: { view: LiveView; onChanged: () => Promise<void> }) {
+  const dialog = useDialogGuard();
+  const positionsRef = useRef(view.positions);
+  positionsRef.current = view.positions;
   const write = useWrite();
-  const close = (position: LivePosition) => {
-    if (!confirm(`在两个交易所平掉 ${pairLabel(position.symbol).symbol}（${pairLabel(position.symbol).short}）的实盘持仓？`)) return;
+  const writeBusyRef = useRef(write.busy);
+  writeBusyRef.current = write.busy;
+  const close = async (position: LivePosition) => {
+    if (writeBusyRef.current !== null || position.state !== 'open') return;
+    if (!await dialog.confirm(`在两个交易所平掉 ${pairLabel(position.symbol).symbol}（${pairLabel(position.symbol).short}）的实盘持仓？`, { title: '平掉实盘持仓', confirmLabel: '确认平仓', tone: 'danger' })) return;
+    if (!dialog.isAlive() || writeBusyRef.current !== null || !positionsRef.current.some(item => item.id === position.id && item.state === 'open')) return;
     void write.run(`close:${position.id}`, () => api(`${LIVE_PATH}/close`, { body: { id: position.id } }), () => { void onChanged(); return '已开始平仓，结果见下方'; });
   };
   const dismiss = (position: LivePosition) => {
@@ -195,7 +235,7 @@ function PositionsPanel({ view, onChanged }: { view: LiveView; onChanged: () => 
         <td className="num">{price(legQty(position, 'b'))} @ {price(avg(position.b.entryQuote, position.b.qty))}<small>{view.venueNames[position.b.venue]} {position.b.side === 'buy' ? '多' : '空'}{position.b.estimated ? ' · 估' : ''}</small></td>
         <td className="num">{duration(view.now - position.openedAt)}</td>
         <td className="wrap">{position.note || '—'}</td>
-        <td>{position.state === 'open' ? <button type="button" className="button secondary" disabled={write.busy !== null} onClick={() => close(position)}>{write.busy === `close:${position.id}` ? <LoaderCircle size={14} className="spin" aria-hidden="true" /> : <X size={14} aria-hidden="true" />}平仓</button>
+        <td>{position.state === 'open' ? <button type="button" className="button secondary" disabled={write.busy !== null} onClick={() => void close(position)}>{write.busy === `close:${position.id}` ? <LoaderCircle size={14} className="spin" aria-hidden="true" /> : <X size={14} aria-hidden="true" />}平仓</button>
           : position.state === 'stuck' ? <button type="button" className="button secondary" disabled={write.busy !== null} onClick={() => dismiss(position)}>已人工处理</button> : null}</td>
       </tr>; })}</tbody></table></div> : <TableEmpty>{view.settings.on ? '没有实盘持仓，等待模拟盘在勾选的配对上开仓' : '实盘关闭，没有实盘持仓'}</TableEmpty>}
   </section>;

@@ -1,5 +1,6 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { api, ApiError } from './api.ts';
+import { useDialogGuard } from './AppDialog.tsx';
 import { ImportPanel } from './ImportPanel.tsx';
 import { ReadTokenSettings } from './ReadTokenSettings.tsx';
 import { READ_TOKEN_PATH, READ_TOKEN_REFRESH_MS, type ReadTokenView } from './read-token-form.ts';
@@ -79,21 +80,27 @@ type SessionView = { createdAt: number; expiresAt: number | null; count: number 
 
 /** The page's own login: when it ends, and logging out here or on every device (docs/plan.md, page sessions). */
 function SessionSettings({ onExpired }: { onExpired: () => void }) {
+  const dialog = useDialogGuard();
   const { data } = useLiveResource<SessionView>('/api/session', { intervalMs: STATUS_REFRESH_MS, onExpired });
   const [busy, setBusy] = useState(false);
+  const busyRef = useRef(busy);
+  busyRef.current = busy;
   const [error, setError] = useState<string | null>(null);
   const leave = async (all: boolean) => {
-    if (all && !window.confirm(`注销全部 ${data?.count ?? ''} 个登录会话？所有浏览器（包括本页）都要重新登录。`)) return;
-    setBusy(true); setError(null);
+    if (busyRef.current) return;
+    if (all && !await dialog.confirm(`注销全部 ${data?.count ?? ''} 个登录会话？所有浏览器（包括本页）都要重新登录。`, { title: '注销全部设备', confirmLabel: '全部注销', tone: 'danger' })) return;
+    if (!dialog.isAlive() || busyRef.current) return;
+    busyRef.current = true; setBusy(true); setError(null);
     try {
       await api(all ? '/api/session/logout-all' : '/api/session/logout', { body: {} });
       window.location.assign('/');
     } catch (failure) {
+      if (!dialog.isAlive()) return;
       // Gone from the running service but not from disk: the cookie is already cleared, so the page would soon fall back
       // to the login form and hide an inline message. Say it before leaving.
-      if (failure instanceof ApiError && failure.code === 'session_not_persisted') { window.alert(failure.message); window.location.assign('/'); return; }
-      setError(errorText(failure)); setBusy(false);
-    }
+      if (failure instanceof ApiError && failure.code === 'session_not_persisted') { await dialog.alert(failure.message, { title: '会话提示', tone: 'warning' }); window.location.assign('/'); return; }
+      setError(errorText(failure));
+    } finally { busyRef.current = false; if (dialog.isAlive()) setBusy(false); }
   };
   return <section className="panel" aria-label="登录会话">
     <div className="section-head"><h2>登录会话</h2><span className="small-note">{data ? `共 ${data.count} 个会话` : '读取中'}</span></div>
@@ -112,6 +119,7 @@ export function SettingsPage({ onChanged, onExpired }: { onChanged: () => void; 
   const { data, refresh } = useLiveResource<ServiceStatus>('/api/status', { intervalMs: STATUS_REFRESH_MS, onExpired });
   const readToken = useLiveResource<ReadTokenView>(READ_TOKEN_PATH, { intervalMs: READ_TOKEN_REFRESH_MS, onExpired });
   return <div className="feature-stack">
+    <header className="wb-heading"><div><h1>设置</h1><p>工作台导入、飞书定时摘要、只读令牌与登录会话管理</p></div></header>
     <ImportPanel onImported={onChanged} />
     <SummarySettings summary={data?.summary} refresh={refresh} />
     <ReadTokenSettings resource={readToken} />

@@ -1,7 +1,8 @@
 // 实盘准备页签：上线前核对清单、全局参数与风控、自动配对的组合开关与手动配对、待确认规格的配对、各场所的采集状态。
-import { useMemo, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import { CircleAlert, CircleCheck, CircleDashed, LoaderCircle, Plus, Save, Trash2 } from 'lucide-react';
 import { api } from '../api.ts';
+import { useDialogGuard } from '../AppDialog.tsx';
 import { Callout, StatePanel, TableEmpty } from '../StateViews.tsx';
 import { useLiveResource } from '../use-live-resource.ts';
 import type { Combo, CustomPair, VenueId } from '../../../src/varlighter/model.ts';
@@ -90,20 +91,33 @@ function GlobalPanel({ view, onChanged }: { view: StateView; onChanged: () => Pr
 
 /** 自动配对：每个场所组合一个开关，开着的组合把两个场所里代码相同的市场配成一对。 */
 function CombosPanel({ view, onChanged }: { view: StateView; onChanged: () => Promise<void> }) {
+  const dialog = useDialogGuard();
   const write = useWrite();
   const combos = view.sources.combos ?? [];
+  const combosRef = useRef(combos);
+  combosRef.current = combos;
+  const settingsRef = useRef(view.settings);
+  settingsRef.current = view.settings;
+  const writeBusyRef = useRef(write.busy);
+  writeBusyRef.current = write.busy;
   const enabled = combos.filter(item => item.enabled).map(item => item.combo);
-  const toggle = (combo: Combo, on: boolean) => {
-    if (!on && !confirm(`关闭「${comboLabel(combo)}」？它的配对不再采集新样本，已采集的样本保留；还启用着或有持仓的配对须先停用并平仓。`)) return;
-    const next = on ? [...enabled, combo] : enabled.filter(item => item !== combo);
-    void write.run(`combo:${combo}`, () => api(`${VARLIGHTER_BASE}/settings`, { body: settingsBody(view.settings, { combos: next }) }),
+  const toggle = async (combo: Combo, on: boolean) => {
+    if (writeBusyRef.current !== null) return;
+    if (!on && !await dialog.confirm(`关闭「${comboLabel(combo)}」？它的配对不再采集新样本，已采集的样本保留；还启用着或有持仓的配对须先停用并平仓。`, { title: '关闭自动配对', confirmLabel: '确认关闭', tone: 'danger' })) return;
+    if (!dialog.isAlive() || writeBusyRef.current !== null) return;
+    const latestCombos = combosRef.current;
+    const latestEntry = latestCombos.find(item => item.combo === combo);
+    if (latestEntry && latestEntry.enabled === on) return;
+    const latestEnabled = latestCombos.filter(item => item.enabled).map(item => item.combo);
+    const next = on ? [...latestEnabled, combo] : latestEnabled.filter(item => item !== combo);
+    void write.run(`combo:${combo}`, () => api(`${VARLIGHTER_BASE}/settings`, { body: settingsBody(settingsRef.current, { combos: next }) }),
       () => { void onChanged(); return on ? `已开启 ${comboLabel(combo)}` : `已关闭 ${comboLabel(combo)}`; });
   };
   return <section className="panel" aria-label="自动配对">
     <div className="panel-heading"><h2>自动配对</h2><span className="muted">两个场所里代码相同的市场自动成对；只在没有组合与手动配对用到某个场所时才停采它</span></div>
     {write.message ? <div className="vl-actions"><Callout tone={write.message.tone}>{write.message.text}</Callout></div> : null}
     <ul className="vl-combos">{combos.map(item => <li key={item.combo}>
-      <label><input type="checkbox" checked={item.enabled} disabled={write.busy !== null} onChange={event => toggle(item.combo, event.target.checked)} />{comboLabel(item.combo)}</label>
+      <label><input type="checkbox" checked={item.enabled} disabled={write.busy !== null} onChange={event => void toggle(item.combo, event.target.checked)} />{comboLabel(item.combo)}</label>
       <span className="muted">{item.enabled ? `${item.pairs} 对` : '未开启'}</span>
       {write.busy === `combo:${item.combo}` ? <LoaderCircle size={14} className="spin" aria-hidden="true" /> : null}
     </li>)}</ul>
@@ -114,9 +128,16 @@ function CombosPanel({ view, onChanged }: { view: StateView; onChanged: () => Pr
 const catalogOf = (markets: Record<VenueId, CatalogEntry[]> | null, venue: VenueId) => markets?.[venue] ?? [];
 /** 手动配对：任意两个场所、任意两个代码，B 腿价格可乘一个乘数（如一股对十股、不同计价单位）。 */
 function PairsPanel({ view, markets, onChanged }: { view: StateView; markets: Record<VenueId, CatalogEntry[]> | null; onChanged: () => Promise<void> }) {
+  const dialog = useDialogGuard();
   const write = useWrite();
   const [form, setForm] = useState<CustomPairForm>(EMPTY_PAIR_FORM);
   const pairs = view.settings.pairs ?? [];
+  const pairsRef = useRef(pairs);
+  pairsRef.current = pairs;
+  const settingsRef = useRef(view.settings);
+  settingsRef.current = view.settings;
+  const writeBusyRef = useRef(write.busy);
+  writeBusyRef.current = write.busy;
   const existing = useMemo(() => [...view.rows.map(row => row.key), ...pairs.map(customPairKey)], [view.rows, pairs]);
   const parsed = customPairRequest(form, existing);
   const rowOf = (pair: CustomPair) => view.rows.find(row => row.key === customPairKey(pair)) ?? null;
@@ -124,13 +145,18 @@ function PairsPanel({ view, markets, onChanged }: { view: StateView; markets: Re
   const aMark = markOf(form.aVenue, form.aSymbol), bMark = markOf(form.bVenue, form.bSymbol);
   const ratio = Number(form.ratio);
   const gap = aMark && bMark && Number.isFinite(ratio) && ratio > 0 ? (aMark / (ratio * bMark) - 1) * 10_000 : null;
-  const save = (next: CustomPair[], done: string) => {
-    void write.run('pairs', () => api(`${VARLIGHTER_BASE}/settings`, { body: settingsBody(view.settings, { pairs: next }) }), () => { void onChanged(); return done; });
+  const save = (next: CustomPair[], done: string, targetSettings = view.settings) => {
+    void write.run('pairs', () => api(`${VARLIGHTER_BASE}/settings`, { body: settingsBody(targetSettings, { pairs: next }) }), () => { void onChanged(); return done; });
   };
   const add = () => { if (parsed.ok) save([...pairs, parsed.value], `已添加 ${customPairKey(parsed.value)}，目录里两条腿都在时开始采集`); };
-  const remove = (pair: CustomPair) => {
-    if (!confirm(`删除手动配对 ${customPairKey(pair)}？已采集的样本保留；还启用着或有持仓时须先停用并平仓。`)) return;
-    save(pairs.filter(item => customPairKey(item) !== customPairKey(pair)), `已删除 ${customPairKey(pair)}`);
+  const remove = async (pair: CustomPair) => {
+    if (writeBusyRef.current !== null) return;
+    const targetKey = customPairKey(pair);
+    if (!await dialog.confirm(`删除手动配对 ${targetKey}？已采集的样本保留；还启用着或有持仓时须先停用并平仓。`, { title: '删除手动配对', confirmLabel: '确认删除', tone: 'danger' })) return;
+    if (!dialog.isAlive() || writeBusyRef.current !== null) return;
+    const latestPairs = pairsRef.current;
+    if (!latestPairs.some(item => customPairKey(item) === targetKey)) return;
+    save(latestPairs.filter(item => customPairKey(item) !== targetKey), `已删除 ${targetKey}`, settingsRef.current);
   };
   const set = (patch: Partial<CustomPairForm>) => setForm(current => ({ ...current, ...patch }));
   const leg = (side: 'a' | 'b') => {
@@ -165,7 +191,7 @@ function PairsPanel({ view, markets, onChanged }: { view: StateView; markets: Re
         <td>{row ? <Badge tone={row.identity === 'mismatch' ? 'bad' : row.eligible ? 'ok' : 'warn'}>{row.identity === 'review' && row.eligible ? '已确认' : IDENTITY_LABELS[row.identity]}</Badge> : <Badge>目录里缺一腿</Badge>}{row?.enabled ? <Badge tone="ok">已启用</Badge> : null}</td>
         <td className="num">{row ? `${plain(row.gapBps, 0)} 基点` : '—'}</td>
         <td className="wrap">{pair.note || <span className="vl-dim">—</span>}</td>
-        <td><button type="button" className="button secondary" aria-label={`删除 ${key}`} disabled={write.busy !== null || !!row?.enabled || !!row?.position} title={row?.enabled || row?.position ? '先停用并平仓' : undefined} onClick={() => remove(pair)}><Trash2 size={14} aria-hidden="true" />删除</button></td>
+        <td><button type="button" className="button secondary" aria-label={`删除 ${key}`} disabled={write.busy !== null || !!row?.enabled || !!row?.position} title={row?.enabled || row?.position ? '先停用并平仓' : undefined} onClick={() => void remove(pair)}><Trash2 size={14} aria-hidden="true" />删除</button></td>
       </tr>; })}</tbody></table></div> : <TableEmpty>还没有手动配对。例：Var AAPL 对 Entropy AAPL 已是自动配对；不同代码或不同单位的同一资产（如 B 腿每份是 A 的十分之一，乘数填 10）在这里添加</TableEmpty>}
   </section>;
 }

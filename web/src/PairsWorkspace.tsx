@@ -181,7 +181,7 @@ export function PairsWorkspace({ state, pairId, stale, onChanged, onExpired }: {
   return <div className="feature-stack pair-workspace">
     <div className="pair-workspace-heading">
       <div>
-        <h2>两子账户配对{pair ? ` · ${pair.id}` : ''}</h2>
+        <h1>两子账户配对{pair ? ` · ${pair.id}` : ''}</h1>
         <p className="muted">两子账户保证金余额平衡 · ADL 应急处理</p>
       </div>
       {pairs.length ? <div className="account-controls">

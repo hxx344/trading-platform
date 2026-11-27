@@ -77,7 +77,7 @@ export function AssetPositions({ onExpired }: { onExpired: () => void }) {
   const invalidFilter = !!filters.exchange && !exchangeOptions.some(([id]) => id === filters.exchange) || !!filters.account && !accountOptions.some(account => account.id === filters.account);
   const issues = exchanges.some(exchange => exchange.accounts.some(account => account.scopes.some(scope => scope.status !== 'live' || oldTime(scope.fetchedAt, now))));
   return <div className="positions-page">
-    <div className="trading-toolbar"><p className="positions-readonly"><ShieldCheck size={15} /><span>资产账本已接入的持仓 · 只读查看，账户在资产页管理</span></p><button type="button" className="button secondary" onClick={() => void live.refresh()} disabled={reading || offline}>{reading ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}刷新仓位</button></div>
+    <div className="trading-toolbar"><div className="positions-title"><h1>持仓</h1><p className="positions-readonly"><ShieldCheck size={15} /><span>资产账本已接入的持仓 · 只读查看，账户在资产页管理</span></p></div><button type="button" className="button secondary" onClick={() => void live.refresh()} disabled={reading || offline}>{reading ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}刷新仓位</button></div>
     {data && error ? <Callout tone="warning">{error} 当前保留上次数据，已标记为旧值。</Callout> : null}
     {data && reading && !error ? <Callout tone="info">已显示上次读取的仓位，正在后台更新。</Callout> : null}
     {data ? <>

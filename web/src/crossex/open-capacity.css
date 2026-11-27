@@ -1,6 +1,6 @@
 /* 复制自 project-aggregation 工作台 modules/crossex/src/open-capacity.css（提交 7745181）。规则内容不改；只保留本页用到的规则，
-   整份包在 .aster-desk .crossex-page 里（:root / body 改为 &），只作用于 CrossEx 页。 */
-.aster-desk .crossex-page {
+   整份包在 .crossex-page 里（:root / body 改为 &），只作用于 CrossEx 页。 */
+.crossex-page {
 .open-capacity{grid-column:1/-1;padding:14px;border:1px solid var(--surface-5);border-left:3px solid var(--accent);border-radius:5px;background:var(--surface-1);min-width:0}
 .capacity-heading,.capacity-leg-name,.capacity-total{display:flex;justify-content:space-between;align-items:center;gap:10px}
 .capacity-heading h3{font-size:12px;color:var(--text-secondary);font-weight:600}

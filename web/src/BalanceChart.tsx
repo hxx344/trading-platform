@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useId, useMemo, useState } from 'react';
 import { Callout, StatePanel } from './StateViews.tsx';
 import { SvgPlot, type PlotLayer } from './svg-plot.tsx';
 import { niceAxis } from './svg-plot-geometry.ts';
@@ -57,7 +57,12 @@ export function BalanceChart({ pairId, onExpired }: { pairId: string; onExpired:
     const values = rows.flatMap(row => [row.long, row.short]).filter((value): value is number => value !== null && Number.isFinite(value));
     return niceAxis(Math.min(...values), Math.max(...values));
   }, [rows]);
-  const xTick = useMemo(() => xTickFor(range), [range]);
+  const fillId = useId().replace(/:/g, '');
+  const layers = useMemo<PlotLayer[]>(() => [
+    { kind: 'area', key: 'long', lower: axis.domain[0], fill: `url(#${fillId})` },
+    ...LAYERS,
+  ], [axis.domain, fillId]);
+  const fillDef = <linearGradient id={fillId} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="var(--accent)" stopOpacity={0.18} /><stop offset="100%" stopColor="var(--accent)" stopOpacity={0.01} /></linearGradient>;
   let body;
   if (!history) body = status === 'error' || status === 'offline' ? <StatePanel kind="error" title="读取余额走势失败" detail={error?.message ?? '网络离线'} /> : <StatePanel kind="loading" title="加载中…" />;
   else if (history.unavailable) body = <Callout tone="warning">{history.unavailable}</Callout>;
@@ -66,8 +71,8 @@ export function BalanceChart({ pairId, onExpired }: { pairId: string; onExpired:
     <div className="chart-legend"><span><span className="swatch long" />A 多侧可用</span><span><span className="swatch short" />B 空侧可用</span>
       <span className="muted">{history.bucketMs > history.sampleEveryMs ? `每 ${Math.round(history.bucketMs / 60_000)} 分钟取最后一次采样` : '每分钟一次采样'}；中断处断线</span></div>
     <div className="balance-chart">
-      <SvgPlot rows={rows} hoverRows={hoverRows} xDomain={[history.from, history.to]} yDomain={axis.domain} yTicks={axis.ticks} yTick={amount} xTick={xTick}
-        layers={LAYERS} margin={{ top: 10, right: 56, bottom: 30 }} label="两侧可用余额走势" height={240}
+      <SvgPlot rows={rows} hoverRows={hoverRows} xDomain={[history.from, history.to]} yDomain={axis.domain} yTicks={axis.ticks} yTick={amount} xTick={xTickFor(range)}
+        layers={layers} defs={fillDef} margin={{ top: 10, right: 56, bottom: 30 }} label="两侧可用余额走势" height={240}
         tooltip={row => <Tooltip point={(row as Plotted).point} />} />
     </div>
     {error ? <p className="err">刷新失败：{error.message}（显示的是上次结果）</p> : null}

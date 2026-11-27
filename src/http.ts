@@ -80,11 +80,31 @@ function assetWriteError(error: unknown): ContractError {
   return new ContractError(500, 'internal', '执行器内部错误');
 }
 
-const LOGIN_REQUIRED = '<!doctype html><meta charset="utf-8"><title>需要登录</title><p>请使用数据目录 access-url 中的登录链接打开（用 sudo bash install.sh --set-password 设置登录密码后可直接输入密码）。</p>';
+const LOGIN_STYLE = '<style>'
+  + '*{box-sizing:border-box}'
+  + 'body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px 16px;background:#080B0F;color:#E6EAF0;color-scheme:dark;font:14px/1.55 "Segoe UI Variable Text","Segoe UI","Microsoft YaHei UI","Microsoft YaHei","PingFang SC",sans-serif;-webkit-font-smoothing:antialiased}'
+  + '.card{width:min(360px,100%);padding:24px;border:1px solid #222B38;border-radius:10px;background:#121720;box-shadow:0 24px 64px rgba(0,0,0,.6),inset 0 1px 0 rgba(255,255,255,.04)}'
+  + '.brand{display:flex;align-items:center;gap:10px;margin-bottom:18px}'
+  + '.mark{width:20px;height:20px;display:grid;grid-template-columns:1fr 1fr;gap:3px;flex-shrink:0}'
+  + '.mark i{border-radius:2px;background:#38BDF8}.mark i:last-child{background:#2DBE87}'
+  + 'h1{margin:0;font-size:17px;font-weight:650;letter-spacing:.01em}'
+  + '.sub{margin:2px 0 0;font-size:12px;color:#7A8591}'
+  + 'label{display:block;font-size:12px;color:#A3ADB9;margin:0 0 14px}'
+  + 'input,button{font:inherit;width:100%;border-radius:6px}'
+  + 'input{margin-top:6px;height:38px;padding:8px 11px;border:1px solid #303B4B;background:#0D1117;color:#E6EAF0;outline:none;transition:border-color .15s,box-shadow .15s}'
+  + 'input:focus{border-color:#38BDF8;box-shadow:0 0 0 3px rgba(56,189,248,.16)}'
+  + 'button{height:38px;border:1px solid #38BDF8;background:#38BDF8;color:#04131D;font-weight:600;cursor:pointer;transition:background-color .15s,border-color .15s}'
+  + 'button:hover{background:#5CCAF9;border-color:#5CCAF9}'
+  + '.notice{margin:14px 0 0;padding:9px 11px;border:1px solid rgba(242,98,107,.35);border-radius:6px;background:rgba(242,98,107,.13);color:#FF9AA1;font-size:12px;line-height:1.6}'
+  + '.hint{margin:0;font-size:13px;color:#A3ADB9;line-height:1.7}'
+  + '</style>';
+const LOGIN_REQUIRED = '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>需要登录</title>'
+  + LOGIN_STYLE + '<main class="card"><div class="brand"><span class="mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span><div><h1>统一交易平台</h1><p class="sub">交易服务</p></div></div><p class="hint">请使用数据目录 access-url 中的登录链接打开（用 sudo bash install.sh --set-password 设置登录密码后可直接输入密码）。</p></main>';
 const loginForm = (notice: string): string => '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>登录</title>'
-  + '<style>body{font:15px/1.5 system-ui,sans-serif;max-width:22rem;margin:4rem auto;padding:0 1rem}input,button{font:inherit;padding:.45rem .6rem;width:100%;box-sizing:border-box;margin:.3rem 0}.notice{color:#b42318}</style>'
-  + '<h1>统一交易平台</h1><form method="post" action="/login"><label>登录密码<input type="password" name="password" autocomplete="current-password" required autofocus maxlength="' + 2 * MAX_PASSWORD_LENGTH + '"></label><button>登录</button></form>'
-  + (notice ? `<p class="notice">${notice}</p>` : '');
+  + LOGIN_STYLE
+  + '<main class="card"><div class="brand"><span class="mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span><div><h1>统一交易平台</h1><p class="sub">登录交易服务</p></div></div>'
+  + '<form method="post" action="/login"><label>登录密码<input type="password" name="password" autocomplete="current-password" required autofocus maxlength="' + 2 * MAX_PASSWORD_LENGTH + '"></label><button>登录</button></form>'
+  + (notice ? `<p class="notice">${notice}</p>` : '') + '</main>';
 
 /** The page's workbench import (the ASTER service only): leaves a request for the root helper and reads its answer. */
 export interface ImportChannel { submit(body: unknown): { id: string; at: number }; latest(): unknown; legacyUpdate?(): UpdateView['job'] }

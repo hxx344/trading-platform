@@ -21,7 +21,7 @@ export function NewsPage({ onExpired }: { onExpired: () => void }) {
   const problem = data ? restProblem(data) : null;
   return <section className="panel" aria-label="EQN 快讯" data-news>
     <div className="section-head">
-      <h2>EQN 快讯</h2>
+      <h1>EQN 快讯</h1>
       {connection ? <span className={`connection ${connection.tone === 'ok' ? 'mint' : connection.tone === 'warn' ? 'amber' : ''}`} data-news-connection={data!.connection.state}><i />{connection.text}</span> : null}
     </div>
     <p className="panel-note">eqn.news 方程式新闻主频道：上新、公告与要闻。内容由程序抓取和翻译，AI 摘要由 AI 生成，仅供参考，不构成投资建议。这里显示最近 100 条，服务重启后补回最新 50 条。</p>

@@ -1,7 +1,7 @@
 /* 复制自 project-aggregation 工作台 modules/crossex/src/styles.css（提交 7745181）。规则内容不改；只保留本页用到的规则，
-   整份包在 .aster-desk .crossex-page 里（:root / body 改为 &），只作用于 CrossEx 页。
+   整份包在 .crossex-page 里（:root / body 改为 &），只作用于 CrossEx 页。
    页面内容区是 <div class="crossex-main">（外壳已有 <main>，不嵌套第二个），原 `main` 选择器相应改为 `.crossex-main`。 */
-.aster-desk .crossex-page {
+.crossex-page {
 /* Shared palette loaded before the existing terminal composition. */
 /* Dark terminal composition adapted from your-quantguy/gate-crossex,
    423356d89e5c8f41d9d9033f4db1f40299774ec0. See THIRD_PARTY_NOTICES. */
@@ -61,7 +61,7 @@ p{line-height:1.65}
 .search-field input:focus{outline:none}
 .topbar{height:59px;display:flex;align-items:center;gap:30px;border-bottom:1px solid var(--line);background:var(--surface-1);padding:0 22px}
 .brand{display:flex;align-items:center;gap:10px;font-size:17px;letter-spacing:-.6px;white-space:nowrap}
-.brand>span:nth-child(2){font-weight:400}
+.brand h1,.brand>span:nth-child(2){font-size:inherit;font-weight:400;margin:0}
 .brand strong{font-weight:750}
 .brand-icon{height:30px;width:30px;display:grid;place-items:center;border-radius:6px;color:var(--green);background:var(--emerald-soft)}
 .brand .tag{font-size:9px;letter-spacing:.03em}
@@ -73,7 +73,7 @@ p{line-height:1.65}
 .header-actions{margin-left:auto;display:flex;align-items:center;gap:12px}
 .connection-badge{display:flex;align-items:center;gap:6px;font-size:11px;white-space:nowrap}
 .header-actions>.text-button{font-size:11px}
-.crossex-main{max-width:1800px;margin:auto;padding:0 20px}
+.crossex-main{max-width:none;margin:0;padding:0}
 .account-identity{min-height:45px;display:flex;align-items:center;justify-content:space-between;gap:15px;color:var(--text-tertiary);font-size:11px;border-bottom:1px solid var(--surface-4);margin-bottom:20px}
 .account-identity>div{display:flex;align-items:center;gap:17px;min-width:0}
 .account-identity strong{color:var(--text-secondary);font-weight:500}
@@ -81,7 +81,7 @@ p{line-height:1.65}
 .view-heading{display:flex;justify-content:space-between;align-items:center;gap:20px;margin:25px 0 21px}
 .view-heading h2{font-size:23px;margin:7px 0 5px;font-weight:650;letter-spacing:-.02em}
 .view-heading p{font-size:12px;color:var(--text-tertiary)}
-.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;min-width:0;overflow:hidden}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius-md);box-shadow:var(--panel-highlight);min-width:0;overflow:hidden}
 .section-heading{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:17px 18px;border-bottom:1px solid var(--line)}
 .section-heading h2{display:flex;align-items:center;gap:8px;font-size:13px}
 .section-heading p{font-size:11px;color:var(--text-tertiary);margin-top:5px}

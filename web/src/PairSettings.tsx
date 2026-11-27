@@ -1,5 +1,6 @@
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { ApiError, api } from './api.ts';
+import { useDialogGuard } from './AppDialog.tsx';
 import { RequestIds } from './request-ids.ts';
 import { TRANSFER_FIELDS, defaultText, transferBody, transferChanges, transferDraft, type TransferDraft } from './transfer-form.ts';
 import type { AdlPairView, PairView, TransferConfig } from './types.ts';
@@ -38,7 +39,10 @@ function TransferForm({ pair, stale, onChanged }: { pair: PairView; stale: boole
   // A draft remembers the stored settings it started from: the server refuses the save when they changed meanwhile.
   const [draft, setDraft] = useState<{ values: TransferDraft; expected: TransferConfig } | null>(null);
   const [saved, setSaved] = useState<TransferConfig | null>(null);
+  const dialog = useDialogGuard();
   const [busy, setBusy] = useState(false);
+  const busyRef = useRef(busy);
+  busyRef.current = busy;
   const [conflict, setConflict] = useState(false);
   const [message, setMessage] = useState<Message>(null);
   const storedKey = JSON.stringify(pair.config);
@@ -46,31 +50,38 @@ function TransferForm({ pair, stale, onChanged }: { pair: PairView; stale: boole
   const current = saved ?? pair.config;
   const input = draft?.values ?? transferDraft(current);
   const expected = draft?.expected ?? current;
+  const expectedRef = useRef(expected);
+  expectedRef.current = expected;
   const edit = (values: TransferDraft) => { setDraft({ values, expected }); if (!conflict) setMessage(null); };
   const reload = () => { setDraft(null); setSaved(null); setConflict(false); setMessage(null); onChanged(); };
   const save = async () => {
+    if (busyRef.current) return;
     const body = transferBody(input);
     if ('error' in body) { setMessage({ tone: 'err', text: body.error }); return; }
     const changes = transferChanges(expected, body.config);
     if (!changes.length) { setDraft(null); setMessage({ tone: 'ok', text: '没有改动' }); return; }
-    if (!confirm(`修改配对 ${pair.id} 的划转参数，保存后下一轮检查起生效：\n${changes.join('\n')}\n确定？`)) return;
-    setBusy(true);
+    const snapshot = JSON.stringify(expected);
+    if (!await dialog.confirm(`修改配对 ${pair.id} 的划转参数，保存后下一轮检查起生效：\n${changes.join('\n')}\n确定？`, { title: '确认修改划转参数', confirmLabel: '保存修改' })) return;
+    if (!dialog.isAlive() || busyRef.current || JSON.stringify(expectedRef.current) !== snapshot) return;
+    busyRef.current = true; setBusy(true);
     try {
       const answer = await requests.run(`transfer-config:${pair.id}`, JSON.stringify({ expected, config: body.config }), requestId =>
         api<PairView>(`/api/transfer-pairs/${encodeURIComponent(pair.id)}/config`, { body: { requestId, expected, ...body.config } }));
+      if (!dialog.isAlive()) return;
       if (answer && typeof answer.config === 'object') setSaved(answer.config);
       setDraft(null);
       setConflict(false);
       setMessage({ tone: 'ok', text: '已保存' });
       onChanged();
     } catch (error) {
+      if (!dialog.isAlive()) return;
       // Changed from another page: the input stays, and the operator chooses to load the latest settings.
       if (error instanceof ApiError && error.code === 'config_changed') {
         setConflict(true);
         setMessage({ tone: 'err', text: `${error.message}（输入已保留；点「载入最新值」会放弃这里的修改）` });
         onChanged();
       } else setMessage({ tone: 'err', text: errorText(error) });
-    } finally { setBusy(false); }
+    } finally { busyRef.current = false; if (dialog.isAlive()) setBusy(false); }
   };
   return <form className="pair-settings-form form-stack" data-transfer-form={pair.id} onSubmit={event => { event.preventDefault(); if (!busy && !stale) void save(); }}>
     <fieldset className="settings-form-grid">

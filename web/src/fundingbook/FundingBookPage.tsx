@@ -6,6 +6,7 @@ import './fundingbook.css';
 import { useEffect, useRef, useState } from 'react';
 import { LoaderCircle, Play, Plus, RotateCcw, Save, Trash2 } from 'lucide-react';
 import { api } from '../api.ts';
+import { useDialogGuard } from '../AppDialog.tsx';
 import { Callout, StatePanel, TableEmpty } from '../StateViews.tsx';
 import { useLiveResource } from '../use-live-resource.ts';
 import { Badge, EquityChart, Metric, useWrite } from '../varlighter/parts.tsx';
@@ -184,9 +185,16 @@ function PlanTab({ view, write, onChanged, onExpired }: { view: StateView; write
 }
 
 function PaperTab({ view, write, onChanged }: { view: StateView; write: Write; onChanged: Changed }) {
+  const dialog = useDialogGuard();
+  const viewRef = useRef(view);
+  viewRef.current = view;
+  const writeBusyRef = useRef(write.busy);
+  writeBusyRef.current = write.busy;
   const book = view.book;
-  const reset = () => {
-    if (!confirm(resetConfirmText(view))) return;
+  const reset = async () => {
+    if (writeBusyRef.current !== null) return;
+    if (!await dialog.confirm(resetConfirmText(view), { title: '重置模拟盘', confirmLabel: '确认重置', tone: 'danger' })) return;
+    if (!dialog.isAlive() || writeBusyRef.current !== null || !viewRef.current.book) return;
     void write.run('reset', () => api(`${FUNDINGBOOK_BASE}/paper/reset`, { body: { confirm: true } }), () => { void onChanged(); return '模拟盘已重置，下一轮规划从本金重新开始'; });
   };
   const profit = book && book.equity !== null ? book.equity - book.initialCapital : null;

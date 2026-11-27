@@ -1,6 +1,7 @@
 import { ArrowRightLeft, ChevronDown, LoaderCircle } from 'lucide-react';
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { api } from './api.ts';
+import { useDialogGuard } from './AppDialog.tsx';
 import { clock, label } from './labels.ts';
 import { LEVEL_LABEL, LEVEL_TONE, METHOD_LABEL, contractName, followsServer, legParts, netText, percent2, rebalanceConfirmText, rebalanceIntent, sameSettings, settingsFormError, sideName, suggestionText, suggestionUsable, usdt2, venueLabel, type SettingsForm } from './hynix-balance.ts';
 import type { HynixBalanceLeg, HynixBalanceRow, HynixBalanceSettings, HynixBalanceView, HynixRebalancePreview, OilConfirmResult, OilJob, RebalanceMethod } from './oil-types.ts';
@@ -156,6 +157,11 @@ export function BalancePanel({ balance, stale, receivedAt, onSaved, onAccepted }
   const [preview, setPreview] = useState<HynixRebalancePreview | null>(null);
   const [pending, setPending] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const dialog = useDialogGuard();
+  const busyRef = useRef(false);
+  busyRef.current = busy;
+  const previewRef = useRef(preview);
+  previewRef.current = preview;
   const [unanswered, setUnanswered] = useState<string | null>(null);
   const [message, setMessage] = useState<Message | null>(null);
   const ids = useRef(new RequestIds());
@@ -175,22 +181,31 @@ export function BalancePanel({ balance, stale, receivedAt, onSaved, onAccepted }
   }
 
   async function runConfirm(current: HynixRebalancePreview): Promise<void> {
-    if (!confirm(rebalanceConfirmText(current))) return;
-    setBusy(true); setMessage({ tone: 'muted', text: '发送中…' });
+    if (busyRef.current) return;
+    if (!await dialog.confirm(rebalanceConfirmText(current), { title: '确认名义平衡下单', confirmLabel: '确定发送', tone: 'danger' })) return;
+    if (!dialog.isAlive() || busyRef.current || previewRef.current?.id !== current.id) return;
+    busyRef.current = true; setBusy(true); setMessage({ tone: 'muted', text: '发送中…' });
     try {
       const result = await ids.current.run('confirm', current.id, requestId => api<OilConfirmResult>('/api/confirm', { body: { previewId: current.id, requestId, confirmLive: true } }), confirmRefused);
+      if (!dialog.isAlive()) return;
       version.current++; setPreview(null); setUnanswered(null);
       setMessage({ tone: 'ok', text: `${result.duplicate ? '该请求已受理过' : '已受理'}：任务 ${result.job.id.slice(0, 8)}（${label(JOB_STATUS, result.job.status)}），进度见下方「成交进度与结果」` });
       onAccepted(result.job);
     } catch (error) {
+      if (!dialog.isAlive()) return;
       const unknown = !confirmRefused(error);
       setUnanswered(unknown ? current.id : null);
       setMessage({ tone: 'err', text: unknown ? `${errorText(error)}（结果未知，可再次点击确认，沿用同一请求编号）` : errorText(error) });
-    } finally { setBusy(false); }
+    } finally { busyRef.current = false; if (dialog.isAlive()) setBusy(false); }
   }
 
-  function cancel(): void {
-    if (preview && unanswered === preview.id && !confirm(LEAVE_UNANSWERED)) return;
+  async function cancel(): Promise<void> {
+    if (busyRef.current) return;
+    const currentPreview = previewRef.current;
+    if (currentPreview && unanswered === currentPreview.id) {
+      if (!await dialog.confirm(LEAVE_UNANSWERED, { title: '离开确认', confirmLabel: '确定返回', tone: 'danger' })) return;
+      if (!dialog.isAlive() || busyRef.current || previewRef.current?.id !== currentPreview.id) return;
+    }
     version.current++; setPreview(null); setUnanswered(null); setMessage(null); setPending(null);
   }
 
@@ -205,7 +220,7 @@ export function BalancePanel({ balance, stale, receivedAt, onSaved, onAccepted }
     </table></div></div>
     {stale ? <p className="trading-footnote trading-warning">执行状态未能刷新，显示的是上次读取的结果。</p> : null}
     {message ? <p className={`execution-message${message.tone === 'err' ? ' warning' : ''}`} id="hynixBalanceMsg" role="status">{message.text}</p> : null}
-    <div ref={reviewRef}>{preview ? <RebalanceReview preview={preview} busy={busy} unknown={unanswered === preview.id} onConfirm={() => void runConfirm(preview)} onCancel={cancel} /> : null}</div>
+    <div ref={reviewRef}>{preview ? <RebalanceReview preview={preview} busy={busy} unknown={unanswered === preview.id} onConfirm={() => void runConfirm(preview)} onCancel={() => void cancel()} /> : null}</div>
     <div className="execution-builder"><SettingsPanel balance={balance} receivedAt={receivedAt} onSaved={onSaved} /></div>
   </section>;
 }

@@ -6,34 +6,11 @@
 /* :root 调色板与 @theme inline 的字体 */
 .aster-desk {
   color-scheme: dark;
-  --background: #0a0d11;
-  --foreground: #e6eaf0;
-  --card: #10141a;
-  --surface-muted: #161b22;
-  --secondary: var(--surface-muted);
-  --primary: #38bdf8;
-  --primary-hover: #0ea5e9;
-  --primary-foreground: #0a0d11;
-  --primary-subtle: rgba(56, 189, 248, 0.12);
-  --muted-foreground: #a3adb9;
-  --subtle-foreground: #7a8591;
-  --border: #212831;
-  --input-border: #2e3640;
-  --positive: #2dbe87;
-  --positive-subtle: rgba(45, 190, 135, 0.13);
-  --positive-border: rgba(45, 190, 135, 0.3);
-  --danger: #f2626b;
-  --danger-subtle: rgba(242, 98, 107, 0.13);
-  --danger-border: rgba(242, 98, 107, 0.35);
-  --warning: #f0b03f;
-  --warning-subtle: rgba(240, 176, 63, 0.13);
-  --warning-border: rgba(240, 176, 63, 0.3);
+  --surface-muted: var(--surface-3);
+  --primary-foreground: #04131D;
   --info: #6ea8fe;
   --chart-blue: var(--info);
-  --radius: 8px;
-  --font-sans: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", sans-serif;
-  /* CJK fallbacks keep Chinese text inside numeric fields off the system monospace font. */
-  --font-mono: "Cascadia Mono", "JetBrains Mono", "SF Mono", Consolas, "Microsoft YaHei UI", "Microsoft YaHei", monospace;
+  --radius: var(--radius-md);
 }
 
 /* body（外边距由页面外壳负责）与基础元素 */
@@ -160,7 +137,8 @@
 .aster-desk .panel {
   background: var(--card);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--radius-md);
+  box-shadow: var(--panel-highlight);
   overflow: hidden;
 }
 .aster-desk .section-head {
@@ -301,9 +279,11 @@
   gap: 16px;
   flex-wrap: wrap;
 }
+.aster-desk .pair-workspace-heading h1,
 .aster-desk .pair-workspace-heading h2 {
   margin: 0;
-  font-size: 15px;
+  font-size: 1.125rem;
+  font-weight: 650;
 }
 .aster-desk .pair-workspace-heading p {
   margin: 7px 0 0;
@@ -529,8 +509,9 @@
   padding: 10px 14px;
   min-height: 42px;
 }
+.aster-desk .section-head h1,
 .aster-desk .focused-desk .section-head h2 {
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 600;
 }
 .aster-desk .section-head [data-slot='button'] {

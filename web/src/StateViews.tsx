@@ -1,4 +1,4 @@
-// 复制自 project-aggregation 工作台 src/StateViews.tsx（提交 056e9c3），未改动。
+// 复制自 project-aggregation 工作台 src/StateViews.tsx（提交 056e9c3），增加加载态骨架占位。
 import { CircleAlert, CircleCheck, Info, LoaderCircle } from 'lucide-react';
 import type { ReactNode } from 'react';
 
@@ -14,6 +14,15 @@ const toneIcon: Record<CalloutTone, ReactNode> = {
   error: <CircleAlert size={16} aria-hidden="true" />,
 };
 
+function LoadingSkeleton() {
+  return <div className="skeleton-stack" aria-hidden="true">
+    <div className="skeleton-row"><span className="skeleton-card" /><span className="skeleton-card" /><span className="skeleton-card" /></div>
+    <span className="skeleton-bar wide" />
+    <span className="skeleton-bar mid" />
+    <span className="skeleton-bar short" />
+  </div>;
+}
+
 // 默认角色：warning、error 用 alert，其余用 status；需要静默时由调用方传 role。
 export function Callout({ tone = 'info', role, action, className, children }: { tone?: CalloutTone; role?: 'alert' | 'status'; action?: { label: string; onClick: () => void }; className?: string; children: ReactNode }) {
   return <div className={`callout ${tone}${className ? ` ${className}` : ''}`} role={role ?? (tone === 'warning' || tone === 'error' ? 'alert' : 'status')}>
@@ -25,12 +34,14 @@ export function Callout({ tone = 'info', role, action, className, children }: { 
 export function StatePanel({ kind, title, detail, children }: { kind: 'loading' | 'empty' | 'error'; title: string; detail?: ReactNode; children?: ReactNode }) {
   return <section className={`empty-state loading-state state-panel ${kind}`} role={kind === 'error' ? 'alert' : 'status'}>
     {kind === 'loading' ? <LoaderCircle className="spin" aria-hidden="true" /> : <CircleAlert aria-hidden="true" />}
-    <h2>{title}</h2>{detail ? <p>{detail}</p> : null}{children}
+    <h2>{title}</h2>{detail ? <p>{detail}</p> : null}
+    {kind === 'loading' ? <LoadingSkeleton /> : null}
+    {children}
   </section>;
 }
 
 export function LoadingFallback({ label }: { label: string }) {
-  return <div className="empty-state loading-state" role="status"><LoaderCircle className="spin" aria-hidden="true" /><p>{label}</p></div>;
+  return <div className="empty-state loading-state" role="status"><LoaderCircle className="spin" aria-hidden="true" /><p>{label}</p><LoadingSkeleton /></div>;
 }
 
 export function TableEmpty({ children }: { children: ReactNode }) {

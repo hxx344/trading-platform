@@ -1,11 +1,11 @@
 /* 复制自 project-aggregation 工作台 src/trading.css（提交 a12e583）与 src/trading-execution.css（提交 1d06abd），
    只保留原油页用到的规则，规则内容未改；本服务专用的原油页补充样式在 styles.css 末尾。 */
 /* src/trading.css */
-.trading-page{min-width:0;color:var(--text-primary)}
+.trading-page{display:flex;flex-direction:column;gap:14px;min-width:0;color:var(--text-primary)}
 .trading-page h1,.trading-page h2,.trading-page h3,.trading-page p,.trading-page figure{margin:0}
 .trading-page .button{min-height:32px}
 .trading-page button:focus-visible,.trading-page summary:focus-visible,.trading-page input:focus-visible,.trading-page select:focus-visible,.trading-page [tabindex]:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.trading-panel{border:1px solid var(--surface-4);border-radius:var(--radius-lg);background:var(--surface-2);margin-bottom:12px;min-width:0;overflow:hidden}
+.trading-panel{border:1px solid var(--surface-4);border-radius:var(--radius-md);background:var(--surface-2);box-shadow:var(--panel-highlight);margin-bottom:12px;min-width:0;overflow:hidden}
 .trading-panel-heading{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:12px 16px 10px}
 .trading-panel-heading h2{font-size:.9375rem;font-weight:650;color:var(--text-primary)}
 .trading-panel-heading p{font-size:.6875rem;color:var(--text-tertiary);margin-top:3px;line-height:1.7}

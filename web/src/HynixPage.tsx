@@ -1,6 +1,7 @@
 import { ArrowRightLeft, ChevronDown, LoaderCircle, RefreshCw } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { api } from './api.ts';
+import { useDialogGuard } from './AppDialog.tsx';
 import { clock, label } from './labels.ts';
 import { ACTIVE_STATUSES, type OilVenue } from './oil-form.ts';
 import { DEFAULT_HYNIX_FORM, HYNIX_LABEL, LEG_FIELDS, HYNIX_SYMBOLS, LEAD_TYPES, OIL_VENUES, VENUE_LABEL, HEDGE_TYPES, allowedOrderTypes, hedgeVenueFor, closeQuantities, describeHynixFourLeg, describeHynixIntent, draftHynixFourLegs, draftHynixLegs, hynixFormToIntent, hynixFourLegFormToIntent, type HynixForm, type HynixFourLegIntent, type HynixIntent, type HynixSymbol } from './hynix-form.ts';
@@ -127,6 +128,11 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
   // Set when picking the hedge venue as the lead swapped the two: with two venues the hedge choice is not shown, so say it.
   const [swapNote, setSwapNote] = useState<string | null>(null);
   const ids = useRef(new RequestIds());
+  const dialog = useDialogGuard();
+  const busyRef = useRef(false);
+  busyRef.current = busy;
+  const previewRef = useRef(preview);
+  previewRef.current = preview;
   const reviewRef = useRef<HTMLDivElement>(null);
   const formVersion = useRef(0);
   const changed = (): void => { formVersion.current++; setPreview(null); };
@@ -190,41 +196,54 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
 
   async function runConfirm(current: HynixPreview | FourLegPreview<HynixFourLegIntent>): Promise<void> {
     if (isFourLegPreview<HynixFourLegIntent>(current)) { await runFourLegConfirm(current); return; }
+    if (busyRef.current) return;
     const sizes = current.legs.map(leg => `${name(leg.symbol)} ${leg.quantity}`).join('、');
     const text = `实盘执行：${describeHynixIntent(current.intent)}，${sizes}，名义金额约 ${current.notional} USDT，${Math.round(current.intent.timeoutMs / 1000)} 秒内完成。确定发送到交易所？`;
-    if (!confirm(text)) return;
-    setBusy(true); setMessage({ tone: 'muted', text: '发送中…' });
+    if (!await dialog.confirm(text, { title: '确认实盘执行', confirmLabel: '确定发送', tone: 'danger' })) return;
+    if (!dialog.isAlive() || busyRef.current || previewRef.current?.id !== current.id) return;
+    busyRef.current = true; setBusy(true); setMessage({ tone: 'muted', text: '发送中…' });
     try {
       const result = await ids.current.run('confirm', current.id, requestId => api<OilConfirmResult>('/api/confirm', { body: { previewId: current.id, requestId, confirmLive: true } }), confirmRefused);
+      if (!dialog.isAlive()) return;
       setPreview(null); setUnanswered(null);
       setMessage({ tone: 'ok', text: `${result.duplicate ? '该请求已受理过' : '已受理'}：任务 ${result.job.id.slice(0, 8)}（${label(JOB_STATUS, result.job.status)}），进度见上方「成交进度与结果」` });
       onAccepted(result.job);
     } catch (error) {
+      if (!dialog.isAlive()) return;
       const unknown = !confirmRefused(error);
       setUnanswered(unknown ? current.id : null);
       setMessage({ tone: 'err', text: unknown ? `${errorText(error)}（结果未知，可再次点击确认，沿用同一请求编号）` : errorText(error) });
-    } finally { setBusy(false); }
+    } finally { busyRef.current = false; if (dialog.isAlive()) setBusy(false); }
   }
 
   /** The four-leg confirm: one request creates both jobs, retried with the same request id while its answer is unknown. */
   async function runFourLegConfirm(current: FourLegPreview<HynixFourLegIntent>): Promise<void> {
+    if (busyRef.current) return;
     const text = `实盘执行：${describeHynixFourLeg(current.intent)}，每腿 ${current.intent.legs[0].notional ?? '?'} USDT，名义金额约 ${current.notional} USDT（四腿合计），${Math.round(current.intent.timeoutMs / 1000)} 秒内完成。确定发送到交易所？`;
-    if (!confirm(text)) return;
-    setBusy(true); setMessage({ tone: 'muted', text: '发送中…' });
+    if (!await dialog.confirm(text, { title: '确认四腿实盘执行', confirmLabel: '确定发送', tone: 'danger' })) return;
+    if (!dialog.isAlive() || busyRef.current || previewRef.current?.id !== current.id) return;
+    busyRef.current = true; setBusy(true); setMessage({ tone: 'muted', text: '发送中…' });
     try {
       const result = await ids.current.run('confirm', current.id, requestId => api<FourLegConfirmResult>('/api/four-leg/confirm', { body: { previewId: current.id, requestId, confirmLive: true } }), confirmRefused);
+      if (!dialog.isAlive()) return;
       setPreview(null); setUnanswered(null);
       setMessage({ tone: 'ok', text: `${result.duplicate ? '该请求已受理过' : '已受理'}：四腿组 ${result.group.slice(0, 8)}，任务 ${result.jobs.map(job => job.id.slice(0, 8)).join('、')}，进度见上方「成交进度与结果」` });
       onAccepted(result.jobs[0]!);
     } catch (error) {
+      if (!dialog.isAlive()) return;
       const unknown = !confirmRefused(error);
       setUnanswered(unknown ? current.id : null);
       setMessage({ tone: 'err', text: unknown ? `${errorText(error)}（结果未知，可再次点击确认，沿用同一请求编号）` : errorText(error) });
-    } finally { setBusy(false); }
+    } finally { busyRef.current = false; if (dialog.isAlive()) setBusy(false); }
   }
 
-  function leave(): void {
-    if (preview && unanswered === preview.id && !confirm(LEAVE_UNANSWERED)) return;
+  async function leave(): Promise<void> {
+    if (busyRef.current) return;
+    const currentPreview = previewRef.current;
+    if (currentPreview && unanswered === currentPreview.id) {
+      if (!await dialog.confirm(LEAVE_UNANSWERED, { title: '离开确认', confirmLabel: '确定返回', tone: 'danger' })) return;
+      if (!dialog.isAlive() || busyRef.current || previewRef.current?.id !== currentPreview.id) return;
+    }
     changed(); setMessage(null); setUnanswered(null);
   }
 
@@ -233,8 +252,8 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
   const same = form.preset === 'same-exchange', crossed = form.preset === 'cross-exchange';
   return <>
     <div ref={reviewRef}>{preview ? isFourLegPreview<HynixFourLegIntent>(preview)
-      ? <FourLegPreviewCard preview={preview} title={describeHynixFourLeg(preview.intent)} size={['每腿下单方式', `等金额 ${preview.intent.legs[0].notional ?? '—'} USDT`]} legName={name} quantityNote={leg => `${leg.symbol} · 步长 ${leg.instrument.quantityStep}`} idPrefix="hynix" busy={busy} unknown={unanswered === preview.id} onConfirm={() => void runConfirm(preview)} onEdit={leave} />
-      : <PreviewCard preview={preview} busy={busy} unknown={unanswered === preview.id} onConfirm={() => void runConfirm(preview)} onEdit={leave} /> : null}</div>
+      ? <FourLegPreviewCard preview={preview} title={describeHynixFourLeg(preview.intent)} size={['每腿下单方式', `等金额 ${preview.intent.legs[0].notional ?? '—'} USDT`]} legName={name} quantityNote={leg => `${leg.symbol} · 步长 ${leg.instrument.quantityStep}`} idPrefix="hynix" busy={busy} unknown={unanswered === preview.id} onConfirm={() => void runConfirm(preview)} onEdit={() => void leave()} />
+      : <PreviewCard preview={preview} busy={busy} unknown={unanswered === preview.id} onConfirm={() => void runConfirm(preview)} onEdit={() => void leave()} /> : null}</div>
     <form className="execution-builder" id="hynixOrder" aria-label="海力士组合交易参数" onSubmit={event => { event.preventDefault(); void runPreview(); }}>
       {preview && messageView ? <div className="oil-review-message">{messageView}</div> : null}
       <fieldset disabled={busy || !!preview}>
@@ -335,6 +354,7 @@ export function HynixPage({ onExpired }: { onExpired: () => void }) {
   const accepted = (job: OilJob): void => { setTracked(job.id); setActive(true); void state.refresh(); };
   if (state.error && statusOf(state.error) === 404) return <StatePanel kind="empty" title="本服务没有配置海力士执行" detail="海力士与原油共用执行账户：在「设置」页「从工作台导入」勾选原油执行账户（或在 config.json 写入 oil）后重启服务。" />;
   return <div className="trading-page oil-page hynix-page">
+    <header className="wb-heading"><div><h1>海力士双腿交易</h1><p>ADR 与正股实时溢价、持仓平衡与组合执行</p></div></header>
     <div className="trading-trade-top">
       <MarketPanel live={market} />
       {state.data ? <PositionsPanel state={state.data} stale={stale} kind={POSITIONS} /> : null}

@@ -1,6 +1,7 @@
 import { ArrowRightLeft, ChevronDown, LoaderCircle, RefreshCw } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { api } from './api.ts';
+import { useDialogGuard } from './AppDialog.tsx';
 import { clock, label } from './labels.ts';
 import { ACTIVE_STATUSES, type OilSymbol, type OilVenue } from './oil-form.ts';
 import { DEFAULT_GOLDOIL_FORM, GOLDOIL_LABEL, GOLDOIL_SYMBOLS, LEG_FIELDS, LEAD_TYPES, OIL_VENUES, VENUE_LABEL, HEDGE_TYPES, allowedOrderTypes, hedgeVenueFor, closeQuantities, describeGoldOilIntent, draftGoldOilLegs, goldOilFormToIntent, type GoldOilForm, type GoldOilHeld, type GoldOilIntent, type GoldOilSymbol } from './goldoil-form.ts';
@@ -125,6 +126,11 @@ function OrderForm({ state, onAccepted }: { state: GoldOilState; onAccepted: (jo
   // Set when picking the hedge venue as the lead swapped the two: with two venues the hedge choice is not shown, so say it.
   const [swapNote, setSwapNote] = useState<string | null>(null);
   const ids = useRef(new RequestIds());
+  const dialog = useDialogGuard();
+  const busyRef = useRef(false);
+  busyRef.current = busy;
+  const previewRef = useRef(preview);
+  previewRef.current = preview;
   const reviewRef = useRef<HTMLDivElement>(null);
   const formVersion = useRef(0);
   const changed = (): void => { formVersion.current++; setPreview(null); };
@@ -182,24 +188,33 @@ function OrderForm({ state, onAccepted }: { state: GoldOilState; onAccepted: (jo
   }
 
   async function runConfirm(current: GoldOilPreview): Promise<void> {
+    if (busyRef.current) return;
     const sizes = current.legs.map(leg => `${name(leg.symbol)} ${leg.quantity}`).join('、');
     const text = `实盘执行：${describeGoldOilIntent(current.intent)}，${sizes}，名义金额约 ${current.notional} USDT，${Math.round(current.intent.timeoutMs / 1000)} 秒内完成。确定发送到交易所？`;
-    if (!confirm(text)) return;
-    setBusy(true); setMessage({ tone: 'muted', text: '发送中…' });
+    if (!await dialog.confirm(text, { title: '确认实盘执行', confirmLabel: '确定发送', tone: 'danger' })) return;
+    if (!dialog.isAlive() || busyRef.current || previewRef.current?.id !== current.id) return;
+    busyRef.current = true; setBusy(true); setMessage({ tone: 'muted', text: '发送中…' });
     try {
       const result = await ids.current.run('confirm', current.id, requestId => api<OilConfirmResult>('/api/confirm', { body: { previewId: current.id, requestId, confirmLive: true } }), confirmRefused);
+      if (!dialog.isAlive()) return;
       setPreview(null); setUnanswered(null);
       setMessage({ tone: 'ok', text: `${result.duplicate ? '该请求已受理过' : '已受理'}：任务 ${result.job.id.slice(0, 8)}（${label(JOB_STATUS, result.job.status)}），进度见上方「成交进度与结果」` });
       onAccepted(result.job);
     } catch (error) {
+      if (!dialog.isAlive()) return;
       const unknown = !confirmRefused(error);
       setUnanswered(unknown ? current.id : null);
       setMessage({ tone: 'err', text: unknown ? `${errorText(error)}（结果未知，可再次点击确认，沿用同一请求编号）` : errorText(error) });
-    } finally { setBusy(false); }
+    } finally { busyRef.current = false; if (dialog.isAlive()) setBusy(false); }
   }
 
-  function leave(): void {
-    if (preview && unanswered === preview.id && !confirm(LEAVE_UNANSWERED)) return;
+  async function leave(): Promise<void> {
+    if (busyRef.current) return;
+    const currentPreview = previewRef.current;
+    if (currentPreview && unanswered === currentPreview.id) {
+      if (!await dialog.confirm(LEAVE_UNANSWERED, { title: '离开确认', confirmLabel: '确定返回', tone: 'danger' })) return;
+      if (!dialog.isAlive() || busyRef.current || previewRef.current?.id !== currentPreview.id) return;
+    }
     changed(); setMessage(null); setUnanswered(null);
   }
 
@@ -208,7 +223,7 @@ function OrderForm({ state, onAccepted }: { state: GoldOilState; onAccepted: (jo
   const same = form.preset === 'same-exchange', crossed = form.preset === 'cross-exchange';
   const oilName = name(form.oilSymbol);
   return <>
-    <div ref={reviewRef}>{preview ? <PreviewCard preview={preview} busy={busy} unknown={unanswered === preview.id} onConfirm={() => void runConfirm(preview)} onEdit={leave} /> : null}</div>
+    <div ref={reviewRef}>{preview ? <PreviewCard preview={preview} busy={busy} unknown={unanswered === preview.id} onConfirm={() => void runConfirm(preview)} onEdit={() => void leave()} /> : null}</div>
     <form className="execution-builder" id="goldoilOrder" aria-label="金油组合交易参数" onSubmit={event => { event.preventDefault(); void runPreview(); }}>
       {preview && messageView ? <div className="oil-review-message">{messageView}</div> : null}
       <fieldset disabled={busy || !!preview}>
@@ -297,6 +312,7 @@ export function GoldOilPage({ onExpired }: { onExpired: () => void }) {
   const accepted = (job: OilJob): void => { setTracked(job.id); setActive(true); void state.refresh(); };
   if (state.error && statusOf(state.error) === 404) return <StatePanel kind="empty" title="本服务没有配置金油执行" detail="金油与原油共用执行账户：在「设置」页「从工作台导入」勾选原油执行账户（或在 config.json 写入 oil）后重启服务。" />;
   return <div className="trading-page oil-page">
+    <header className="wb-heading"><div><h1>金油双腿交易</h1><p>XAU 与原油实时比价、持仓与组合执行</p></div></header>
     <div className="trading-trade-top">
       <MarketPanel live={market} />
       {state.data ? <PositionsPanel state={state.data} stale={stale} kind={POSITIONS} /> : null}

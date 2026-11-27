@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { api, ApiError } from './api.ts';
+import { useDialogGuard } from './AppDialog.tsx';
 import {
   money, quantityText, quoteFingerprint, quoteSecondsLeft, RFQ_PATH, rfqCreateBody, rfqCreateProblem, rfqExecuteBody, rfqOpen, rfqStrategyLabel, signedMoney, startRefused, utcTime,
 } from './options-form.ts';
@@ -103,6 +104,11 @@ export function RfqPane({ strategy, quantity, onExpired, onChanged }: { strategy
   const [creating, setCreating] = useState(false);
   const [canceling, setCanceling] = useState(false);
   const [sending, setSending] = useState(false);
+  const dialog = useDialogGuard();
+  const creatingRef = useRef(false);
+  creatingRef.current = creating;
+  const cancelingRef = useRef(false);
+  cancelingRef.current = canceling;
   const [selected, setSelected] = useState<Selected | null>(null);
   const [changed, setChanged] = useState(false);
   const [dialogError, setDialogError] = useState<string | null>(null);
@@ -134,10 +140,16 @@ export function RfqPane({ strategy, quantity, onExpired, onChanged }: { strategy
 
   const createProblem = rfqCreateProblem(view, quantity, strategy) ?? (creating ? '提交中' : null);
   const open = rfqOpen(rfq);
+  const createProblemRef = useRef(createProblem);
+  createProblemRef.current = createProblem;
+  const rfqStateRef = useRef({ open, rfqId: rfq?.rfqId ?? null });
+  rfqStateRef.current = { open, rfqId: rfq?.rfqId ?? null };
   const executeBlocked = !open ? '询价已不在可执行状态' : sending || canceling ? '另一项操作进行中' : null;
 
   async function create() {
-    if (quantity === null || !confirm(CREATE_CONFIRM(rfqStrategyLabel(strategy), quantity))) return;
+    if (quantity === null || creatingRef.current || createProblemRef.current !== null) return;
+    if (!await dialog.confirm(CREATE_CONFIRM(rfqStrategyLabel(strategy), quantity), { title: '创建组合询价', confirmLabel: '确认创建' })) return;
+    if (!dialog.isAlive() || creatingRef.current || createProblemRef.current !== null) return;
     setCreating(true); setNotice(null);
     try {
       // The RFQ shown now is part of the input: after it is gone, the same choice is a new request, not a replay of the old one.
@@ -152,10 +164,13 @@ export function RfqPane({ strategy, quantity, onExpired, onChanged }: { strategy
     } finally { setCreating(false); void read.refresh(); onChanged(); }
   }
   async function cancel() {
-    if (!rfq?.rfqId || !confirm(CANCEL_CONFIRM)) return;
+    const rfqId = rfqStateRef.current.rfqId;
+    if (!rfqId || cancelingRef.current || !rfqStateRef.current.open) return;
+    if (!await dialog.confirm(CANCEL_CONFIRM, { title: '取消询价', confirmLabel: '确认取消', tone: 'danger' })) return;
+    if (!dialog.isAlive() || cancelingRef.current || !rfqStateRef.current.open || rfqStateRef.current.rfqId !== rfqId) return;
     setCanceling(true); setNotice(null);
     try {
-      const answer = await api<RfqAccepted>(`${RFQ_PATH}/cancel`, { body: { rfqId: rfq.rfqId }, timeoutMs: WRITE_TIMEOUT_MS });
+      const answer = await api<RfqAccepted>(`${RFQ_PATH}/cancel`, { body: { rfqId }, timeoutMs: WRITE_TIMEOUT_MS });
       setNotice(answer.status === 'Active' ? { tone: 'error', text: answer.error ?? '取消未生效', key: rfqKey(answer) } : { tone: 'info', text: '取消已提交，等待交易所确认。', key: rfqKey(answer) });
     } catch (error) {
       setNotice({ tone: 'error', text: `取消请求未确认：${errorText(error)}；页面会继续核对状态` });

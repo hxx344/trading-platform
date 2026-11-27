@@ -25,7 +25,7 @@ export function MovesPanel({ onExpired }: { onExpired: () => void }) {
     {error ? <p className="notice error" role="alert">刷新失败：{error.message}（停留在 {clock(receivedAt)}）</p> : null}
     {problem ? <p className="notice error" role="alert">{problem}</p> : null}
     <section className="table-panel">
-      <div className="section-heading"><h2>异动行情</h2><span>EQN 监控频道 · 每 15 秒更新</span></div>
+      <div className="section-heading"><h1>异动行情</h1><span>EQN 监控频道 · 每 15 秒更新</span></div>
       <div className="moves-toolbar">
         <div className="segmented" role="group" aria-label="选择异动频道">
           {[{ key: 'all', name: '全部' }, ...data.channels].map(item => <button key={item.key} type="button" className={item.key === channel ? 'active' : ''} aria-pressed={item.key === channel} onClick={() => setChannel(item.key)}>{item.name}</button>)}

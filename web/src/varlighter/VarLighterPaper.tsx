@@ -1,7 +1,8 @@
 // 模拟盘页签：持仓（可手动平仓）、累计盈亏、按日汇总、成交与事件，以及清空模拟盘。
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { LoaderCircle, RotateCcw, X } from 'lucide-react';
 import { api } from '../api.ts';
+import { useDialogGuard } from '../AppDialog.tsx';
 import { Callout, StatePanel, TableEmpty } from '../StateViews.tsx';
 import { useLiveResource } from '../use-live-resource.ts';
 import type { PaperView, StateView } from '../../../src/varlighter/views.ts';
@@ -12,18 +13,25 @@ import { VARLIGHTER_BASE, VAR_QUOTE_LABELS, bps, directionLabel, duration, pairL
 const PAPER_PATH = `${VARLIGHTER_BASE}/paper`;
 
 export function VarLighterPaper({ view, onChanged, onExpired }: { view: StateView; onChanged: () => Promise<void>; onExpired: () => void }) {
+  const dialog = useDialogGuard();
   const live = useLiveResource<PaperView>(PAPER_PATH, { intervalMs: 10_000, timeoutMs: 15_000, onExpired });
   const data = live.data;
   const write = useWrite();
   const [resetText, setResetText] = useState('');
+  const positionsRef = useRef(data?.positions);
+  positionsRef.current = data?.positions;
+  const writeBusyRef = useRef(write.busy);
+  writeBusyRef.current = write.busy;
   const refresh = async () => { await Promise.all([live.refresh(), onChanged()]); };
   if (!data) return live.error ? <StatePanel kind="error" title="读取模拟盘失败" detail={live.error.message} /> : <StatePanel kind="loading" title="加载中…" />;
   const totals = data.totals, limits = data.limits;
-  const close = (symbol: string) => {
+  const close = async (symbol: string) => {
+    if (writeBusyRef.current !== null) return;
     const label = `${pairLabel(symbol).symbol}（${pairLabel(symbol).short || '—'}）`;
     const lost = view.orphans?.find(row => row.key === symbol);
     const text = lost ? `${label}：${lost.reason}。按最后一个样本（${lost.lastSampleAt ? new Date(lost.lastSampleAt).toLocaleString() : '—'}）平掉模拟持仓？` : `按最新报价平掉 ${label} 的模拟持仓？`;
-    if (!confirm(text)) return;
+    if (!await dialog.confirm(text, { title: '平掉模拟持仓', confirmLabel: '确认平仓', tone: 'danger' })) return;
+    if (!dialog.isAlive() || writeBusyRef.current !== null || !positionsRef.current?.some(item => item.symbol === symbol)) return;
     void write.run(`close:${symbol}`, () => api<{ netUsd: number; closedAt: number }>(`${PAPER_PATH}/close`, { body: { symbol } }), trade => { void refresh(); return `${label} 已${Date.now() - trade.closedAt > 10 * 60_000 ? `按 ${new Date(trade.closedAt).toLocaleString()} 的样本` : ''}平仓，净 ${signedUsd(trade.netUsd)}`; });
   };
   const reset = () => {

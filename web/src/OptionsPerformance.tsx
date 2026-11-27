@@ -4,7 +4,7 @@
 // Differences: the curves are the service's SvgPlot, broken where the service marks a gap (thinned points can no
 // longer show one by their spacing); a group's curve is drawn only while it is open; the read runs every 30 s while
 // this tab is shown and keeps the last result when it fails; with no data yet the currency is USDC (docs/frontend.md, G2b).
-import { useMemo } from 'react';
+import { useId, useMemo } from 'react';
 import { SvgPlot, type PlotLayer } from './svg-plot.tsx';
 import { niceAxis } from './svg-plot-geometry.ts';
 import { useLiveResource } from './use-live-resource.ts';
@@ -24,13 +24,19 @@ function PerformanceChart<T extends PerformancePoint>({ points, sampled, value, 
   const plot = useMemo(() => plotRows(points, value), [points, value]);
   const axis = useMemo(() => { const values = [0, ...plot.hover.map(row => row.value as number)]; return niceAxis(Math.min(...values), Math.max(...values)); }, [plot]);
   const marked = useMemo(() => markedRows(plot.hover), [plot]);
+  const fillId = useId().replace(/:/g, '');
+  const layers = useMemo<PlotLayer[]>(() => [
+    { kind: 'area', key: 'value', lower: axis.domain[0], fill: `url(#${fillId})` },
+    ...LAYERS,
+  ], [axis.domain, fillId]);
+  const fillDef = <linearGradient id={fillId} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="var(--accent)" stopOpacity={0.18} /><stop offset="100%" stopColor="var(--accent)" stopOpacity={0.01} /></linearGradient>;
   if (!points.length) return <div className="empty">{holding ? '暂无持仓期间采样。开始采集后显示真实盈亏路径，历史缺失时段无法还原。' : '暂无已核实的到期结束组合。提前平仓和持仓中的组合仅在下方展示。'}</div>;
   const first = points[0]!.time, last = points.at(-1)!.time;
   const terminalOnly = sampled === 0;
   return <>
     <div className="performance-plot">
       <SvgPlot rows={plot.rows} hoverRows={plot.hover} xDomain={[first, last]} yDomain={axis.domain} yTicks={axis.ticks} yTick={tick => number(tick, Math.abs(tick) < 10 ? 2 : 0)} xTick={plotTick(last - first)}
-        layers={LAYERS} references={[{ y: 0, color: 'var(--text-tertiary)', dash: '5 4' }]} margin={{ top: 24, right: 64, bottom: 32 }} height={280}
+        layers={layers} defs={fillDef} references={[{ y: 0, color: 'var(--text-tertiary)', dash: '5 4' }]} margin={{ top: 24, right: 64, bottom: 32 }} height={280}
         label={`${holding ? '单次组合持仓盈亏采样曲线' : '仅到期结束组合综合收益采样曲线'}，横轴为实际时间。${sampled} 个真实采样点，缺失区间断开显示。`}
         overlay={scales => marked.map(row => <circle key={row.time} className="performance-point" cx={scales.x(row.time)} cy={scales.y(row.value as number)} r={row.point?.terminal ? 4 : 2} />)}
         tooltip={row => { const point = (row as PlotRow).point as T | null; return point ? <span className="performance-tip">{describe(point)} {currency}</span> : null; }} />

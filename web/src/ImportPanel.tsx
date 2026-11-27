@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { api } from './api.ts';
+import { useDialogGuard } from './AppDialog.tsx';
 import { fullStamp } from './asset-format.ts';
 import { alertsAvailable, assetAvailable, confirmText, defaultAssetOwner, importBody, monitorAvailable, paperAvailable, restarts, variationalAvailable, type AssetItem, type ImportBody, type ImportChoices, type MonitorAlertsItem, type MonitorItem, type MonitorPaperItem, type MonitorVariationalItem } from './import-form.ts';
 
@@ -286,6 +287,7 @@ const statusOf = (error: unknown): number | undefined => {
 
 /** Shown only where the service offers it (the ASTER service with the helper's directory); elsewhere the route is 404. */
 export function ImportPanel({ onImported }: { onImported: () => void }) {
+  const dialog = useDialogGuard();
   const [offered, setOffered] = useState(false);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<Message>(null);
@@ -356,11 +358,13 @@ export function ImportPanel({ onImported }: { onImported: () => void }) {
     }
   }
 
-  const run = () => {
-    if (picks.asset && assetAvailable(result?.asset) && picks.assetOwner === null) { alert('请先在资产账本表里选择要导入的工作台用户'); return; }
+  const run = async () => {
+    if (waiting.current) return;
+    if (picks.asset && assetAvailable(result?.asset) && picks.assetOwner === null) { void dialog.alert('请先在资产账本表里选择要导入的工作台用户', { tone: 'warning' }); return; }
     const choices = choicesOf(result, picked, picks), body = importBody(choices);
-    if (!body) { alert('请先勾选要导入的配对、原油执行账户、期权账户、行情监控或资产账本'); return; }
-    if (!confirm(confirmText(choices, result?.asset?.enabled ?? false))) return;
+    if (!body) { void dialog.alert('请先勾选要导入的配对、原油执行账户、期权账户、行情监控或资产账本', { tone: 'warning' }); return; }
+    if (!await dialog.confirm(confirmText(choices, result?.asset?.enabled ?? false), { title: '确认从工作台导入', confirmLabel: '确认导入' })) return;
+    if (!dialog.isAlive() || !mounted.current || waiting.current) return;
     void request(body, '正在导入');
   };
 
@@ -373,7 +377,7 @@ export function ImportPanel({ onImported }: { onImported: () => void }) {
         <button type="button" id="importPreviewBtn" className="button secondary" disabled={busy} onClick={() => void request({ action: 'preview' }, '正在读取工作台')}>读取工作台</button>
         {message ? <span className={message.tone} role="status">{message.text}</span> : null}
       </div>
-      {result ? <Results result={result} picked={picked} setPicked={setPicked} picks={picks} setPicks={setPicks} onRun={run} busy={busy} /> : null}
+      {result ? <Results result={result} picked={picked} setPicked={setPicked} picks={picks} setPicks={setPicks} onRun={() => void run()} busy={busy} /> : null}
     </div>
   </section>;
 }

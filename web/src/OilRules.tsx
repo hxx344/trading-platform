@@ -5,8 +5,9 @@
 // without a definite answer re-reads the list before anything else can be done. Turning a rule live, enabling it and
 // resetting its position record each ask for a browser confirmation first.
 import { Bot, CircleAlert, Pencil, Play, Plus, Power, RefreshCw, RotateCcw, Trash2, Zap } from 'lucide-react';
-import { memo, useState } from 'react';
+import { memo, useRef, useState } from 'react';
 import { api, ApiError } from './api.ts';
+import { useDialogGuard } from './AppDialog.tsx';
 import { stamp } from './labels.ts';
 import { RULE_BATCH_LIMITS, RULE_MARKET_TEXT, conditionText, directionText, emptyRuleForm, heldText, liveConfirmText, ruleActions, ruleConfigOf, ruleFormOf, sizeText, type OilRule, type OilRulesView, type RuleAction, type RuleDirection, type RuleForm, type RuleMarket, type RuleVenue } from './oil-rules-form.ts';
 import { useLiveResource } from './use-live-resource.ts';
@@ -120,6 +121,9 @@ export function OilRules({ onExpired, market = 'oil' }: { onExpired: () => void;
   const view = live.data;
   // Counts are only shown from a read that is current: a failed, paused or old read hides them and blocks writes.
   const evidenceValid = !uncertain && (live.status === 'ready' || (live.status === 'loading' && live.error === null)) && live.receivedAt !== null && Date.now() - live.receivedAt <= 2 * RULES_MS + READ_TIMEOUT_MS;
+  const dialog = useDialogGuard();
+  const guardRef = useRef({ busy, evidenceValid });
+  guardRef.current = { busy, evidenceValid };
 
   /** Sends a write; returns null when it went through, else the message to show. */
   async function write(path: string, body: unknown, done: string, inline = false): Promise<string | null> {
@@ -158,9 +162,11 @@ export function OilRules({ onExpired, market = 'oil' }: { onExpired: () => void;
     if (!refused) setEditor(null);
     return refused;
   }
-  function act(rule: OilRule, action: RuleAction): void {
-    if (action === 'delete' && !window.confirm(`删除自动规则「${rule.title}」？规则记录一并删除。`)) return;
-    if ((action === 'live' || action === 'enable' || action === 'reset') && !window.confirm(liveConfirmText(rule, action, VENUES[rule.config.venue]))) return;
+  async function act(rule: OilRule, action: RuleAction): Promise<void> {
+    if (guardRef.current.busy || !guardRef.current.evidenceValid) return;
+    if (action === 'delete' && !await dialog.confirm(`删除自动规则「${rule.title}」？规则记录一并删除。`, { title: '删除自动规则', confirmLabel: '确认删除', tone: 'danger' })) return;
+    if ((action === 'live' || action === 'enable' || action === 'reset') && !await dialog.confirm(liveConfirmText(rule, action, VENUES[rule.config.venue]), { title: '确认自动规则操作', confirmLabel: '确认执行', tone: 'danger' })) return;
+    if (!dialog.isAlive() || guardRef.current.busy || !guardRef.current.evidenceValid) return;
     const body = action === 'live' || action === 'enable' ? { revision: rule.revision, confirmLive: true } : { revision: rule.revision };
     void write(`${OIL_RULES_PATH}/${rule.id}/${action}`, body, ACTION_DONE[action]);
   }

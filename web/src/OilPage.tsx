@@ -1,6 +1,7 @@
 import { ArrowRightLeft, ChevronDown, Clock3, LoaderCircle, RefreshCw, Square } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { api } from './api.ts';
+import { useDialogGuard } from './AppDialog.tsx';
 import { clock, label, stamp } from './labels.ts';
 import { ACTIVE_STATUSES, CONFIRM_ACKNOWLEDGE, CONFIRM_NOT_CREATED, CONFIRM_RELEASE, DEFAULT_FORM, LEAD_TYPES, OIL_VENUES, VENUE_LABEL, describeFourLeg, describeIntent, draftFourLegs, fourLegFormToIntent, HEDGE_TYPES, allowedOrderTypes, hedgeVenueFor, leadTypeAllowed, draftLegs, formToIntent, jobActions, type OilForm, type OilFourLegIntent, type OilIntent, type OilLeadType, type OilSymbol, type OilVenue } from './oil-form.ts';
 import { bookTitle, crossPairs, operationStatus, type OilBook, type OilConfirmResult, type OilJob, type OilMarket, type OilPositionAccount, type OilPreview, type OilPreviewLeg, type OilState } from './oil-types.ts';
@@ -302,8 +303,13 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
   const [advanced, setAdvanced] = useState(false);
   // Set when picking the hedge venue as the lead swapped the two: with two venues the hedge choice is not shown, so say it.
   const [swapNote, setSwapNote] = useState<string | null>(null);
+  const dialog = useDialogGuard();
   const ids = useRef(new RequestIds());
   const reviewRef = useRef<HTMLDivElement>(null);
+  const previewRef = useRef(preview);
+  previewRef.current = preview;
+  const busyRef = useRef(busy);
+  busyRef.current = busy;
   // Bumped on every form change: a preview answered for an older form is dropped, never shown beside the new one.
   const formVersion = useRef(0);
   const changed = (): void => { formVersion.current++; setPreview(null); };
@@ -363,42 +369,55 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
 
   async function runConfirm(current: OilPreview | FourLegPreview<OilFourLegIntent>): Promise<void> {
     if (isFourLegPreview<OilFourLegIntent>(current)) { await runFourLegConfirm(current); return; }
+    if (busyRef.current) return;
     const text = `实盘执行：${describeIntent(current.intent as OilIntent)}，每腿 ${current.barrels ?? '?'} 桶，名义金额约 ${current.notional} USDT，${Math.round(current.intent.timeoutMs / 1000)} 秒内完成。确定发送到交易所？`;
-    if (!confirm(text)) return;
-    setBusy(true); setMessage({ tone: 'muted', text: '发送中…' });
+    if (!await dialog.confirm(text, { title: '确认实盘执行', confirmLabel: '确定发送', tone: 'danger' })) return;
+    if (!dialog.isAlive() || busyRef.current || previewRef.current?.id !== current.id) return;
+    busyRef.current = true; setBusy(true); setMessage({ tone: 'muted', text: '发送中…' });
     try {
       const result = await ids.current.run('confirm', current.id, requestId => api<OilConfirmResult>('/api/confirm', { body: { previewId: current.id, requestId, confirmLive: true } }), confirmRefused);
+      if (!dialog.isAlive()) return;
       setPreview(null); setUnanswered(null);
       setMessage({ tone: 'ok', text: `${result.duplicate ? '该请求已受理过' : '已受理'}：任务 ${result.job.id.slice(0, 8)}（${label(JOB_STATUS, result.job.status)}），进度见上方「成交进度与结果」` });
       onAccepted(result.job);
     } catch (error) {
+      if (!dialog.isAlive()) return;
       // Without an answer the job may have been accepted: the retry reuses the request id, so it cannot run twice.
       // Only the confirm's own refusal settles it; anything else (no answer, 401, 5xx, a reused id) keeps the result unknown and the id for the retry.
       const unknown = !confirmRefused(error);
       setUnanswered(unknown ? current.id : null);
       setMessage({ tone: 'err', text: unknown ? `${errorText(error)}（结果未知，可再次点击确认，沿用同一请求编号）` : errorText(error) });
-    } finally { setBusy(false); }
+    } finally { busyRef.current = false; if (dialog.isAlive()) setBusy(false); }
   }
 
   /** The four-leg confirm: one request creates both jobs, retried with the same request id while its answer is unknown. */
   async function runFourLegConfirm(current: FourLegPreview<OilFourLegIntent>): Promise<void> {
+    if (busyRef.current) return;
     const text = `实盘执行：${describeFourLeg(current.intent)}，每腿 ${current.barrels ?? '?'} 桶，名义金额约 ${current.notional} USDT（四腿合计），${Math.round(current.intent.timeoutMs / 1000)} 秒内完成。确定发送到交易所？`;
-    if (!confirm(text)) return;
-    setBusy(true); setMessage({ tone: 'muted', text: '发送中…' });
+    if (!await dialog.confirm(text, { title: '确认四腿实盘执行', confirmLabel: '确定发送', tone: 'danger' })) return;
+    if (!dialog.isAlive() || busyRef.current || previewRef.current?.id !== current.id) return;
+    busyRef.current = true; setBusy(true); setMessage({ tone: 'muted', text: '发送中…' });
     try {
       const result = await ids.current.run('confirm', current.id, requestId => api<FourLegConfirmResult>('/api/four-leg/confirm', { body: { previewId: current.id, requestId, confirmLive: true } }), confirmRefused);
+      if (!dialog.isAlive()) return;
       setPreview(null); setUnanswered(null);
       setMessage({ tone: 'ok', text: `${result.duplicate ? '该请求已受理过' : '已受理'}：四腿组 ${result.group.slice(0, 8)}，任务 ${result.jobs.map(job => job.id.slice(0, 8)).join('、')}，进度见上方「成交进度与结果」` });
       onAccepted(result.jobs[0]!);
     } catch (error) {
+      if (!dialog.isAlive()) return;
       const unknown = !confirmRefused(error);
       setUnanswered(unknown ? current.id : null);
       setMessage({ tone: 'err', text: unknown ? `${errorText(error)}（结果未知，可再次点击确认，沿用同一请求编号）` : errorText(error) });
-    } finally { setBusy(false); }
+    } finally { busyRef.current = false; if (dialog.isAlive()) setBusy(false); }
   }
 
-  function leave(): void {
-    if (preview && unanswered === preview.id && !confirm(LEAVE_UNANSWERED)) return;
+  async function leave(): Promise<void> {
+    if (busyRef.current) return;
+    const currentPreview = previewRef.current;
+    if (currentPreview && unanswered === currentPreview.id) {
+      if (!await dialog.confirm(LEAVE_UNANSWERED, { title: '离开确认', confirmLabel: '确定返回', tone: 'danger' })) return;
+      if (!dialog.isAlive() || busyRef.current || previewRef.current?.id !== currentPreview.id) return;
+    }
     changed(); setMessage(null); setUnanswered(null);
   }
 
@@ -406,8 +425,8 @@ function OrderForm({ state, onAccepted }: { state: OilState; onAccepted: (job: O
   const messageView = message ? <p id="oilOrderMsg" className={message.tone === 'err' ? 'execution-warning' : message.tone === 'ok' ? 'oil-ok' : undefined} role="status">{message.text}</p> : null;
   return <>
     <div ref={reviewRef}>{preview ? isFourLegPreview<OilFourLegIntent>(preview)
-      ? <FourLegPreviewCard preview={preview} title={describeFourLeg(preview.intent)} size={['每腿桶数', `${preview.barrels ?? '—'} 桶`]} legName={short} quantityNote={leg => `每张 ${leg.instrument.contractSize} 桶`} idPrefix="oil" busy={busy} unknown={unanswered === preview.id} onConfirm={() => void runConfirm(preview)} onEdit={leave} />
-      : <PreviewCard preview={preview} busy={busy} unknown={unanswered === preview.id} onConfirm={() => void runConfirm(preview)} onEdit={leave} /> : null}</div>
+      ? <FourLegPreviewCard preview={preview} title={describeFourLeg(preview.intent)} size={['每腿桶数', `${preview.barrels ?? '—'} 桶`]} legName={short} quantityNote={leg => `每张 ${leg.instrument.contractSize} 桶`} idPrefix="oil" busy={busy} unknown={unanswered === preview.id} onConfirm={() => void runConfirm(preview)} onEdit={() => void leave()} />
+      : <PreviewCard preview={preview} busy={busy} unknown={unanswered === preview.id} onConfirm={() => void runConfirm(preview)} onEdit={() => void leave()} /> : null}</div>
     <form className="execution-builder" id="oilOrder" aria-label="原油组合交易参数" onSubmit={event => { event.preventDefault(); void runPreview(); }}>
       {preview && messageView ? <div className="oil-review-message">{messageView}</div> : null}
       <fieldset disabled={busy || !!preview}>
@@ -559,10 +578,15 @@ function JobCard({ job, busy, strategyId, onStrategyId, onAction }: { job: OilJo
 const needsWatch = (job: OilJob): boolean => { const actions = jobActions(job); return ACTIVE_STATUSES.includes(job.status) || actions.strategy || actions.acknowledge; };
 
 export function JobsSection({ jobs, stale, tracked, onUntrack, onChanged }: { jobs: OilJob[]; stale: boolean; tracked: string | null; onUntrack: () => void; onChanged: () => void }) {
+  const dialog = useDialogGuard();
   const ids = useRef(new RequestIds());
   const trackingRef = useRef<HTMLElement>(null);
   const [strategyIds, setStrategyIds] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<string | null>(null);
+  const jobsRef = useRef(jobs);
+  jobsRef.current = jobs;
+  const busyRef = useRef(busy);
+  busyRef.current = busy;
   const [message, setMessage] = useState<{ jobId: string; tone: 'ok' | 'err'; text: string } | null>(null);
   // A four-leg group stays together wherever it is listed: tracked, still needing watch while either job does, or past.
   const entries = groupJobs(jobs);
@@ -575,13 +599,20 @@ export function JobsSection({ jobs, stale, tracked, onUntrack, onChanged }: { jo
   useEffect(() => { if (shown) trackingRef.current?.scrollIntoView({ block: 'start', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' }); }, [tracked, shown]);
 
   async function act(job: OilJob, kind: ActionKind): Promise<void> {
+    if (busyRef.current !== null) return;
     const path = `/api/jobs/${job.id}/`;
     const strategyId = (strategyIds[job.id] ?? '').trim();
     if (kind === 'adopt' && !strategyId) { setMessage({ jobId: job.id, tone: 'err', text: `任务 ${job.id.slice(0, 8)}：请先填写交易所显示的策略编号` }); return; }
-    if (kind === 'notcreated' && !confirm(CONFIRM_NOT_CREATED)) return;
-    if (kind === 'release' && !confirm(CONFIRM_RELEASE)) return;
-    if (kind === 'acknowledge' && !confirm(CONFIRM_ACKNOWLEDGE)) return;
-    setBusy(job.id);
+    if (kind === 'notcreated' && !await dialog.confirm(CONFIRM_NOT_CREATED, { title: '确认未创建', confirmLabel: '确认', tone: 'danger' })) return;
+    if (kind === 'release' && !await dialog.confirm(CONFIRM_RELEASE, { title: '强制释放策略', confirmLabel: '强制释放', tone: 'danger' })) return;
+    if (kind === 'acknowledge' && !await dialog.confirm(CONFIRM_ACKNOWLEDGE, { title: '确认已人工处理', confirmLabel: '确认', tone: 'danger' })) return;
+    if (!dialog.isAlive() || busyRef.current !== null) return;
+    const latest = jobsRef.current.find(entry => entry.id === job.id);
+    if (!latest) return;
+    const latestActions = jobActions(latest);
+    if ((kind === 'notcreated' || kind === 'release') && !latestActions.strategy) return;
+    if (kind === 'acknowledge' && !latestActions.acknowledge) return;
+    busyRef.current = job.id; setBusy(job.id);
     try {
       const send = (requestId: string) => kind === 'stop' ? api(`${path}stop`, { body: { requestId } })
         : kind === 'acknowledge' ? api(`${path}acknowledge`, { body: { requestId } })
@@ -589,12 +620,13 @@ export function JobsSection({ jobs, stale, tracked, onUntrack, onChanged }: { jo
         : kind === 'notcreated' ? api(`${path}confirm-not-created`, { body: { requestId } })
         : api(`${path}release-strategy`, { body: { requestId, acknowledgeRisk: true } });
       await ids.current.run(`${job.id}:${kind}`, kind === 'adopt' ? strategyId : '', send);
+      if (!dialog.isAlive()) return;
       if (kind === 'adopt') setStrategyIds(currentIds => { const next = { ...currentIds }; delete next[job.id]; return next; });
       setMessage({ jobId: job.id, tone: 'ok', text: `任务 ${job.id.slice(0, 8)}：${kind === 'stop' ? '已请求停止' : kind === 'adopt' ? '已认领策略' : kind === 'notcreated' ? '已确认未创建' : kind === 'release' ? '已强制释放' : '已释放合约'}` });
       onChanged();
     } catch (error) {
-      setMessage({ jobId: job.id, tone: 'err', text: `任务 ${job.id.slice(0, 8)}：${statusOf(error) === undefined ? `${errorText(error)}（结果未知，可再次点击，沿用同一请求编号）` : errorText(error)}` });
-    } finally { setBusy(null); }
+      if (dialog.isAlive()) setMessage({ jobId: job.id, tone: 'err', text: `任务 ${job.id.slice(0, 8)}：${statusOf(error) === undefined ? `${errorText(error)}（结果未知，可再次点击，沿用同一请求编号）` : errorText(error)}` });
+    } finally { busyRef.current = null; if (dialog.isAlive()) setBusy(null); }
   }
 
   const view = (entry: (typeof entries)[number]) => entry.group ? <FourLegGroup key={entry.group} jobs={entry.jobs} card={card} /> : card(entry.jobs[0]);
@@ -631,6 +663,7 @@ export function OilPage({ onExpired }: { onExpired: () => void }) {
   const missing = state.error && statusOf(state.error) === 404;
   if (missing) return <StatePanel kind="empty" title="本服务没有配置原油执行" detail="在 config.json 写入 oil（或在「设置」页「从工作台导入」勾选原油执行账户）后重启服务。" />;
   return <div className="trading-page oil-page">
+    <header className="wb-heading"><div><h1>原油双腿交易</h1><p>BZ / CL 实时价差、持仓与组合执行</p></div></header>
     <div className="trading-trade-top">
       <MarketPanel live={market} />
       {state.data ? <PositionsPanel state={state.data} stale={stale} /> : null}

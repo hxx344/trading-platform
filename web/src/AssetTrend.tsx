@@ -3,7 +3,7 @@
 // monthly figures and the annualized returns come computed from /api/asset/history; the chart is the service's SvgPlot
 // instead of recharts; daily changes and cash flows are read from /api/asset/*; the cash flow form is a panel above the
 // list and saves through the page's one writer (AssetPage.tsx useWriter).
-import { memo, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { SvgPlot, createHoverStore, type HoverStore, type PlotLayer, type PlotScales } from './svg-plot.tsx';
 import { niceAxis } from './svg-plot-geometry.ts';
 import { useLiveResource } from './use-live-resource.ts';
@@ -77,7 +77,12 @@ export const AssetTrend = memo(function AssetTrend({ history, version, writer, o
   const plotted = useMemo(() => trendPlotPoints(trend), [trend]);
   const step = first && last ? trendStepDays((last.time - first.time) / 86_400_000) : 1;
   const axis = useMemo(() => { const values = plotted.flatMap(point => [point.adjusted, point.held]); return niceAxis(Math.min(...values), Math.max(...values)); }, [plotted]);
-  const layers = useMemo(() => lines(trend.length === 1), [trend.length]);
+  const fillId = useId().replace(/:/g, '');
+  const layers = useMemo<PlotLayer[]>(() => [
+    { kind: 'area', key: 'adjusted', lower: axis.domain[0], fill: `url(#${fillId})` },
+    ...lines(trend.length === 1),
+  ], [axis.domain, fillId, trend.length]);
+  const fillDef = <linearGradient id={fillId} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="var(--chart-1)" stopOpacity={0.18} /><stop offset="100%" stopColor="var(--chart-1)" stopOpacity={0.01} /></linearGradient>;
   const month = annualized?.monthlyPeriod ?? null;
   const [hover] = useState(createHoverStore);
   return <section className="panel trend-panel">
@@ -89,7 +94,7 @@ export const AssetTrend = memo(function AssetTrend({ history, version, writer, o
     </div>
     <div className="trend-key"><span><i className="adjusted-line" />剔除出金影响</span><span><i className="held-line" />实际持有资产</span></div>
     {first && last ? <div className="chart">
-      <SvgPlot rows={plotted} hoverRows={trend} xDomain={[first.time, last.time]} yDomain={axis.domain} yTicks={axis.ticks} yTick={amountTick} xTick={dayTick} layers={layers}
+      <SvgPlot rows={plotted} hoverRows={trend} xDomain={[first.time, last.time]} yDomain={axis.domain} yTicks={axis.ticks} yTick={amountTick} xTick={dayTick} layers={layers} defs={fillDef}
         margin={{ top: 10, right: 48, bottom: 28 }} height={220} hover={hover} label="资产变化折线图：实线为剔除出金影响后的资产，虚线为实际持有资产；跨度超过两个月时每 3 天、超过半年时每 7 天取一份快照。详细数值见历史记录。"
         tooltip={row => <TrendTip point={row as TrendPoint} />} />
     </div> : <div className="empty-state">导入的账本还没有可画的快照</div>}

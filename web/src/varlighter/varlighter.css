@@ -14,14 +14,14 @@
 .vl-chip.warn i{background:var(--warning)}
 .vl-chip.bad i{background:var(--error)}
 .vl-tabs{display:flex;gap:2px;padding:3px;border:1px solid var(--surface-4);border-radius:var(--radius-md);background:var(--surface-1);overflow-x:auto;max-width:100%;align-self:flex-start}
-.vl-tabs a{display:inline-flex;align-items:center;gap:6px;min-height:30px;padding:0 14px;border-radius:var(--radius-sm);color:var(--text-secondary);font-size:.8125rem;white-space:nowrap}
+.vl-tabs a{display:inline-flex;align-items:center;gap:6px;min-height:30px;padding:0 14px;border-radius:var(--radius-sm);color:var(--text-secondary);font-size:.8125rem;white-space:nowrap;transition:background-color .15s ease,color .15s ease}
 .vl-tabs a:hover{background:var(--surface-3);color:var(--text-primary)}
-.vl-tabs a[aria-current=page]{background:var(--surface-4);color:var(--text-primary);font-weight:600}
+.vl-tabs a[aria-current=page]{background:var(--accent-subtle);color:var(--accent);font-weight:600}
 
 /* 指标卡 */
 .vl-metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}
 .vl-metrics.inset{padding:14px}
-.vl-metric{display:flex;flex-direction:column;gap:4px;min-width:0;padding:12px 14px;border:1px solid var(--surface-4);border-radius:var(--radius-md);background:var(--surface-2)}
+.vl-metric{display:flex;flex-direction:column;gap:4px;min-width:0;padding:12px 14px;border:1px solid var(--surface-4);border-radius:var(--radius-md);background:var(--surface-2);box-shadow:var(--panel-highlight)}
 .vl-metric span{color:var(--text-tertiary);font-size:.75rem}
 .vl-metric strong{font-size:1.125rem;font-weight:650;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
 .vl-metric small{color:var(--text-tertiary);font-size:.6875rem;line-height:1.5}
@@ -32,7 +32,9 @@
 .vl-table th,.vl-table td{padding:8px 12px;text-align:left;border-bottom:1px solid var(--surface-4);vertical-align:top;white-space:nowrap}
 .vl-table th{font-weight:500;color:var(--text-tertiary);font-size:.75rem}
 .vl-table tr:last-child td{border-bottom:0}
-.vl-table .num{text-align:right;font-variant-numeric:tabular-nums}
+.vl-table .num{text-align:right;font-family:var(--font-mono);font-variant-numeric:tabular-nums}
+.vl-table tbody tr{transition:background-color .15s ease}
+.vl-table tbody tr:hover{background:var(--surface-3)}
 .vl-table small{display:block;color:var(--text-tertiary);font-size:.6875rem}
 .vl-table td.wrap{white-space:normal;min-width:220px}
 .vl-table th button{border:0;background:none;padding:0;color:inherit;font:inherit;cursor:pointer}

@@ -8,7 +8,9 @@
 .om-table th,.om-table td{padding:8px 12px;text-align:left;border-bottom:1px solid var(--surface-4);vertical-align:top;white-space:nowrap}
 .om-table th{font-weight:500;color:var(--text-tertiary);font-size:.75rem}
 .om-table tr:last-child td{border-bottom:0}
-.om-table .num{text-align:right;font-variant-numeric:tabular-nums}
+.om-table .num{text-align:right;font-family:var(--font-mono);font-variant-numeric:tabular-nums}
+.om-table tbody tr{transition:background-color .15s ease}
+.om-table tbody tr:hover{background:var(--surface-3)}
 .om-table small{display:block;color:var(--text-tertiary);font-size:.6875rem;white-space:normal}
 .om-hold{color:var(--warning)}
 .om-ok{color:var(--emerald)}

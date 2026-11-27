@@ -171,21 +171,28 @@ function SingleEstimate({ initial, scopeKey, assetEnabled, onExpired }: { initia
   </>;
 }
 
+const CHAIN_ARB_HEADING = <header className="wb-heading"><div><h1>链上折价套利</h1><p>KyberSwap 链上买入、地址模拟实收与交易所现货/永续路线估算</p></div></header>;
+
 export function ChainArbPage({ shell, onExpired }: { shell: ResourceSnapshot<ShellView>; onExpired: () => void }) {
+  const failure = readFailure(shell);
+  if (failure) return <div className="wb-page chain-arb-page">{CHAIN_ARB_HEADING}<StatePanel kind="error" title="无法核对行情开关" detail={failure} /></div>;
+  if (!shell.data) return <div className="wb-page chain-arb-page">{CHAIN_ARB_HEADING}<StatePanel kind="loading" title="正在核对行情开关…" /></div>;
+  const scope = shell.data.monitor?.perpetual;
+  if (!scope) return <div className="wb-page chain-arb-page">{CHAIN_ARB_HEADING}<StatePanel kind="empty" title="尚未配置合约价差监控"
+    detail="在设置的「从工作台导入」中点「读取工作台」，勾选「启用行情监控」并导入。服务重启后回到这里即可设置扫描。">
+    <a className="button secondary" href="#/settings">打开设置</a></StatePanel></div>;
+  if (!scope.enabled) return <div className="wb-page chain-arb-page">{CHAIN_ARB_HEADING}<StatePanel kind="empty" title="合约价差监控已关闭"
+    detail="打开行情监控的「合约价差」页签，开启「运行监控」，即可在这里查看报价和配置扫描。">
+    <a className="button secondary" href="?monitor=perpetual#/monitor">打开合约价差监控</a></StatePanel></div>;
+  return <ChainArbWorkspace shell={shell as ResourceSnapshot<ShellView> & { data: ShellView }} scope={scope} onExpired={onExpired} />;
+}
+
+function ChainArbWorkspace({ shell, scope, onExpired }: { shell: ResourceSnapshot<ShellView> & { data: ShellView }; scope: NonNullable<NonNullable<ShellView['monitor']>['perpetual']>; onExpired: () => void }) {
   const [mode, setMode] = useState<'scan' | 'single'>('scan');
   const [manual, setManual] = useState<ManualSetup>({ form: initialChainArbForm, autoGas: false });
-  const failure = readFailure(shell);
-  if (failure) return <StatePanel kind="error" title="无法核对行情开关" detail={failure} />;
-  if (!shell.data) return <StatePanel kind="loading" title="正在核对行情开关…" />;
-  const scope = shell.data.monitor?.perpetual;
-  if (!scope) return <StatePanel kind="empty" title="尚未配置合约价差监控"
-    detail="在设置的「从工作台导入」中点「读取工作台」，勾选「启用行情监控」并导入。服务重启后回到这里即可设置扫描。">
-    <a className="button secondary" href="#/settings">打开设置</a></StatePanel>;
-  if (!scope.enabled) return <StatePanel kind="empty" title="合约价差监控已关闭"
-    detail="打开行情监控的「合约价差」页签，开启「运行监控」，即可在这里查看报价和配置扫描。">
-    <a className="button secondary" href="?monitor=perpetual#/monitor">打开合约价差监控</a></StatePanel>;
   const scopeKey = [shell.data.generation, scope.revision].join('/');
-  return <div className="chain-arb-page">
+  return <div className="wb-page chain-arb-page">
+    {CHAIN_ARB_HEADING}
     <div className="toolbar" role="group" aria-label="链上折价套利视图">
       <button type="button" aria-pressed={mode === 'scan'} className={'button ' + (mode === 'scan' ? 'primary' : 'secondary')}
         onClick={() => setMode('scan')}>自动扫描</button>

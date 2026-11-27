@@ -113,3 +113,11 @@
    时的图标颜色会被它盖掉（高度那条权重相同、靠后者胜），这里加上 .nav-item 等限定再写一次。 */
 .app-shell > .sidebar .nav-item.update-nav{min-height:44px}
 .app-shell > .sidebar .update-nav.available>svg:first-child{color:var(--accent)}
+@media(min-width:761px){
+  .app-shell.sidebar-collapsed > .sidebar .nav-item.update-nav{min-height:36px;justify-content:center;padding:6px 0}
+  .app-shell.sidebar-collapsed > .sidebar .nav-item.update-nav>span,
+  .app-shell.sidebar-collapsed > .sidebar .nav-item.update-nav>svg:last-child{display:none}
+  .app-shell.sidebar-collapsed > .sidebar .nav-item.update-nav.available::after,
+  .app-shell.sidebar-collapsed > .sidebar .nav-item.update-nav.attention::after{content:"";position:absolute;top:7px;right:10px;width:6px;height:6px;border-radius:var(--radius-circle);background:var(--accent)}
+  .app-shell.sidebar-collapsed > .sidebar .nav-item.update-nav.attention::after{background:var(--warning)}
+}

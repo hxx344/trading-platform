@@ -1,17 +1,15 @@
-/* 来自 project-aggregation 工作台 src/styles.css（提交 52337a9）第 171–195 行、第 409 行（1100px 隐藏 .connection-label）与第 421–425 行（手机宽度）。
-   改动：选择器加 .app-shell > .workspace > .topbar > .topbar-right 限定，与 shell.css 的外壳规则同一层，不会改到页面里的同名元素；手机断点用本服务外壳的 760px。
-   .connection-route 与 .host-open 的按钮形态未用到，已去掉 .connection-route；.host-open 在这里是链接。 */
-.app-shell > .workspace > .topbar > .topbar-right{display:flex;align-items:center;gap:10px;margin-left:auto;flex-shrink:0}
+/* 顶栏状态胶囊与紧凑刷新按钮。 */
+.app-shell > .workspace > .topbar > .topbar-right{display:flex;align-items:center;gap:8px;margin-left:auto;flex-shrink:0}
 .app-shell > .workspace > .topbar > .topbar-right .connection-status{position:relative;color:var(--text-secondary);font-size:.75rem;flex-shrink:0}
-.app-shell > .workspace > .topbar > .topbar-right .connection-status summary{display:flex;align-items:center;gap:6px;min-height:28px;padding:3px 10px;border:1px solid var(--surface-4);border-radius:var(--radius-pill);cursor:pointer;list-style:none;white-space:nowrap;background:var(--surface-1)}
+.app-shell > .workspace > .topbar > .topbar-right .connection-status summary{display:flex;align-items:center;gap:6px;min-height:28px;padding:3px 10px;border:1px solid var(--surface-4);border-radius:var(--radius-pill);cursor:pointer;list-style:none;white-space:nowrap;background:var(--surface-1);transition:background-color .15s ease,border-color .15s ease}
 .app-shell > .workspace > .topbar > .topbar-right .connection-status summary::-webkit-details-marker{display:none}
-.app-shell > .workspace > .topbar > .topbar-right .connection-status summary:hover{background:var(--surface-3)}
+.app-shell > .workspace > .topbar > .topbar-right .connection-status summary:hover{background:var(--surface-3);border-color:var(--surface-5)}
 .app-shell > .workspace > .topbar > .topbar-right .connection-label{color:var(--text-secondary)}
 .app-shell > .workspace > .topbar > .topbar-right .connection-latency{font-family:var(--font-mono);font-variant-numeric:tabular-nums}
 .app-shell > .workspace > .topbar > .topbar-right .connection-good{color:var(--emerald)}
 .app-shell > .workspace > .topbar > .topbar-right .connection-fair,.app-shell > .workspace > .topbar > .topbar-right .connection-slow{color:var(--warning)}
 .app-shell > .workspace > .topbar > .topbar-right .connection-unreachable,.app-shell > .workspace > .topbar > .topbar-right .connection-offline{color:var(--error)}
-.app-shell > .workspace > .topbar > .topbar-right .connection-details{position:absolute;right:0;top:calc(100% + 8px);width:min(320px,calc(100vw - 32px));padding:14px;background:var(--surface-2);border:1px solid var(--surface-5);border-radius:var(--radius-md);box-shadow:var(--shadow-lg);z-index:15;color:var(--text-secondary);white-space:normal;line-height:1.7}
+.app-shell > .workspace > .topbar > .topbar-right .connection-details{position:absolute;right:0;top:calc(100% + 8px);width:min(320px,calc(100vw - 32px));padding:14px;background:var(--surface-2);border:1px solid var(--surface-5);border-radius:var(--radius-md);box-shadow:var(--shadow-lg),var(--panel-highlight);z-index:15;color:var(--text-secondary);white-space:normal;line-height:1.7}
 .app-shell > .workspace > .topbar > .topbar-right .connection-details strong{color:var(--text-primary);font-size:.8125rem}
 .app-shell > .workspace > .topbar > .topbar-right .connection-details p{margin-top:6px}
 .app-shell > .workspace > .topbar > .topbar-right .connection-details small{display:block;margin-top:8px;color:var(--text-tertiary);font-size:.6875rem}
@@ -24,7 +22,15 @@
 .app-shell > .workspace > .topbar > .topbar-right .host-worst{display:none;font-family:var(--font-mono);font-variant-numeric:tabular-nums}
 .app-shell > .workspace > .topbar > .topbar-right .host-open{margin-top:8px;padding:0;border:0;background:none;color:var(--accent);font-size:.75rem;cursor:pointer}
 .app-shell > .workspace > .topbar > .topbar-right .host-open:hover{text-decoration:underline}
-@media(max-width:1100px){.app-shell > .workspace > .topbar > .topbar-right .connection-label{display:none}}
+.app-shell > .workspace > .topbar > .topbar-right .service-dot{width:6px;height:6px;border-radius:var(--radius-circle);background:var(--text-tertiary);flex-shrink:0}
+.app-shell > .workspace > .topbar > .topbar-right .service-status.mint .service-dot{background:var(--emerald)}
+.app-shell > .workspace > .topbar > .topbar-right .service-status.amber .service-dot{background:var(--warning)}
+.app-shell > .workspace > .topbar > .topbar-right .service-status.danger .service-dot{background:var(--error)}
+.app-shell > .workspace > .topbar > .topbar-right .service-status.amber>summary{border-color:var(--warning-border);color:var(--warning)}
+.app-shell > .workspace > .topbar > .topbar-right .service-status.danger>summary{border-color:var(--error-border);color:var(--error)}
+.app-shell > .workspace > .topbar > .topbar-right .service-clock{font-family:var(--font-mono);color:var(--text-tertiary);font-variant-numeric:tabular-nums}
+.app-shell > .workspace > .topbar > .topbar-right .topbar-refresh{border-color:var(--surface-4);background:var(--surface-1)}
+@media(max-width:1100px){.app-shell > .workspace > .topbar > .topbar-right .connection-label,.app-shell > .workspace > .topbar > .topbar-right .service-clock{display:none}}
 @media(max-width:760px){
   .app-shell > .workspace > .topbar > .topbar-right{gap:4px;position:relative}
   .app-shell > .workspace > .topbar > .topbar-right .connection-status{position:static}

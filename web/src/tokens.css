@@ -1,0 +1,132 @@
+/* 全站唯一设计令牌与全局深色细滚动条，所有模块共享根变量。 */
+:root{
+  color-scheme:dark;
+  --font-sans:"Segoe UI Variable Text","Segoe UI","Microsoft YaHei UI","Microsoft YaHei","PingFang SC",sans-serif;
+  --font-mono:"Cascadia Mono","JetBrains Mono","SF Mono",Consolas,"Microsoft YaHei UI","Microsoft YaHei","PingFang SC",monospace;
+  font-family:var(--font-sans);
+  font-synthesis:none;
+  font-size:16px;
+  font-weight:400;
+  line-height:1.55;
+
+  /* 深色表面层级（适当拉开底色、侧栏、卡片与悬停态对比） */
+  --surface-0:#080B0F;
+  --surface-1:#0D1117;
+  --surface-2:#121720;
+  --surface-3:#18202B;
+  --surface-4:#222B38;
+  --surface-5:#303B4B;
+  --surface-6:#3E4C5F;
+  --panel-highlight:inset 0 1px 0 rgba(255,255,255,.04);
+
+  /* 语义色与强调色 */
+  --accent:#38BDF8;
+  --accent-dim:#0EA5E9;
+  --accent-subtle:rgba(56,189,248,.13);
+  --accent-border:rgba(56,189,248,.35);
+  --emerald:#2DBE87;
+  --emerald-dim:#24A576;
+  --emerald-soft:rgba(45,190,135,.13);
+  --emerald-border:rgba(45,190,135,.32);
+  --warning:#F0B03F;
+  --warning-soft:rgba(240,176,63,.13);
+  --warning-border:rgba(240,176,63,.32);
+  --error:#F2626B;
+  --error-soft:rgba(242,98,107,.13);
+  --error-border:rgba(242,98,107,.35);
+  --info:#6EA8FE;
+  --info-soft:rgba(110,168,254,.13);
+  --off:#8C96A3;
+  --up:var(--emerald);
+  --down:var(--error);
+
+  /* 文字色 */
+  --text-primary:#E6EAF0;
+  --text-secondary:#A3ADB9;
+  --text-tertiary:#7A8591;
+
+  /* 间距与圆角 */
+  --space-xs:0.25rem;
+  --space-sm:0.5rem;
+  --space-md:0.75rem;
+  --space-lg:1rem;
+  --space-xl:1.5rem;
+  --space-2xl:2rem;
+  --radius-sm:6px;
+  --radius-md:8px;
+  --radius-lg:10px;
+  --radius-pill:999px;
+  --radius-circle:50%;
+
+  /* 阴影 */
+  --shadow-sm:none;
+  --shadow-md:0 8px 24px rgba(0,0,0,.38);
+  --shadow-lg:0 24px 64px rgba(0,0,0,.6);
+
+  /* 布局与控件尺寸 */
+  --sidebar-width:212px;
+  --sidebar-collapsed-width:56px;
+  --topbar-height:50px;
+  --content-max-width:1600px;
+  --control-height:32px;
+  --control-height-lg:36px;
+
+  /* 各模块共用的语义变量别名 */
+  --background:var(--surface-0);
+  --foreground:var(--text-primary);
+  --card:var(--surface-2);
+  --card-foreground:var(--text-primary);
+  --popover:var(--surface-3);
+  --popover-foreground:var(--text-primary);
+  --primary:var(--accent);
+  --primary-hover:var(--accent-dim);
+  --primary-foreground:#04131D;
+  --primary-subtle:var(--accent-subtle);
+  --primary-border:var(--accent-border);
+  --secondary:var(--surface-3);
+  --secondary-foreground:var(--text-primary);
+  --muted:var(--surface-3);
+  --muted-foreground:var(--text-secondary);
+  --subtle-foreground:var(--text-tertiary);
+  --border:var(--surface-4);
+  --input:var(--surface-5);
+  --input-border:var(--surface-5);
+  --ring:var(--accent);
+  --positive:var(--emerald);
+  --negative:var(--error);
+  --destructive:var(--error);
+  --positive-surface:var(--emerald-soft);
+  --positive-subtle:var(--emerald-soft);
+  --positive-border:var(--emerald-border);
+  --negative-surface:var(--error-soft);
+  --negative-border:var(--error-border);
+  --warning-surface:var(--warning-soft);
+  --active-surface:var(--accent-subtle);
+  --surface-hover:var(--surface-3);
+  --danger:var(--error);
+  --danger-subtle:var(--error-soft);
+  --danger-border:var(--error-border);
+  --font-ui:var(--font-sans);
+  --font-number:var(--font-mono);
+  --chart-1:var(--accent);
+  --chart-2:#A3ADB9;
+  --chart-3:var(--info);
+  --chart-4:var(--warning);
+  --chart-5:#C4A2F5;
+
+  /* 兼容旧选择器别名 */
+  --nav:var(--surface-1);
+  --blue:var(--accent);
+  --surface:var(--surface-2);
+}
+
+/* 全局深色细滚动条 */
+html,body,*{
+  scrollbar-width:thin;
+  scrollbar-color:var(--surface-6) transparent;
+}
+*::-webkit-scrollbar{width:6px;height:6px}
+*::-webkit-scrollbar-track{background:transparent}
+*::-webkit-scrollbar-thumb{background:var(--surface-5);border-radius:var(--radius-pill)}
+*::-webkit-scrollbar-thumb:hover{background:var(--surface-6)}
+*::-webkit-scrollbar-corner{background:transparent}

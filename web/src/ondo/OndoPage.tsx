@@ -7,6 +7,7 @@ import './ondo.css';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { LoaderCircle, Play, RefreshCw, Save, Square } from 'lucide-react';
 import { api, ApiError } from '../api.ts';
+import { useDialogGuard } from '../AppDialog.tsx';
 import type { OndoMmConfig, OndoMmSide, OndoMmSnapshot } from './ondo-mm-types.ts';
 import type { OndoRewardsView } from '../../../src/ondo/reward-types.ts';
 import { useLiveResource } from '../use-live-resource.ts';
@@ -69,6 +70,8 @@ export function OndoPage({ onExpired }: { onExpired: () => void }) {
   draftRef.current = draft;
   const busyRef = useRef(false);
   busyRef.current = !!busy;
+  const dialog = useDialogGuard();
+  const guardRef = useRef({ active: false, startBlock: '', snapshot: null as OndoMmSnapshot | null });
   const fail = useCallback((reason: unknown, show: (text: string) => void) => { if (reason instanceof ApiError && reason.status === 401) onExpired(); else show(message(reason)); }, [onExpired]);
   // 未保存的草稿保留；轮询只刷新运行状态。
   const accept = useCallback((data: OndoMmSnapshot, replace?: boolean) => {
@@ -125,13 +128,16 @@ export function OndoPage({ onExpired }: { onExpired: () => void }) {
     await execute('save', '/config', 'PUT', configRequest.body, '设置已保存', () => JSON.stringify(draftRef.current) === submitted);
   };
   const startLive = async () => {
-    if (!snapshot || snapshot.config.mode !== 'live' || active || startBlock) return;
+    if (!snapshot || snapshot.config.mode !== 'live' || active || startBlock || busyRef.current) return;
     const body = quoteStartRequest('live', snapshot.revision, confirmedRevision, adoptPositions);
     if (!body) return;
     const config = snapshot.config;
     const preview = [`在 ${config.markets.join('、')} 启动实盘，每单 ${config.orderUsd} USD，开仓前方至少 ${config.wallUsd} USD。`,
       ACCOUNT_WIDE_CONFIRMATION, exitSummary(config), adoptPositions ? '将接管所选市场的已有持仓。' : '所选市场已有持仓时拒绝启动。', '确认启动实盘挂单？'].join('\n\n');
-    if (window.confirm(preview)) await execute('start', '/start', 'POST', body, '实盘会话已启动');
+    if (!await dialog.confirm(preview, { title: '确认启动实盘挂单', confirmLabel: '确认启动', tone: 'danger' })) return;
+    const current = guardRef.current;
+    if (!dialog.isAlive() || busyRef.current || current.active || current.startBlock || current.snapshot?.revision !== snapshot.revision) return;
+    await execute('start', '/start', 'POST', body, '实盘会话已启动');
   };
   const stopRequest = quoteStopRequest(snapshot);
   const stop = async () => {
@@ -164,8 +170,10 @@ export function OndoPage({ onExpired }: { onExpired: () => void }) {
     const checked = await execute('cleanup', '/cleanup', 'POST', {}, '', undefined, 60_000);
     if (checked && 'data' in checked && !checked.data.recovery) setNotice('已完成上次实盘的恢复核对。');
   };
-  const discard = () => {
-    if (window.confirm('请先在 Ondo 核实已撤清本模块挂单，并确认剩余仓位由你自行处理。现在结束上次会话的恢复跟踪？实盘须另行手动启动。')) {
+  const discard = async () => {
+    if (busyRef.current || !guardRef.current.snapshot?.recovery || guardRef.current.active) return;
+    if (await dialog.confirm('请先在 Ondo 核实已撤清本模块挂单，并确认剩余仓位由你自行处理。现在结束上次会话的恢复跟踪？实盘须另行手动启动。', { title: '结束恢复跟踪', confirmLabel: '确认结束', tone: 'danger' })) {
+      if (!dialog.isAlive() || busyRef.current || !guardRef.current.snapshot?.recovery || guardRef.current.active) return;
       void execute('discard', '/recovery/discard', 'POST', {}, '已按人工核对结果结束恢复跟踪。');
     }
   };
@@ -175,6 +183,7 @@ export function OndoPage({ onExpired }: { onExpired: () => void }) {
   const liveSaved = snapshot?.config.mode === 'live';
   const confirmLive = !!snapshot && confirmedRevision === snapshot.revision;
   const startBlock = !snapshot ? '' : stateStale ? '等待最新会话状态' : dirty ? '请先保存设置' : liveSaved && !snapshot.credentials.configured ? '没有配置 API Key' : liveSaved && snapshot.paused ? snapshot.pauseReason ?? '挂单已暂停' : liveSaved && recovery ? '请先核对上次实盘的挂单与余仓' : liveSaved && !confirmLive ? '请先勾选实盘确认' : '';
+  guardRef.current = { active, startBlock, snapshot };
   const heading = <header className="wb-heading"><div><h1>Ondo 挂单奖励</h1><p>观察奖励区间的盘口与触价频率。实盘仅在前方保护量充足时挂 Maker 开仓单，成交后暂停开仓并处理持仓。</p></div><div className="wb-toolbar">
     <button className="button secondary" disabled={!!busy} onClick={() => void resource.refresh()}><RefreshCw size={15} />刷新</button>
     {active ? <button key={stopRequest?.sessionId} className="button primary" disabled={!!busy || !stopRequest} title={!stopRequest ? '请刷新以核对当前会话' : undefined} onClick={() => void stop()}>{busy === 'stop' ? <LoaderCircle size={15} className="spin" /> : <Square size={15} />}{snapshot?.phase === 'stopping' ? '继续停止' : snapshot?.live ? '停止并撤单' : '停止观察'}</button>

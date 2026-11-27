@@ -849,3 +849,13 @@ DEX 价差详情在采集缺口处断开价差、基线和入场带。图形限�
 全局风控保留正在编辑的字段。设置版本变化时页面说明哪些值来自草稿，其余字段取最新值。使用者可继续保存，也可放弃草稿。例行轮询期间继续展示最近的成功结果，失去连接、读取失败和重新进入页面时仍按原有规则显示状态。合约价差的秒数在报价行内更新，扫描排名随新快照或五秒时钟更新。
 
 工作台对照为 `7745181` 的 `TradingPnlChart.tsx`、`modules/monitor/app/svg-plot.tsx`、`spread-chart.tsx` 与 `perpetual-panel.tsx`。Chrome 在 1280 和 390 像素宽度下检查了模拟盘、风控、原油监控、原油盈亏、合约价差和持仓页。原油盈亏断点与持仓的慢响应使用浏览器替身数据。回退页面不需要转换配置或数据。
+
+## 全站视觉统一与交互升级
+
+在严格保留主页面 CSP（`style-src 'self'; script-src 'self'`）与既有业务文案、请求编号规则的前提下，收敛全站跨模块视觉与交互差异（允许模块样式统一遵循本仓库共享设计令牌，不再要求与旧工作台逐像素一致）：
+
+- **统一根令牌与深色质感**（`web/src/tokens.css`）：抽出全局表面层级（`--surface-0` 至 `--surface-6` 拉开暗色背景、侧栏、卡片与悬停对比度）、面板顶部高光（`--panel-highlight`）、补全 `--font-mono` 中文字体回退，并加入全局深色细滚动条。修复 `button:disabled` 默认禁用光标为 `not-allowed`（仅 `[aria-busy="true"]` / `[data-busy]` 显示 `wait`），统一表头粘性定位、行悬停反馈与图表面板渐变填充。
+- **消除双页头与桌面端可折叠侧栏**（`web/src/App.tsx`、`shell.css`、`topbar-status.css`、`updates.css`）：移除原本占据首屏的全局 `<h1>交易服务</h1>` 区块，将连接状态、写者代次、同步时刻和快捷刷新按钮整合进顶栏 `topbar-right` 胶囊；异常与陈旧提示改为顶部按需显示 `Callout`。为各子页补齐紧凑单行 `<h1>` 与统一版心留白（`--content-max-width: 1600px`），去除非 ASTER 页面外层的 `.aster-desk` 包裹依赖及 CrossEx 样式上的 `.aster-desk` 前缀。新增桌面端侧栏一键收起/展开（56px 图标栏与 212px 完整栏，状态记入浏览器本地存储）。
+- **暗色登录页**（`src/http.ts`）：`loginForm` 与 `LOGIN_REQUIRED` 改用与主站一致的深色居中卡片、四格品牌标记与主色按钮，保留原有表单字段、提交路径与安全响应头。
+- **暗色模态确认框与加载骨架屏**（`web/src/AppDialog.tsx`、`app-dialog-queue.ts`、`StateViews.tsx`）：将全站原生 `alert()` / `confirm()` 替换为基于 `<dialog>` 的暗色排队对话框与生命周期防重入守卫 `useDialogGuard()`；加载态 `StatePanel` / `LoadingFallback` 增加纯 CSS 骨架占位条。
+- **回滚**：回退到 `v0.106.2`（本批不改接口、数据库或配置格式）。

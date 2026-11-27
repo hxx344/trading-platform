@@ -1,8 +1,9 @@
 // 只读接口令牌 (docs/mcp.md 8.4): the list of tokens (name, scopes, dates, use), generating one with a name and scopes,
 // revoking each, and the alias lookup. The workbench has no such panel; it is put together from the settings page's own
 // parts (panel, section-head, settings form, data table, Callout).
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { api } from './api.ts';
+import { useDialogGuard } from './AppDialog.tsx';
 import { stamp } from './labels.ts';
 import { Callout } from './StateViews.tsx';
 import { expiryNotice, generateBody, parseAlias, READ_SCOPE_TEXT, READ_SCOPES, scopeText, setupCommands, type ReadScope, type ReadTokenView } from './read-token-form.ts';
@@ -12,10 +13,15 @@ type Message = { tone: 'ok' | 'err'; text: string } | null;
 const errorText = (error: unknown): string => error instanceof Error ? error.message : String(error);
 
 export function ReadTokenSettings({ resource }: { resource: LiveResource<ReadTokenView> }) {
+  const dialog = useDialogGuard();
   const view = resource.data;
+  const viewRef = useRef(view);
+  viewRef.current = view;
   const [issued, setIssued] = useState<{ id: string; name: string; token: string } | null>(null);
   const [copied, setCopied] = useState(false);
   const [busy, setBusy] = useState(false);
+  const busyRef = useRef(busy);
+  busyRef.current = busy;
   const [message, setMessage] = useState<Message>(null);
   const [name, setName] = useState('');
   const [scopes, setScopes] = useState<ReadonlySet<ReadScope>>(new Set(READ_SCOPES));
@@ -26,26 +32,31 @@ export function ReadTokenSettings({ resource }: { resource: LiveResource<ReadTok
   const notice = expiryNotice(view, now);
   const full = view.tokens.length >= view.max;
   const generate = async () => {
+    if (busyRef.current) return;
     const request = generateBody(name, scopes, view);
     if ('error' in request) { setMessage({ tone: 'err', text: request.error }); return; }
-    setBusy(true); setMessage(null); setIssued(null); setCopied(false);
+    busyRef.current = true; setBusy(true); setMessage(null); setIssued(null); setCopied(false);
     try {
       const { token, id } = await api<{ token: string; id: string }>('/api/read-token/generate', { body: request.body });
+      if (!dialog.isAlive()) return;
       setIssued({ id, name: request.body.name, token });
       setName('');
       setMessage({ tone: 'ok', text: '已生成。令牌只显示这一次，请现在保存到客户端电脑上。' });
-    } catch (error) { setMessage({ tone: 'err', text: errorText(error) }); }
-    finally { setBusy(false); void resource.refresh(); }
+    } catch (error) { if (dialog.isAlive()) setMessage({ tone: 'err', text: errorText(error) }); }
+    finally { busyRef.current = false; if (dialog.isAlive()) { setBusy(false); void resource.refresh(); } }
   };
   const revoke = async (id: string, label: string) => {
-    if (!window.confirm(`吊销「${label}」后它立即失效，用它的 MCP 客户端将无法读取。确定吊销？`)) return;
-    setBusy(true); setMessage(null);
+    if (busyRef.current) return;
+    if (!await dialog.confirm(`吊销「${label}」后它立即失效，用它的 MCP 客户端将无法读取。确定吊销？`, { title: '吊销只读令牌', confirmLabel: '确认吊销', tone: 'danger' })) return;
+    if (!dialog.isAlive() || busyRef.current || !viewRef.current?.tokens.some(token => token.id === id)) return;
+    busyRef.current = true; setBusy(true); setMessage(null);
     try {
       await api('/api/read-token/revoke', { body: { id } });
-      if (issued?.id === id) setIssued(null);
+      if (!dialog.isAlive()) return;
+      setIssued(current => current?.id === id ? null : current);
       setMessage({ tone: 'ok', text: `已吊销「${label}」，立即失效。` });
-    } catch (error) { setMessage({ tone: 'err', text: errorText(error) }); }
-    finally { setBusy(false); void resource.refresh(); }
+    } catch (error) { if (dialog.isAlive()) setMessage({ tone: 'err', text: errorText(error) }); }
+    finally { busyRef.current = false; if (dialog.isAlive()) { setBusy(false); void resource.refresh(); } }
   };
   const toggle = (scope: ReadScope, on: boolean) => {
     const next = new Set(scopes);

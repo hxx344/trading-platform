@@ -5,7 +5,9 @@
 
 .positions-table-scroll:focus-visible,.positions-details summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
-.positions-page{min-width:0}
+.positions-page{display:flex;flex-direction:column;gap:12px;min-width:0}
+.positions-title{display:flex;flex-direction:column;gap:4px;min-width:0}
+.positions-title h1{font-size:1.25rem;font-weight:650;margin:0}
 .positions-readonly{display:flex;align-items:center;gap:6px;margin:0;font-size:.75rem;color:var(--text-tertiary);line-height:1.6}
 .positions-readonly>svg{flex-shrink:0}
 
@@ -35,7 +37,7 @@
 .positions-filters select:hover{border-color:var(--surface-6)}
 .positions-filters select:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-subtle)}
 
-.positions-exchange{background:var(--surface-2);border:1px solid var(--surface-4);border-radius:var(--radius-lg);margin-bottom:12px;min-width:0;overflow:hidden}
+.positions-exchange{background:var(--surface-2);border:1px solid var(--surface-4);border-radius:var(--radius-md);box-shadow:var(--panel-highlight);margin-bottom:12px;min-width:0;overflow:hidden}
 .positions-exchange-heading{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 14px;border-bottom:1px solid var(--surface-4);background:var(--surface-1)}
 .positions-exchange-heading h2{font-size:.9375rem;line-height:1.4;font-weight:650;overflow-wrap:anywhere;color:var(--text-primary)}
 .positions-exchange-heading>span{font-size:.6875rem;color:var(--text-tertiary)}

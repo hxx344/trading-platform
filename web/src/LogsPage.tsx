@@ -24,7 +24,7 @@ export function LogsPage({ onExpired }: { onExpired: () => void }) {
   return <section className="panel" aria-label="服务日志" data-logs>
     {live.data?.pendingWrites ? <p role="status">页面日志暂时无法写入，显示已落盘的记录。待写 {live.data.pendingWrites} 行。</p> : null}
     <div className="section-head">
-      <h2>服务日志</h2>
+      <h1>服务日志</h1>
       <div className="account-controls" role="group" aria-label="筛选">
         {FILTERS.map(([key, text]) => <button key={key} type="button" className={`button ${key === filter ? 'primary' : 'secondary'}`} data-slot="button" aria-pressed={key === filter} data-log-filter={key} onClick={() => setFilter(key)}>{text}</button>)}
       </div>

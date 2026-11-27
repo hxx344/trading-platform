@@ -90,10 +90,11 @@ export function AssetPage({ onExpired }: { onExpired: () => void }) {
   }, [imported, gate]);
 
   const stateError = readFailure(state), ledgerError = readFailure(ledger);
-  if (!state.data) return <div className="asset-desk"><div className="page">{stateError
+  if (!state.data) return <div className="asset-desk"><div className="page"><header className="wb-heading"><div><h1>资产账本</h1></div></header>{stateError
     ? <StatePanel kind="error" title="读取资产账本失败" detail={stateError} />
     : <StatePanel kind="loading" title="加载中…" />}</div></div>;
   if (!state.data.imported) return <div className="asset-desk"><div className="page">
+    <header className="wb-heading"><div><h1>资产账本</h1></div></header>
     <StatePanel kind="empty" title="尚未导入资产账本" detail="本服务的资产页数据来自工作台资产账本的一次导入。到「设置」页的「从工作台导入」点「读取工作台」，勾选「导入资产账本」并选择工作台用户即可（不重启服务）；导入完成后本页一分钟内显示。也可在服务器上运行下面的命令（参数见 README 的 asset 一节）。">
       <p><a className="button secondary" href="#/settings">打开设置页导入</a></p>
       <code className="import-command">{IMPORT_COMMAND}</code>
@@ -126,6 +127,7 @@ export function AssetPage({ onExpired }: { onExpired: () => void }) {
       {importOpen ? <ImportPanel writer={writer} gate={gate} onClose={() => toggleImport(false)} /> : null}</> : null;
   return <div className="asset-desk">
     <div className="ledger-head">
+      <h1 className="ledger-title">资产账本</h1>
       <nav className="ledger-tabs" aria-label="资产账本">{VIEWS.map(({ id, label }) => <button type="button" key={id} aria-current={view === id ? 'page' : undefined} onClick={() => navigate(id)}>{label}{counts[id] ? <span className="count-chip">{counts[id]}</span> : null}</button>)}</nav>
       <div className="ledger-head-meta">
         <span className="workspace-date">导入于 {fullStamp(info.importedAt)} · 北京时间</span>

@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api } from './api.ts';
+import { useDialogGuard } from './AppDialog.tsx';
 import { Batches, Progress, sideName } from './PairHistory.tsx';
 import { RequestIds } from './request-ids.ts';
 import { ADL_STATUS, DIRECTION, clock, label, seconds, stamp } from './labels.ts';
@@ -12,18 +13,25 @@ import type { AdlIncident, AdlPairView } from './types.ts';
 const requests = new RequestIds();
 
 function Incident({ incident, onChanged }: { incident: AdlIncident; onChanged: () => void }) {
+  const dialog = useDialogGuard();
   const [busy, setBusy] = useState(false);
+  const busyRef = useRef(busy);
+  busyRef.current = busy;
+  const incidentRef = useRef(incident);
+  incidentRef.current = incident;
   // A restart that took effect (the incident left halted, or its restart count moved) ends the pending request: halting
   // again later needs a new request, not a replay of the first one.
   useEffect(() => { if (incident.status !== 'halted') requests.answered(`restart:${incident.id}`); }, [incident.id, incident.status]);
   const restart = async () => {
-    if (!confirm('重新开始自动减仓：重置处理时限与批次计数，重新核对现场后继续分批市价减仓。确定？')) return;
-    setBusy(true);
+    if (busyRef.current) return;
+    if (!await dialog.confirm('重新开始自动减仓：重置处理时限与批次计数，重新核对现场后继续分批市价减仓。确定？', { title: '重新开始自动减仓', confirmLabel: '确认继续', tone: 'danger' })) return;
+    if (!dialog.isAlive() || busyRef.current || incidentRef.current.status !== 'halted') return;
+    busyRef.current = true; setBusy(true);
     try {
-      await requests.run(`restart:${incident.id}`, String(incident.restarts), requestId => api(`/api/adl/incidents/${encodeURIComponent(incident.id)}/restart`, { body: { requestId } }));
-      onChanged();
-    } catch (error) { alert(error instanceof Error ? error.message : String(error)); }
-    finally { setBusy(false); }
+      await requests.run(`restart:${incident.id}`, String(incidentRef.current.restarts), requestId => api(`/api/adl/incidents/${encodeURIComponent(incident.id)}/restart`, { body: { requestId } }));
+      if (dialog.isAlive()) onChanged();
+    } catch (error) { if (dialog.isAlive()) void dialog.alert(error instanceof Error ? error.message : String(error), { title: '操作失败', tone: 'error' }); }
+    finally { busyRef.current = false; if (dialog.isAlive()) setBusy(false); }
   };
   return <div className="pair-adl-incident" data-adl-incident={incident.id}>
     <p>

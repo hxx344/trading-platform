@@ -3,9 +3,10 @@
 // 五个页签在地址里：概览、机会、交易、池子与代币、设置。启动后是观察模式，实盘只能在这里确认后开始。
 import '../varlighter/varlighter.css';
 import './mev.css';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { LoaderCircle, Play, Plus, Save, Square, Trash2 } from 'lucide-react';
 import { api } from '../api.ts';
+import { useDialogGuard } from '../AppDialog.tsx';
 import { Callout, StatePanel, TableEmpty } from '../StateViews.tsx';
 import { useLiveResource } from '../use-live-resource.ts';
 import { Badge, Metric, useWrite } from '../varlighter/parts.tsx';
@@ -66,12 +67,30 @@ function Chips({ view }: { view: MevStateView }) {
 }
 
 function Overview({ view, write, onChanged }: { view: MevStateView; write: Write; onChanged: Changed }) {
+  const dialog = useDialogGuard();
+  const viewRef = useRef(view);
+  viewRef.current = view;
+  const writeBusyRef = useRef(write.busy);
+  writeBusyRef.current = write.busy;
   const live = view.mode === 'live', blocker = startBlocker(view), today = view.today;
   const open = view.transactions.filter(tx => ['recorded', 'sent', 'unknown', 'expired'].includes(tx.status)).length;
   const profitUsd = today.profits.reduce((sum, item) => sum + (item.usd ?? 0), 0);
-  const start = () => {
-    if (!confirm(startConfirmText(view))) return;
-    void write.run('start', () => api(`${MEV_BASE}/live/start`, { body: { confirm: view.operator, fault: view.fault, haltReason: view.haltReason } }), () => { void onChanged(); return '实盘已开始'; });
+  const start = async () => {
+    const seen = viewRef.current;
+    if (writeBusyRef.current !== null || seen.mode === 'live' || startBlocker(seen) !== null) return;
+    if (!await dialog.confirm(startConfirmText(seen), { title: '确认开始实盘套利', confirmLabel: '确认开始', tone: 'danger' })) return;
+    const latest = viewRef.current;
+    if (!dialog.isAlive() || writeBusyRef.current !== null || latest.mode === 'live' || startBlocker(latest) !== null) return;
+    const unchanged = latest.operator === seen.operator && latest.executor === seen.executor && latest.owner === seen.owner
+      && (latest.fault ?? null) === (seen.fault ?? null) && (latest.haltReason ?? null) === (seen.haltReason ?? null)
+      && latest.settings.dailyGasBudgetEth === seen.settings.dailyGasBudgetEth
+      && latest.settings.minNetUsd === seen.settings.minNetUsd
+      && latest.settings.maxConsecutiveReverts === seen.settings.maxConsecutiveReverts;
+    if (!unchanged) {
+      void dialog.alert('运行状态或风控参数在确认期间已发生变化，已取消开启实盘，请核对后再试', { title: '状态已变更', tone: 'warning' });
+      return;
+    }
+    void write.run('start', () => api(`${MEV_BASE}/live/start`, { body: { confirm: seen.operator, fault: seen.fault, haltReason: seen.haltReason } }), () => { void onChanged(); return '实盘已开始'; });
   };
   const stop = () => { void write.run('stop', () => api(`${MEV_BASE}/live/stop`, { body: {} }), () => { void onChanged(); return '已停止实盘，回到观察模式；未结清的交易继续核对'; }); };
   return <>
@@ -86,7 +105,7 @@ function Overview({ view, write, onChanged }: { view: MevStateView; write: Write
         <span className="grow" />
         {live
           ? <button type="button" className="button secondary" disabled={write.busy !== null} onClick={stop}>{write.busy === 'stop' ? <LoaderCircle size={14} className="spin" aria-hidden="true" /> : <Square size={14} aria-hidden="true" />}停止实盘</button>
-          : <button type="button" className="button" disabled={write.busy !== null || blocker !== null} title={blocker ?? undefined} onClick={start}>{write.busy === 'start' ? <LoaderCircle size={14} className="spin" aria-hidden="true" /> : <Play size={14} aria-hidden="true" />}开始实盘</button>}
+          : <button type="button" className="button" disabled={write.busy !== null || blocker !== null} title={blocker ?? undefined} onClick={() => void start()}>{write.busy === 'start' ? <LoaderCircle size={14} className="spin" aria-hidden="true" /> : <Play size={14} aria-hidden="true" />}开始实盘</button>}
       </div>
       {!live && blocker ? <p className="vl-note">暂不能开始实盘：{blocker}</p> : null}
     </section>
@@ -163,11 +182,18 @@ function Transactions({ view }: { view: MevStateView }) {
 }
 
 function Pools({ view, write, onChanged }: { view: MevStateView; write: Write; onChanged: Changed }) {
+  const dialog = useDialogGuard();
+  const tokensRef = useRef(view.tokens);
+  tokensRef.current = view.tokens;
+  const writeBusyRef = useRef(write.busy);
+  writeBusyRef.current = write.busy;
   const [address, setAddress] = useState('');
   const valid = /^0x[0-9a-fA-F]{40}$/.test(address.trim());
   const add = () => { void write.run('token:add', () => api(`${MEV_BASE}/tokens`, { body: { action: 'add', address: address.trim() } }), () => { setAddress(''); void onChanged(); return '代币已加入白名单，池子目录在下一个区块刷新'; }); };
-  const remove = (token: MevStateView['tokens'][number]) => {
-    if (!confirm(`把 ${token.symbol}（${token.address}）移出白名单？经过它的环路不再参与。`)) return;
+  const remove = async (token: MevStateView['tokens'][number]) => {
+    if (writeBusyRef.current !== null || token.start) return;
+    if (!await dialog.confirm(`把 ${token.symbol}（${token.address}）移出白名单？经过它的环路不再参与。`, { title: '移出代币白名单', confirmLabel: '确认移除', tone: 'danger' })) return;
+    if (!dialog.isAlive() || writeBusyRef.current !== null || !tokensRef.current.some(item => item.address === token.address && !item.start)) return;
     void write.run(`token:${token.address}`, () => api(`${MEV_BASE}/tokens`, { body: { action: 'remove', address: token.address } }), () => { void onChanged(); return `${token.symbol} 已移出白名单`; });
   };
   return <>
@@ -180,7 +206,7 @@ function Pools({ view, write, onChanged }: { view: MevStateView; write: Write; o
           <td><External href={explorerAddress(token.address)}>{token.address}</External></td>
           <td className="num">{token.decimals}</td>
           <td className="num">{usd(token.priceUsd, token.priceUsd !== null && token.priceUsd < 10 ? 4 : 2)}</td>
-          <td>{token.start ? null : <button type="button" className="button secondary" disabled={write.busy !== null} onClick={() => remove(token)}><Trash2 size={14} aria-hidden="true" />移除</button>}</td>
+          <td>{token.start ? null : <button type="button" className="button secondary" disabled={write.busy !== null} onClick={() => void remove(token)}><Trash2 size={14} aria-hidden="true" />移除</button>}</td>
         </tr>)}</tbody></table></div>
       <div className="vl-toolbar">
         <input value={address} onChange={event => setAddress(event.target.value)} placeholder="0x… 代币合约地址" aria-label="代币合约地址" size={46} />

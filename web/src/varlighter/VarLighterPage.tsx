@@ -3,8 +3,9 @@
 // 页签与配对键（场所:代码|场所:代码）在地址里，刷新或分享链接回到同一处。场所有 Var、Lighter RH、Lighter 主网与 Entropy，
 // 开着的组合自动把同代码的市场配对，另有手动配对；同一代码在几个组合里是几行。
 import './varlighter.css';
-import { useDeferredValue, useState } from 'react';
+import { useDeferredValue, useRef, useState } from 'react';
 import { api } from '../api.ts';
+import { useDialogGuard } from '../AppDialog.tsx';
 import { Callout, StatePanel, TableEmpty } from '../StateViews.tsx';
 import { useLiveResource } from '../use-live-resource.ts';
 import type { OrphanRow, PositionSummary, StateRow, StateView, VenueStatus } from '../../../src/varlighter/views.ts';
@@ -157,6 +158,11 @@ const positionPnl = ({ pnlBps, estimated }: PositionSummary): string | null =>
 
 /** 已启用或有持仓、但已失联的键（下架、规格改判、长时间无样本）：可停用，持仓按最后样本平仓。 */
 function Orphans({ view, rows, write, onChanged }: { view: StateView; rows: OrphanRow[]; write: ReturnType<typeof useWrite>; onChanged: () => Promise<void> }) {
+  const dialog = useDialogGuard();
+  const rowsRef = useRef(rows);
+  rowsRef.current = rows;
+  const writeBusyRef = useRef(write.busy);
+  writeBusyRef.current = write.busy;
   const label = (row: OrphanRow) => `${row.symbol}（${row.a && row.b ? `${venueShort(row.a.venue)}↔${venueShort(row.b.venue)}` : row.key}）`;
   const disable = (row: OrphanRow) => {
     const params = view.settings.symbols[row.key];
@@ -164,8 +170,10 @@ function Orphans({ view, rows, write, onChanged }: { view: StateView; rows: Orph
     void write.run(`disable:${row.key}`, () => api(`${VARLIGHTER_BASE}/settings`, { body: settingsBody(view.settings, { symbol: { symbol: row.key, params: { ...params, enabled: false } } }) }),
       () => { void onChanged(); return `${label(row)} 已停用`; });
   };
-  const close = (row: OrphanRow) => {
-    if (!confirm(`${label(row)}：${row.reason}。按最后一个样本（${row.lastSampleAt ? new Date(row.lastSampleAt).toLocaleString() : '—'}）平掉模拟持仓？`)) return;
+  const close = async (row: OrphanRow) => {
+    if (writeBusyRef.current !== null) return;
+    if (!await dialog.confirm(`${label(row)}：${row.reason}。按最后一个样本（${row.lastSampleAt ? new Date(row.lastSampleAt).toLocaleString() : '—'}）平掉模拟持仓？`, { title: '平掉模拟持仓', confirmLabel: '确认平仓', tone: 'danger' })) return;
+    if (!dialog.isAlive() || writeBusyRef.current !== null || !rowsRef.current.some(item => item.key === row.key && item.position)) return;
     void write.run(`close:${row.key}`, () => api<{ netUsd: number; closedAt: number }>(`${VARLIGHTER_BASE}/paper/close`, { body: { symbol: row.key } }),
       trade => { void onChanged(); return `${label(row)} 已按 ${new Date(trade.closedAt).toLocaleString()} 的样本平仓，净 ${signedUsd(trade.netUsd)}`; });
   };
@@ -180,7 +188,7 @@ function Orphans({ view, rows, write, onChanged }: { view: StateView; rows: Orph
         <td>{age(row.lastSampleAt, view.now)}</td>
         <td><div className="vl-actions">
           {row.enabled ? <button type="button" className="button secondary" disabled={write.busy !== null} onClick={() => disable(row)}>停用</button> : null}
-          {row.position ? <button type="button" className="button secondary" disabled={write.busy !== null} onClick={() => close(row)}>按最后样本平仓</button> : null}
+          {row.position ? <button type="button" className="button secondary" disabled={write.busy !== null} onClick={() => void close(row)}>按最后样本平仓</button> : null}
         </div></td>
       </tr>)}</tbody>
     </table></div>

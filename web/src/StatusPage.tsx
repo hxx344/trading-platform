@@ -97,9 +97,11 @@ function Watch({ watch, now }: { watch: NonNullable<ServiceStatus['watch']>; now
 /** The service's own health: background loops, the database, the request budget, user streams and the alert outbox. */
 export function StatusPage({ onExpired }: { onExpired: () => void }) {
   const { data, status, error } = useLiveResource<ServiceStatus>('/api/status', { intervalMs: REFRESH_MS, onExpired });
-  if (!data) return status === 'error' || status === 'offline' ? <StatePanel kind="error" title="读取运行状态失败" detail={error?.message ?? '网络离线'} /> : <StatePanel kind="loading" title="加载中…" />;
+  const heading = <header className="wb-heading"><div><h1>运行状态</h1><p>服务健康、后台循环、请求权重与推送通知状态</p></div></header>;
+  if (!data) return <>{heading}{status === 'error' || status === 'offline' ? <StatePanel kind="error" title="读取运行状态失败" detail={error?.message ?? '网络离线'} /> : <StatePanel kind="loading" title="加载中…" />}</>;
   const now = data.health.now;
   return <>
+    {heading}
     {error ? <p className="status-line err">刷新失败：{error.message}（显示的是 {stamp(now)} 的结果）</p> : null}
     <section className="panel">
       <div className="section-head"><h2>服务健康</h2></div>

@@ -1,81 +1,11 @@
-/* 设计令牌、基础元素、面板、按钮、提示条与空状态复制自 project-aggregation 工作台 src/styles.css（提交 056e9c3）；
-   表格、页面骨架与本服务专用部分在文件末尾。 */
-:root{
-  color-scheme:dark;
-  font-family:"Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", sans-serif;
-  font-synthesis:none;
-  font-size:16px;
-  font-weight:400;
-  line-height:1.55;
-
-  --surface-0:#0A0D11;
-  --surface-1:#0E1217;
-  --surface-2:#10141A;
-  --surface-3:#161B22;
-  --surface-4:#212831;
-  --surface-5:#2E3640;
-  --surface-6:#3A4450;
-
-  --accent:#38BDF8;
-  --accent-dim:#0EA5E9;
-  --accent-subtle:rgba(56,189,248,.12);
-  --emerald:#2DBE87;
-  --emerald-dim:#24A576;
-  --warning:#F0B03F;
-  --error:#F2626B;
-  --info:#6EA8FE;
-  --off:#8C96A3;
-  --up:var(--emerald);
-  --down:var(--error);
-  --emerald-soft:rgba(45,190,135,.13);
-  --warning-soft:rgba(240,176,63,.13);
-  --error-soft:rgba(242,98,107,.13);
-  --info-soft:rgba(110,168,254,.13);
-  --warning-border:rgba(240,176,63,.3);
-
-  --text-primary:#E6EAF0;
-  --text-secondary:#A3ADB9;
-  --text-tertiary:#7A8591;
-
-  --font-mono:"Cascadia Mono", "JetBrains Mono", "SF Mono", Consolas, monospace;
-
-  --space-xs:0.25rem;
-  --space-sm:0.5rem;
-  --space-md:0.75rem;
-  --space-lg:1rem;
-  --space-xl:1.5rem;
-  --space-2xl:2rem;
-
-  --radius-sm:0.375rem;
-  --radius-md:0.5rem;
-  --radius-lg:0.625rem;
-  --radius-pill:999px;
-  --radius-circle:50%;
-
-  --shadow-sm:none;
-  --shadow-md:0 8px 24px rgba(0,0,0,0.35);
-  --shadow-lg:0 24px 64px rgba(0,0,0,0.55);
-
-  --sidebar-width:212px;
-  --topbar-height:52px;
-
-  /* Deprecated aliases kept for older selectors. */
-  --nav:var(--surface-1);
-  --blue:var(--accent);
-  --muted:var(--text-tertiary);
-  --border:var(--surface-4);
-  --surface:var(--surface-2);
-
-  color:var(--text-primary);
-  background:var(--surface-0)
-}
-
+/* 全局基础元素、面板、按钮、提示条与空状态；设计令牌与滚动条定义在 tokens.css。 */
 *{box-sizing:border-box}
-body{margin:0;background:var(--surface-0);font-size:.8125rem;-webkit-font-smoothing:antialiased}
+body{margin:0;background:var(--surface-0);color:var(--text-primary);font-size:.8125rem;-webkit-font-smoothing:antialiased}
 button,input,select{font:inherit}
 button,a,input,select,summary{-webkit-tap-highlight-color:transparent}
 button{cursor:pointer}
-button:disabled{cursor:wait;opacity:.5}
+button:disabled{cursor:not-allowed;opacity:.5}
+button[aria-busy="true"],button[data-busy]{cursor:wait}
 button,a{touch-action:manipulation}
 button{color:inherit}
 a{color:inherit;text-decoration:none}
@@ -90,20 +20,46 @@ small{font-size:.75rem}
 .muted{color:var(--text-tertiary);font-size:.75rem}
 .spin{animation:spin 1s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
-.button{display:inline-flex;align-items:center;justify-content:center;gap:6px;min-height:32px;padding:5px 12px;border:1px solid transparent;border-radius:var(--radius-sm);font-size:.8125rem;font-weight:500;line-height:1.4;white-space:nowrap;transition:background-color .15s ease,border-color .15s ease,color .15s ease;cursor:pointer}
-.primary{background:var(--accent);color:#04131D;border-color:var(--accent);font-weight:600}.primary:hover{background:#5ccaf9;border-color:#5ccaf9}
-.secondary{background:var(--surface-3);border-color:var(--surface-5);color:var(--text-primary)}.secondary:hover{background:var(--surface-4)}
-.panel{border:1px solid var(--surface-4);border-radius:var(--radius-md);background:var(--surface-2);overflow:hidden}
+.button{display:inline-flex;align-items:center;justify-content:center;gap:6px;min-height:var(--control-height);padding:5px 12px;border:1px solid transparent;border-radius:var(--radius-sm);font-size:.8125rem;font-weight:500;line-height:1.4;white-space:nowrap;transition:background-color .15s ease,border-color .15s ease,color .15s ease,box-shadow .15s ease;cursor:pointer}
+.primary{background:var(--accent);color:#04131D;border-color:var(--accent);font-weight:600}.primary:hover:not(:disabled){background:#5ccaf9;border-color:#5ccaf9}
+.secondary{background:var(--surface-3);border-color:var(--surface-5);color:var(--text-primary)}.secondary:hover:not(:disabled){background:var(--surface-4);border-color:var(--surface-6)}
+.button.danger{background:var(--error-soft);border-color:var(--error-border);color:var(--error);font-weight:600}.button.danger:hover:not(:disabled){background:rgba(242,98,107,.22);border-color:var(--error)}
+.panel{border:1px solid var(--surface-4);border-radius:var(--radius-md);background:var(--surface-2);box-shadow:var(--panel-highlight);overflow:hidden}
 .panel-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;min-height:42px;padding:8px 14px;border-bottom:1px solid var(--surface-4);flex-wrap:wrap}
 .panel-heading h2{display:flex;align-items:center;gap:8px;color:var(--text-primary);font-size:.8125rem}
 .panel-heading h2>svg{color:var(--text-tertiary)}
-.empty-state{display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:10px;padding:48px 24px;color:var(--text-tertiary)}
+.empty-state{display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:10px;padding:44px 24px;color:var(--text-tertiary)}
 .empty-state h2,.empty-state h3{color:var(--text-secondary);font-weight:500;font-size:.875rem}
-.empty-state p{font-size:.75rem;max-width:400px;line-height:1.75}
+.empty-state p{font-size:.75rem;max-width:420px;line-height:1.75}
 .empty-state>.button{margin-top:4px}
 .compact{padding:32px 20px;flex:1}
 .compact>svg{color:var(--text-tertiary)}
-.loading-state{background:var(--surface-2);border:1px solid var(--surface-4);border-radius:var(--radius-md);padding:48px 24px}
+.loading-state{background:var(--surface-2);border:1px solid var(--surface-4);border-radius:var(--radius-md);box-shadow:var(--panel-highlight);padding:40px 24px}
+.skeleton-stack{width:min(460px,100%);display:flex;flex-direction:column;gap:10px;margin-top:6px}
+.skeleton-row{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+.skeleton-card,.skeleton-bar{display:block;border-radius:var(--radius-sm);background:linear-gradient(90deg,var(--surface-3) 25%,var(--surface-4) 50%,var(--surface-3) 75%);background-size:200% 100%;animation:tp-shimmer 1.5s ease-in-out infinite}
+.skeleton-card{height:44px}
+.skeleton-bar{height:12px}
+.skeleton-bar.wide{width:100%}
+.skeleton-bar.mid{width:78%}
+.skeleton-bar.short{width:54%}
+@keyframes tp-shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
+@media(prefers-reduced-motion:reduce){.skeleton-card,.skeleton-bar,.spin{animation:none}}
+/* 全局暗色确认/提示框 */
+.tp-dialog{padding:0;border:1px solid var(--surface-5);border-radius:var(--radius-lg);width:min(460px,calc(100vw - 28px));max-height:calc(100dvh - 40px);background:var(--surface-2);color:var(--text-primary);box-shadow:var(--shadow-lg),var(--panel-highlight);overflow:hidden}
+.tp-dialog::backdrop{background:rgba(3,5,8,.76);backdrop-filter:blur(3px)}
+.tp-dialog-danger{border-color:var(--error-border)}
+.tp-dialog-card{display:flex;flex-direction:column;max-height:calc(100dvh - 42px)}
+.tp-dialog-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 18px;border-bottom:1px solid var(--surface-4)}
+.tp-dialog-title{display:flex;align-items:center;gap:9px;min-width:0}
+.tp-dialog-title>svg{color:var(--accent);flex-shrink:0}
+.tp-dialog-danger .tp-dialog-title>svg{color:var(--error)}
+.tp-dialog-title h2{font-size:.9375rem;font-weight:600;color:var(--text-primary);margin:0}
+.tp-dialog-head .icon-button{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border:0;border-radius:var(--radius-sm);background:transparent;color:var(--text-secondary)}
+.tp-dialog-head .icon-button:hover{background:var(--surface-3);color:var(--text-primary)}
+.tp-dialog-body{padding:16px 18px;overflow-y:auto;overscroll-behavior:contain}
+.tp-dialog-body p{margin:0;font-size:.8125rem;line-height:1.75;color:var(--text-secondary);white-space:pre-wrap;overflow-wrap:anywhere}
+.tp-dialog-foot{display:flex;align-items:center;justify-content:flex-end;gap:10px;padding:12px 18px;border-top:1px solid var(--surface-4);background:var(--surface-1)}
 .callout{display:flex;align-items:flex-start;gap:8px;border:1px solid var(--surface-5);background:var(--surface-1);color:var(--text-secondary);padding:10px 12px;border-radius:var(--radius-sm);font-size:.75rem;line-height:1.65;overflow-wrap:anywhere}
 .callout>svg{flex-shrink:0;margin-top:2px}
 .callout-body{flex:1;min-width:0}
@@ -126,7 +82,7 @@ small{font-size:.75rem}
 
 /* ========== 本服务 ========== */
 /* ASTER 页面外壳与内容样式在 aster.css；这里留本服务自己的规则。 */
-.aster-desk{min-height:100vh}
+.aster-desk{min-height:0}
 .aster-desk .disclosure-body{padding:0 14px 14px}
 .aster-desk .disclosure-body>p{margin:0 0 10px}
 .aster-desk .feature-stack>.callout{margin:0}
@@ -138,8 +94,10 @@ small{font-size:.75rem}
 .table-wrap{overflow-x:auto;margin:10px 0 0;-webkit-overflow-scrolling:touch}
 .panel>.table-wrap{margin:10px 0 12px}
 table.data{border-collapse:collapse;width:100%;font-size:.75rem}
-table.data th{color:var(--text-tertiary);font-weight:500;text-align:left;white-space:nowrap;padding:6px 10px;border-bottom:1px solid var(--surface-4)}
+table.data th{position:sticky;top:0;z-index:1;background:var(--surface-3);color:var(--text-tertiary);font-weight:500;text-align:left;white-space:nowrap;padding:7px 10px;border-bottom:1px solid var(--surface-4)}
 table.data td{padding:7px 10px;border-bottom:1px solid var(--surface-4);vertical-align:top;color:var(--text-primary);overflow-wrap:break-word}
+table.data tbody tr{transition:background-color .15s ease}
+table.data tbody tr:hover{background:var(--surface-3)}
 /* On a phone the tables keep a readable width and scroll sideways inside their own box instead of breaking every word. */
 @media (max-width:720px){table.data{min-width:640px}}
 table.data tr:last-child td{border-bottom:0}
@@ -171,7 +129,7 @@ table.data.log-table td.log-text{white-space:pre-wrap;word-break:break-word;font
 .svg-plot{height:100%;width:100%;position:relative;--muted-foreground:var(--text-tertiary);--card:var(--surface-2)}
 .svg-plot-surface{display:block;overflow:visible;touch-action:pan-y;outline:none}
 .svg-plot-surface:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.svg-plot-tick{fill:var(--text-tertiary);font-size:11px}
+.svg-plot-tick{fill:var(--text-tertiary);font-family:var(--font-mono);font-size:11px;font-variant-numeric:tabular-nums}
 @media(max-width:650px){.wb-heading{flex-direction:column}}
 .monitor-desk .indicator-check[data-indicator="sma"]{color:var(--warning)}
 .monitor-desk .indicator-check[data-indicator="bands"]{color:var(--chart-5)}
@@ -179,7 +137,7 @@ table.data.log-table td.log-text{white-space:pre-wrap;word-break:break-word;font
 .monitor-desk .indicator-toggle.selected .indicator-check{border-color:currentColor}
 .trading-pnl-legend i[data-series="totalPnl"]{background:var(--accent)}
 .trading-pnl-legend i[data-series="unrealizedPnl"]{background:var(--text-secondary)}
-.svg-plot-tooltip{max-width:calc(100% - 8px);overflow-wrap:anywhere;position:absolute;top:4px;z-index:2;padding:8px 10px;border:1px solid var(--surface-5);border-radius:var(--radius-sm);background:var(--surface-3);box-shadow:var(--shadow-md);pointer-events:none}
+.svg-plot-tooltip{max-width:calc(100% - 8px);overflow-wrap:anywhere;position:absolute;top:4px;z-index:2;padding:8px 10px;border:1px solid var(--surface-5);border-radius:var(--radius-sm);background:rgba(18,23,32,.94);backdrop-filter:blur(8px);box-shadow:var(--shadow-md);pointer-events:none}
 table.data.history{min-width:0}
 /* 原油、海力士与设置页共用的字段网格，来自 trading.css 同一工作台版本。 */
 .execution-review-settings{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin:0;padding:14px 0;border-block:1px solid var(--execution-border)}
@@ -243,21 +201,16 @@ table.data.history{min-width:0}
 /* The workbench drops its legs table into the two-column .legs grid meant for the old leg cards, so the table squeezes
    into half a cell and runs under the payoff chart; here the table takes the whole column and scrolls when narrow. */
 .options-desk .strategy-body .legs{display:block;min-width:0;overflow-x:auto}
-/* The page sits inside the shell's .aster-desk, and aster.css plus the shared rules above give some class names the
-   options page also uses (muted, panel, count, button, primary) properties the workbench copy never sets; put back the
-   workbench values (prefixed with .aster-desk to outrank aster.css, which loads after this file). */
-.aster-desk .options-desk .muted{line-height:inherit}
-.aster-desk .options-desk .panel:not(.kpi-panel){overflow:visible}
-.aster-desk .options-desk .subnav .count{margin-left:0}
-.aster-desk .options-desk .button{line-height:inherit;white-space:normal}
-.aster-desk .options-desk .button.primary:disabled:hover{background:var(--accent);border-color:transparent}
+.options-desk .muted{line-height:inherit}
+.options-desk .panel:not(.kpi-panel){overflow:visible}
+.options-desk .subnav .count{margin-left:0}
+.options-desk .button{line-height:inherit;white-space:normal}
+.options-desk .button.primary:disabled:hover{background:var(--accent);border-color:transparent}
 /* The monitor page's run switch (MonitorPage.tsx, M-3c): the workbench puts .hub-monitor-controls in its hub's side card;
    here it sits on the right of the market tab row, so it drops that card's margin and top rule. */
 .monitor-desk .hub-nav-row .hub-monitor-controls{margin:0;border-top:0;min-height:44px}
 .monitor-desk .monitor-main>.hub-control-notice{margin:0 0 12px}
-/* The side navigation (shell.css, docs/frontend.md《导航按工作区组织》): the pages keep the ASTER desk's colours, so
-   that content area fills the height beside the sidebar; the entries are links to the hash routes, not buttons. */
-.app-shell>.workspace>main.aster-desk{flex:1;min-width:0}
+/* The side navigation (shell.css, docs/frontend.md《导航按工作区组织》): focus ring inside sidebar and drawer layering. */
 .app-shell>.sidebar a.nav-item:focus-visible{outline-offset:-2px}
 /* The options page's fixed notice (options.css, z-index 20) comes later in the DOM and would cover the open drawer. */
 /* The element selectors outrank shell.css's own z-index rules, which load later. */
@@ -269,19 +222,16 @@ table.data.history{min-width:0}
 /* CrossEx 页（web/src/crossex，样式来自工作台 modules/crossex/src，见 crossex/crossex.css）。工作台用 style={{ width }} 画的
    条（维持保证金率、盘口深度、双腿数量对比）在本服务的 CSP 下改为 crossex/FillBar.tsx 的 SVG，尺寸与颜色取工作台原规则
    （.kpi .meter i、.book-row>i、.position-quantity-track>span）的值。 */
-.aster-desk .crossex-page .fill-bar{display:block;width:100%;height:100%}
-.aster-desk .crossex-page .kpi .meter .fill-bar rect{fill:var(--emerald)}
-.aster-desk .crossex-page .book-row>.fill-bar{position:absolute;right:0;top:0;bottom:0;z-index:0;pointer-events:none}
-.aster-desk .crossex-page .book-row>.fill-bar rect{fill:var(--emerald-soft)}
-.aster-desk .crossex-page .book-row.sell>.fill-bar rect{fill:var(--error-soft)}
-.aster-desk .crossex-page .position-quantity-track .fill-bar rect{fill:var(--accent)}
-.aster-desk .crossex-page .position-quantity-comparison>div:nth-child(2) .position-quantity-track .fill-bar rect{fill:var(--amber)}
+.crossex-page .fill-bar{display:block;width:100%;height:100%}
+.crossex-page .kpi .meter .fill-bar rect{fill:var(--emerald)}
+.crossex-page .book-row>.fill-bar{position:absolute;right:0;top:0;bottom:0;z-index:0;pointer-events:none}
+.crossex-page .book-row>.fill-bar rect{fill:var(--emerald-soft)}
+.crossex-page .book-row.sell>.fill-bar rect{fill:var(--error-soft)}
+.crossex-page .position-quantity-track .fill-bar rect{fill:var(--accent)}
+.crossex-page .position-quantity-comparison>div:nth-child(2) .position-quantity-track .fill-bar rect{fill:var(--amber)}
 /* The read-only hard caps sit in the settings disconnect-row (a wrapping flex row); take the full width like its label. */
-.aster-desk .crossex-page .disconnect-row>.ticket-details{width:100%}
-/* aster.css gives .count a 5px left margin the workbench copy never sets (it pushed the tab and filter counts 5px right);
-   put back the workbench value. Its .panel leaks into CrossEx are all overridden; shell.css reaches only its own sidebar and
-   top bar through child selectors (.app-shell > .workspace > .topbar), not CrossEx's .topbar/.brand (hidden under .hub-embedded). */
-.aster-desk .crossex-page .count{margin-left:0}
+.crossex-page .disconnect-row>.ticket-details{width:100%}
+.crossex-page .count{margin-left:0}
 
 /* Ondo 的公开观察选择、并行 APR 和延迟明细。复用工作台的 om-table、wb-field 与 or-window。 */
 .oo-panel{min-width:0}

@@ -1,6 +1,7 @@
 import './options.css';
 import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { api, ApiError } from './api.ts';
+import { useDialogGuard } from './AppDialog.tsx';
 import {
   autoOpenConfirm, chainLines, isActive, money, orderState, payoffAt, payoffCurve, planBody, planLimit, parseQuantity, quantityText, QUANTITY_PRESETS,
   signedMoney, startBody, startRefused, STATUS_TEXT, scheduleTime, strategyName, legWord, m50Summary, taskSummary, utcDate, utcTime,
@@ -269,6 +270,15 @@ export function OptionsPage({ tab, onExpired }: { tab: OptionsTab; onExpired: ()
   const [performanceChoice, setPerformanceChoice] = useState<PerformanceChoice>(() => ({ currency: null, expanded: new Set() }));
   const [toggling, setToggling] = useState(false);
   const ids = useRef(new RequestIds());
+  const dialog = useDialogGuard();
+  const sendingRef = useRef(false);
+  sendingRef.current = sending;
+  const togglingRef = useRef(false);
+  togglingRef.current = toggling;
+  const stopsRef = useRef(stops);
+  stopsRef.current = stops;
+  const planRef = useRef(plan);
+  planRef.current = plan;
   const busyRef = useRef(false);
   const state = useLiveResource<OptionsState>(OPTIONS_STATE_PATH, { intervalMs: busyRef.current ? ACTIVE_MS : IDLE_MS, timeoutMs: OPTIONS_READ_TIMEOUT_MS, onExpired });
   const data = state.data;
@@ -292,6 +302,8 @@ export function OptionsPage({ tab, onExpired }: { tab: OptionsTab; onExpired: ()
   useEffect(() => { setChainExpiry(previewExpiry); }, [previewExpiry]);
   const busy = data?.busy === true;
   const tasks = data?.tasks ?? [];
+  const tasksRef = useRef(tasks);
+  tasksRef.current = tasks;
   const activeTasks = tasks.filter(isActive), history = tasks.filter(task => !isActive(task));
   const hero = activeTasks[0];
   const positionsCount = data?.positions?.rows.length ?? 0;
@@ -330,27 +342,42 @@ export function OptionsPage({ tab, onExpired }: { tab: OptionsTab; onExpired: ()
     } finally { setSending(false); }
   }
   async function toggleAutoOpen(enabled: boolean) {
-    if (!data?.schedule) return;
-    if (enabled && !confirm(autoOpenConfirm(data.settings, data.schedule))) return;
+    if (!data?.schedule || togglingRef.current) return;
+    if (enabled && !await dialog.confirm(autoOpenConfirm(data.settings, data.schedule), { title: '打开定时开仓', confirmLabel: '确认打开' })) return;
+    if (!dialog.isAlive() || togglingRef.current) return;
+    togglingRef.current = true;
     setToggling(true);
     try {
       await api('/api/options/auto-open', { body: { enabled }, timeoutMs: WRITE_TIMEOUT_MS });
-      const running = data.tasks.some(task => task.scheduled && isActive(task));
+      if (!dialog.isAlive()) return;
+      const running = tasksRef.current.some(task => task.scheduled && isActive(task));
       setNotice({ tone: 'info', text: enabled ? `定时开仓已打开：${scheduleTime(data.schedule)}。` : running ? '定时开仓已关闭；已受理的定时任务仍在执行，要停下请在“组合执行”里停止。' : '定时开仓已关闭。' });
       void state.refresh();
     } catch (error) {
+      if (!dialog.isAlive()) return;
       setNotice({ tone: 'error', text: `定时开仓开关未确认：${errorText(error)}；请刷新核对后再试` });
       if (error instanceof ApiError && error.status === 401) onExpired();
-    } finally { setToggling(false); }
+    } finally { togglingRef.current = false; if (dialog.isAlive()) setToggling(false); }
   }
   async function stop(task: Task) {
-    if (!confirm(STOP_CONFIRM)) return;
-    setStops(current => new Set(current).add(task.id));
+    if (stopsRef.current.has(task.id)) return;
+    if (!await dialog.confirm(STOP_CONFIRM, { title: '停止组合执行', confirmLabel: '确认停止', tone: 'danger' })) return;
+    if (!dialog.isAlive() || stopsRef.current.has(task.id)) return;
+    const latest = tasksRef.current.find(item => item.id === task.id);
+    if (!latest || !isActive(latest)) return;
+    const adding = new Set(stopsRef.current).add(task.id);
+    stopsRef.current = adding;
+    setStops(adding);
     try {
       await api(`/api/options/tasks/${task.id}/stop`, { body: {}, timeoutMs: WRITE_TIMEOUT_MS });
-      void state.refresh();
-    } catch (error) { setNotice({ tone: 'error', text: `停止请求未确认：${errorText(error)}；请刷新核对后再试` }); }
-    finally { setStops(current => { const next = new Set(current); next.delete(task.id); return next; }); }
+      if (dialog.isAlive()) void state.refresh();
+    } catch (error) { if (dialog.isAlive()) setNotice({ tone: 'error', text: `停止请求未确认：${errorText(error)}；请刷新核对后再试` }); }
+    finally {
+      const next = new Set(stopsRef.current);
+      next.delete(task.id);
+      stopsRef.current = next;
+      if (dialog.isAlive()) setStops(next);
+    }
   }
 
   const marketAt = market.data?.at ?? data?.market.at ?? null;
@@ -458,7 +485,16 @@ export function OptionsPage({ tab, onExpired }: { tab: OptionsTab; onExpired: ()
       </div>}
     </main>
     <PlanDialog plan={plan} error={planError} sending={sending} pending={plan !== null && unanswered === plan.planId} fallback={data?.schedule?.marketFallback ?? false} onClose={() => {
-      if (sending || (unanswered === plan?.planId && !confirm(LEAVE_UNANSWERED))) return;
+      if (sendingRef.current) return;
+      const currentPlan = planRef.current;
+      if (currentPlan && unanswered === currentPlan.planId) {
+        const currentPlanId = currentPlan.planId;
+        void dialog.confirm(LEAVE_UNANSWERED, { title: '离开确认', confirmLabel: '确定返回', tone: 'danger' }).then(ok => {
+          if (!ok || !dialog.isAlive() || sendingRef.current || planRef.current?.planId !== currentPlanId) return;
+          setPlan(null); setPlanError(null); setUnanswered(null); void state.refresh();
+        });
+        return;
+      }
       setPlan(null); setPlanError(null); setUnanswered(null); void state.refresh();
     }} onSubmit={limit => void submit(limit)} />
   </div>;

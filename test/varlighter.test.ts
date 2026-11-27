@@ -2453,6 +2453,7 @@ test('引擎按策略信号真正开出实盘仓：样本先落盘再写开仓�
     const position = engine.views.symbol(key, '1').position!;
     const aEntry = opened.a.entryQuote / opened.a.qty, bEntry = opened.b.entryQuote / opened.b.qty;
     assert.ok(Math.abs(position.entrySpread - (aEntry - bEntry) / bEntry * 1e4) < 1e-9, '入场价差按两腿实际成交均价');
+    assert.notEqual(position.entrySpread, opened.strategy!.entrySpread, '替身按含滑点的限价成交，实际成交价差与信号价差不同');
     assert.deepEqual([position.state, engine.views.state().trading.open], ['open', 1]);
   } finally { engine.close(); rmSync(dir, { recursive: true, force: true }); }
 });

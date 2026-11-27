@@ -35,7 +35,7 @@ usage() {
   --uninstall          停止并移除巡检服务，保留 /etc/main-watch 配置
 首次安装需要 --heartbeat-listen、--main 或 --checks 之一，以及 --webhook（或 --webhook-stdin）；之后不带参数重复执行即为升级。
 开启心跳后，先在副服务器读取令牌（不回显到主服务器命令行）：
-  sudo awk -F= '$1=="HEARTBEAT_TOKEN"{print $2}' /etc/main-watch/config
+  sudo sed -n 's/^HEARTBEAT_TOKEN=//p' /etc/main-watch/config
 再将令牌保存为文件后在主服务器（统一交易平台）上开启推送：
   sudo bash install.sh --watch-url http://<副服务器IP>:<端口>/heartbeat --watch-token-stdin < /path/to/heartbeat-token
 USAGE
@@ -478,7 +478,7 @@ if ((${#heartbeat[@]} && config_changed)); then
   host=${heartbeat[0]%:*}
   case $host in 0.0.0.0|'[::]') host='<副服务器公网IP>' ;; esac
   say "心跳接收监听 ${heartbeat[0]}。请在安全组放通主服务器到本机 TCP ${heartbeat[2]}，先在当前副服务器执行以下命令读取令牌："
-  printf '  sudo awk -F= '\''$1=="HEARTBEAT_TOKEN"{print $2}'\'' %s\n' "$config"
+  printf '  sudo sed -n '\''s/^HEARTBEAT_TOKEN=//p'\'' %s\n' "$config"
   say "将输出的令牌写入主服务器临时文件（如 /tmp/heartbeat-token，使用后删除）后，在主服务器（统一交易平台）执行："
   printf '  sudo bash install.sh --watch-url http://%s:%s/heartbeat --watch-token-stdin < /tmp/heartbeat-token\n' "$host" "${heartbeat[2]}"
 fi

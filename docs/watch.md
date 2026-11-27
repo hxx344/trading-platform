@@ -87,7 +87,7 @@ sudo bash install-watch.sh --heartbeat-listen 0.0.0.0:8792 --webhook <飞书机�
 先在**副服务器**读取心跳令牌（`/etc/main-watch/config` 仅保存在副服务器）：
 
 ```bash
-sudo awk -F= '$1=="HEARTBEAT_TOKEN"{print $2}' /etc/main-watch/config
+sudo sed -n 's/^HEARTBEAT_TOKEN=//p' /etc/main-watch/config
 ```
 
 将令牌保存为主服务器上的临时文件（例如 `/tmp/heartbeat-token`，接入后删除），再在**主服务器**执行：

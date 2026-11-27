@@ -52,8 +52,8 @@ export async function api<T>(path: string, { body, signal, timeoutMs = 15_000, m
     const response = await request();
     const data = await response.json().catch(() => null);
     controller.signal.throwIfAborted();
-    // A write answered with success went through even if its body cannot be read; the page refreshes to show it. A read
-    // without a readable body has no result: it fails without a status, like a lost answer, and the last data stays.
+    // Explicit empty write answers (204 or content-length: 0) succeeded; a non-empty unreadable 200 body leaves the outcome
+    // unknown, like a read without a readable body: it fails without a status, and a read keeps the last data.
     if (data === null) {
       if (writing && (response.status === 204 || response.headers.get('content-length') === '0')) return {} as T;
       if (writing) throw new Error('响应无法解析，结果未知；请刷新核对后再操作');

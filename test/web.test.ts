@@ -173,7 +173,7 @@ test('页面请求号：传入 settles 时只有它认可的拒绝才换编号�
   assert.notEqual(seen[5], seen[4], '确认流程拒绝后下一次是新请求');
 });
 
-test('页面请求层：网络错误、超时与读响应体时中断都不带状态码（结果未知）；拒绝带状态码；成功但响应体不可读仍算成功', async () => {
+test('页面请求层：网络错误、超时与读响应体时中断都不带状态码（结果未知）；拒绝带状态码；写入仅 204/空体算成功，非空不可读 200 按结果未知处理', async () => {
   const original = globalThis.fetch;
   const seen: { url: string; init: RequestInit }[] = [];
   const reply = (handler: (init: RequestInit) => Promise<Response>) => { globalThis.fetch = (async (url: string, init: RequestInit) => { seen.push({ url, init }); return handler(init); }) as typeof fetch; };
@@ -195,8 +195,10 @@ test('页面请求层：网络错误、超时与读响应体时中断都不带�
     reply(async () => new Response('<html>bad gateway</html>', { status: 502 }));
     await assert.rejects(api('/api/x', { body: {} }), (error: unknown) => error instanceof ApiError && error.status === 502 && /HTTP 502/.test(error.message));
 
+    reply(async () => new Response(null, { status: 204 }));
+    assert.deepEqual(await api('/api/x', { body: {} }), {}, '写入返回 204 空响应体仍算成功');
     reply(async () => new Response('not json', { status: 200 }));
-    assert.deepEqual(await api('/api/x', { body: {} }), {}, '写入成功但响应体不可读仍算成功');
+    await assert.rejects(api('/api/x', { body: {} }), (error: unknown) => statusOf(error) === undefined && /响应无法解析，结果未知/.test((error as Error).message), '写入返回非空损坏响应体按结果未知处理');
     await assert.rejects(api('/api/state'), (error: unknown) => statusOf(error) === undefined && /响应无法解析/.test((error as Error).message), '读取没有结果，按读取失败处理');
     reply(async () => Response.json({ ok: 1 }));
     assert.deepEqual(await api('/api/state'), { ok: 1 });

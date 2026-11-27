@@ -654,8 +654,17 @@ if ((import_workbench)); then
         [[ "$env_line" =~ ^[[:space:]]*(NODE_USE_ENV_PROXY|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY|http_proxy|https_proxy|all_proxy|no_proxy)=(.*)$ ]] || continue
         env_key=${BASH_REMATCH[1]} env_value=${BASH_REMATCH[2]}
         if [[ "$env_value" =~ ^\"(.*)\"$ || "$env_value" =~ ^\'(.*)\'$ ]]; then env_value=${BASH_REMATCH[1]}; fi
-        printf -v "$env_key" '%s' "$env_value"
-        export "$env_key"
+        case "$env_key" in
+          NODE_USE_ENV_PROXY) export NODE_USE_ENV_PROXY="$env_value" ;;
+          HTTP_PROXY) export HTTP_PROXY="$env_value" ;;
+          HTTPS_PROXY) export HTTPS_PROXY="$env_value" ;;
+          ALL_PROXY) export ALL_PROXY="$env_value" ;;
+          NO_PROXY) export NO_PROXY="$env_value" ;;
+          http_proxy) export http_proxy="$env_value" ;;
+          https_proxy) export https_proxy="$env_value" ;;
+          all_proxy) export all_proxy="$env_value" ;;
+          no_proxy) export no_proxy="$env_value" ;;
+        esac
       done <"$CONF_DIR/environment"
     fi
     exec "$NODE_BIN" "$release_dir/src/service/import-workbench.ts" "${import_args[@]}" 9>&-

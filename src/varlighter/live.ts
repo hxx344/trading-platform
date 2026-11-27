@@ -40,7 +40,7 @@ export interface LiveSignal { direction: Direction; notionalUsd: number; strateg
 export interface PendingOrder { leg: LegName; purpose: 'open' | 'hedge' | 'flatten' | 'close'; side: Side; qty: number; limit: number; reduceOnly: boolean; clientId: number; sentAt: number }
 export type LiveState = 'opening' | 'open' | 'closing' | 'stuck' | 'closed';
 export interface LivePosition {
-  id: string; /** 配对键。 */ symbol: string; /** v0.111.1 以前跟随的模拟持仓编号（只在旧记录里）。 */ paperId?: string; direction: Direction; ratio: number; state: LiveState;
+  id: string; /** 配对键。 */ symbol: string; /** v0.111.2 以前跟随的模拟持仓编号（只在旧记录里）。 */ paperId?: string; direction: Direction; ratio: number; state: LiveState;
   /** 开仓走到哪一步：a 下第一腿、b 下第二腿、settle 核对两腿并回补。 */ step: 'a' | 'b' | 'settle';
   openedAt: number; updatedAt: number; closedAt: number | null;
   a: LiveLeg; b: LiveLeg; /** 计划的 A 腿数量与限价；bLimit 是预演里 B 腿的限价，发第一腿前 B 的当前价不能比它差（旧记录没有）。 */ plan: { qty: number; limit: number; bLimit?: number };

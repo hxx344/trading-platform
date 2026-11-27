@@ -1114,7 +1114,7 @@ test('失联配对：总览列出，可停用；保存的配对键有上限', as
   const { engine, sockets, dispose } = seededEngine(store => {
     store.setState(SETTINGS_KEY, settings2({ [RH_BTC]: { ...DEFAULT_SYMBOL, enabled: true }, [GONE]: { ...DEFAULT_SYMBOL, enabled: true, cooldownMinutes: 120 } }), T0);
     store.addSamples([sample(T0 - 30 * 60_000, 100.1, 100, { symbol: GONE }), sample(T0 - 20 * 60_000, 100.1, 100, { symbol: RH_BTC })]);
-    // v0.111.1 以前的模拟持仓留在库里，不再显示，也不让配对算作有持仓。
+    // v0.111.2 以前的模拟持仓留在库里，不再显示，也不让配对算作有持仓。
     store.savePosition(position(GONE));
   });
   try {

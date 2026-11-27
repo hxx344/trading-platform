@@ -134,7 +134,7 @@ function ParamsPanel({ data, view, onChanged }: { data: SymbolView; view: StateV
       onChange={event => set({ regimes: event.target.checked ? [...form.regimes, regime] : form.regimes.filter(item => item !== regime) })} />{REGIME_LABELS[regime]}</label>)}</div>
     <div className="vl-options"><b>方向</b>{ALL_DIRECTIONS.map(direction => <label key={direction}><input type="checkbox" checked={form.directions.includes(direction)}
       onChange={event => set({ directions: event.target.checked ? [...form.directions, direction] : form.directions.filter(item => item !== direction) })} />{directionLabel(direction, data.a.venue, data.b.venue)}</label>)}</div>
-    <div className="vl-options"><label><input type="checkbox" checked={form.enabled} disabled={!data.eligible && !form.enabled} onChange={event => set({ enabled: event.target.checked })} />启用该标的的策略（实盘准备页勾选后才下真实订单）</label>
+    <div className="vl-options"><label><input type="checkbox" checked={form.enabled} disabled={!data.eligible && !form.enabled} onChange={event => set({ enabled: event.target.checked })} />启用该标的的策略（实盘总开关打开、实盘准备页勾选后才下真实订单）</label>
       {!data.eligible ? <span className="vl-warn">规格确认后才能启用</span> : null}</div>
     <div className="vl-actions">
       <label className="vl-field">回测范围<select value={btHours} onChange={event => setBtHours(Number(event.target.value))}>{BACKTEST_HOURS.map(value => <option key={value} value={value}>最近 {value / 24} 天</option>)}</select></label>

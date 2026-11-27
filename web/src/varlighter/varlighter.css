@@ -172,7 +172,7 @@ a.vl-symbol:hover{color:var(--accent)}
 .vl-help p{padding:0 14px 14px}
 @media (max-width:650px){.vl-help dl{grid-template-columns:minmax(0,1fr);gap:2px}.vl-help dd{margin-bottom:8px}}
 
-/* 模拟盘的行内勾选与详情页的自动配置 */
+/* 总览「策略」列的行内勾选与详情页的自动配置 */
 .vl-check{display:inline-flex;align-items:center;gap:6px;color:var(--text-secondary);cursor:pointer}
 .vl-check.on{color:var(--emerald);font-weight:600}
 .vl-check input{width:16px;height:16px;margin:0;accent-color:var(--emerald);cursor:pointer}

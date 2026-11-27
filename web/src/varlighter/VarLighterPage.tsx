@@ -109,10 +109,10 @@ function Overview({ view, onChanged }: { view: StateView; onChanged: () => Promi
   const pairFoot = [...combos.map(item => `${comboShort(item.combo)} ${item.pairs}`), customCount ? `手动 ${customCount}` : '', counts.review ? `待确认 ${counts.review}` : '', counts.mismatch ? `规格不同 ${counts.mismatch}` : ''].filter(Boolean).join(' · ');
   return <>
     <section className="vl-metrics" aria-label="概览">
-      <Metric label="开仓机会" value={`${hits} 个`} tone={hits ? 'up' : ''} accent={hits > 0} foot={hits ? '价差偏离已到开仓线，表格里绿色高亮' : '暂时没有配对的偏离到开仓线'} />
+      <Metric label="开仓机会" value={`${hits} 个`} tone={hits ? 'up' : ''} accent={hits > 0} foot={hits ? '价差偏离已到开仓线，表格里绿色高亮；含只采集、不下单的配对' : '暂时没有配对的偏离到开仓线'} />
       <Metric label="监控中的配对" value={`${view.rows.length} 个`} foot={pairFoot || '还没有配对'} />
       <Metric label="实盘今日净盈亏" value={signedUsd(trading.todayNetUsd)} tone={tone(trading.todayNetUsd)} foot={trading.on ? '实盘已打开 · 明细在实盘准备页' : '实盘关闭，不开新仓'} />
-      <Metric label="实盘持仓" value={`${trading.open} 笔`} foot={`名义金额 ${usd(trading.openNotionalUsd, 0)}（含开仓中、平仓中）`} />
+      <Metric label="实盘持仓" value={`${trading.open} 笔`} foot={`名义金额 ${usd(trading.openNotionalUsd, 0)}（含开仓中、平仓中、待处理）`} />
     </section>
     {view.orphans?.length ? <Orphans view={view} rows={view.orphans} write={orphanWrite} onChanged={onChanged} />
       : orphanWrite.message ? <div className="vl-actions"><Callout tone={orphanWrite.message.tone}>{orphanWrite.message.text}</Callout><button type="button" className="button secondary" onClick={orphanWrite.clear}>知道了</button></div> : null}
@@ -172,12 +172,12 @@ function Orphans({ view, rows, write, onChanged }: { view: StateView; rows: Orph
   };
   const close = async (row: OrphanRow) => {
     if (writeBusyRef.current !== null) return;
-    const id = row.position?.id;
+    const id = row.position?.state === 'open' ? row.position.id : null;
     if (!id) return;
-    if (!await dialog.confirm(`${label(row)}：${row.reason}。在两个交易所按市价平掉这笔实盘持仓？`, { title: '平掉实盘持仓', confirmLabel: '确认平仓', tone: 'danger' })) return;
-    if (!dialog.isAlive() || writeBusyRef.current !== null || !rowsRef.current.some(item => item.key === row.key && item.position?.id === id)) return;
+    if (!await dialog.confirm(`${label(row)}：${row.reason}。按两腿此刻的一档只减仓平掉这笔实盘持仓？没有报价时会等待、告警，最后转人工处理。`, { title: '平掉实盘持仓', confirmLabel: '确认平仓', tone: 'danger' })) return;
+    if (!dialog.isAlive() || writeBusyRef.current !== null || !rowsRef.current.some(item => item.key === row.key && item.position?.id === id && item.position.state === 'open')) return;
     void write.run(`close:${row.key}`, () => api(`${VARLIGHTER_BASE}/live/close`, { body: { id } }),
-      () => { void onChanged(); return `${label(row)} 已发出平仓，结果在实盘准备页`; });
+      () => { void onChanged(); return `${label(row)} 已发出平仓，还没有平掉；进展在实盘准备页`; });
   };
   return <section className="panel" aria-label="失联的标的">
     <div className="panel-heading"><h2>失联的标的</h2><span className="muted">下架、规格改判或长时间无样本；没有新样本就不会自动止损或超时平仓，可停用或对实盘持仓发平仓</span></div>
@@ -186,11 +186,11 @@ function Orphans({ view, rows, write, onChanged }: { view: StateView; rows: Orph
       <thead><tr><th>标的</th><th>状态</th><th>最后样本</th><th /></tr></thead>
       <tbody>{rows.map(row => <tr key={row.key}>
         <td><span className="vl-symbol">{row.symbol}</span><small>{row.a && row.b ? `${row.a.name} ↔ ${row.b.name}` : row.key}</small></td>
-        <td className="wrap">{row.reason}<small>{row.enabled ? <Badge tone="warn">已启用</Badge> : null} {row.position ? <>{directionShort(row.position.direction, row.a?.venue ?? null)} 持仓 {positionPnl(row.position)}</> : null}</small></td>
+        <td className="wrap">{row.reason}<small>{row.enabled ? <Badge tone="warn">已启用</Badge> : null} {row.position ? <>{directionShort(row.position.direction, row.a?.venue ?? null)} {row.position.state ? LIVE_STATE_LABELS[row.position.state] ?? row.position.state : '持有'} {positionPnl(row.position)}{row.position.state === 'stuck' ? <> · <a href={varLighterHref('ready')}>到实盘准备页处理</a></> : null}</> : null}</small></td>
         <td>{age(row.lastSampleAt, view.now)}</td>
         <td><div className="vl-actions">
           {row.enabled ? <button type="button" className="button secondary" disabled={write.busy !== null} onClick={() => disable(row)}>停用</button> : null}
-          {row.position ? <button type="button" className="button secondary" disabled={write.busy !== null} onClick={() => void close(row)}>平掉实盘持仓</button> : null}
+          {row.position?.state === 'open' ? <button type="button" className="button secondary" disabled={write.busy !== null} onClick={() => void close(row)}>平掉实盘持仓</button> : null}
         </div></td>
       </tr>)}</tbody>
     </table></div>

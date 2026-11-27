@@ -1,6 +1,6 @@
 # DEX 价差模块（原 Var / Lighter 价差回归）：方案与现状
 
-Var（Variational Omni）与 Lighter 两个场所——Lighter RH（`api.rh.lighter.xyz`）与 Lighter 主网（`mainnet.zklighter.elliot.ai`）——共有标的的价差采集、基线、回测、模拟盘与实盘前准备。**目前只做模拟盘：只读公开行情，不向任何交易所下单。**
+Var（Variational Omni）与 Lighter 两个场所——Lighter RH（`api.rh.lighter.xyz`）与 Lighter 主网（`mainnet.zklighter.elliot.ai`）——共有标的的价差采集、基线、回测、模拟盘与实盘前准备。本节以下为 v0.112.0 以前的方案记录；现状见下方提示。
 
 > **v0.112.0 起没有模拟盘**：策略持仓就是实盘持仓，引擎按策略信号直接让实盘开平仓；带 Var 腿的配对只采集、算基线与回测。下文中模拟盘的开平仓、成交、清空、「模拟盘」页签与 `paper` 接口都已去掉，信号、复核、风控与平仓规则照旧适用于实盘。见 [dexspread.md](dexspread.md) 第 18 节。
 

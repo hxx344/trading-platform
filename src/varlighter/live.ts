@@ -40,7 +40,7 @@ export interface LiveSignal { direction: Direction; notionalUsd: number; strateg
 export interface PendingOrder { leg: LegName; purpose: 'open' | 'hedge' | 'flatten' | 'close'; side: Side; qty: number; limit: number; reduceOnly: boolean; clientId: number; sentAt: number }
 export type LiveState = 'opening' | 'open' | 'closing' | 'stuck' | 'closed';
 export interface LivePosition {
-  id: string; /** 配对键。 */ symbol: string; /** v0.111.2 以前跟随的模拟持仓编号（只在旧记录里）。 */ paperId?: string; direction: Direction; ratio: number; state: LiveState;
+  id: string; /** 配对键。 */ symbol: string; /** v0.111.2 以前跟随的模拟持仓编号；v0.112.0 起写成持仓自己的编号，只为回滚时旧版本能认出并平掉，本版本不读。 */ paperId?: string; direction: Direction; ratio: number; state: LiveState;
   /** 开仓走到哪一步：a 下第一腿、b 下第二腿、settle 核对两腿并回补。 */ step: 'a' | 'b' | 'settle';
   openedAt: number; updatedAt: number; closedAt: number | null;
   a: LiveLeg; b: LiveLeg; /** 计划的 A 腿数量与限价；bLimit 是预演里 B 腿的限价，发第一腿前 B 的当前价不能比它差（旧记录没有）。 */ plan: { qty: number; limit: number; bLimit?: number };
@@ -526,8 +526,10 @@ ${reason}`;
         const late = blocker(pair, notionalUsd);
         if (late) { skip(pair.key, late); return; }
         const leg = (info: LegInfo, side: Side): LiveLeg => ({ venue: info.venue as KeyVenue, symbol: positionSymbol(info), side, qty: 0, entryQuote: 0, exitQty: 0, exitQuote: 0, feesUsd: 0, estimated: false, market: info.market, code: info.symbol });
+        const id = `l${time.toString(36)}-${(++sequence).toString(36)}`;
         const position: LivePosition = {
-          id: `l${time.toString(36)}-${(++sequence).toString(36)}`, symbol: pair.key, direction: signal.direction, ratio: pair.ratio, state: 'opening', step: 'a',
+          // paperId 取自己的编号：本版本不读它；回滚到 v0.111.2 时旧版本找不到这个编号的模拟持仓，会立即只减仓平掉（docs/dexspread.md 18.3）。
+          id, paperId: id, symbol: pair.key, direction: signal.direction, ratio: pair.ratio, state: 'opening', step: 'a',
           openedAt: time, updatedAt: time, closedAt: null, a: leg(pair.a, legA.side), b: leg(pair.b, legB.side), plan: { qty: Number(legA.qty), limit: Number(legA.limit), bLimit: Number(legB.limit) },
           pending: null, tries: 0, retryAt: 0, closeReason: null, singleLeg: false, netUsd: null, note: '',
           strategy: { ...signal.strategy, notionalUsd },

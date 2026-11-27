@@ -2227,7 +2227,7 @@ test('两腿行情流的配对按策略信号驱动实盘（docs/dexspread.md �
   // 总览的浮动按最近落盘的样本估：与下面第一次推送的行情相同。
   store.addSamples([sample(T0 - 1_000, 100.5, 100, { symbol: key })]);
   store.setState(LIVE_SETTINGS_KEY, { on: true, pairs: [key], limits: { perTradeUsd: 100, maxOpen: 1, dailyLossUsd: 20, slippageBps: 30 } }, T0);
-  // v0.111 写下的实盘持仓：带 paperId。实际成交的入场价差 40 基点，记下的信号价差 80 基点——判断按实际成交。
+  // 库里预置的实盘持仓（带开仓时的策略读数）。实际成交的入场价差 40 基点，记下的信号价差 80 基点——判断按实际成交。
   const leg = (venue: 'rh' | 'lighter', side: 'buy' | 'sell', entry: number) => ({ venue, symbol: 'BTC', side, qty: 1, entryQuote: entry, exitQty: 0, exitQuote: 0, feesUsd: 0, estimated: false });
   const held: LivePosition = { id: 'l-1', symbol: key, paperId: 'p-legacy', direction: 'a_rich', ratio: 1, state: 'open', step: 'settle', openedAt: T0 - 60_000, updatedAt: T0 - 60_000, closedAt: null,
     a: leg('rh', 'sell', 100.4), b: leg('lighter', 'buy', 100), plan: { qty: 1, limit: 100.1 }, pending: null, tries: 0, retryAt: 0, closeReason: null, singleLeg: false, netUsd: null, note: '',
@@ -2399,4 +2399,101 @@ test('Entropy 默认单边 0.2 基点（往返 0.4）与总览成本列；老库
       } finally { cEngine.close(); }
     } finally { rmSync(customDir, { recursive: true, force: true }); }
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('引擎按策略信号真正开出实盘仓：样本先落盘再写开仓意图，名义取较小值，手动参数不带平仓规则，入场价差按实际成交（docs/dexspread.md 第 18 节）', async t => {
+  const key = 'rh:BTC|lighter:BTC', dir = mkdtempSync(path.join(tmpdir(), 'tp-live-open-'));
+  const store = openVarLighterStore(path.join(dir, 'varlighter.sqlite')), keys = createLiveKeysStore(dir);
+  // 假值私钥，不对应任何真实账户。
+  keys.set('rh', { accountIndex: 11, apiKeyIndex: 5, privateKey: 'cd'.repeat(40) });
+  keys.set('lighter', { accountIndex: 12, apiKeyIndex: 5, privateKey: 'ab'.repeat(40) });
+  store.setState(SETTINGS_KEY, settings2({ [key]: { ...DEFAULT_SYMBOL, enabled: true, notionalUsd: 1000, entryBps: 15, cooldownMinutes: 0 } }, { ...DEFAULT_GLOBAL, minSamples: 10, minNetBps: 0, slippageBps: 0 }, ['rh|lighter']), T0);
+  store.addSamples(Array.from({ length: 12 }, (_, i) => sample(T0 - (12 - i) * 60_000, 100, 100, { symbol: key })));
+  store.setState(LIVE_SETTINGS_KEY, { on: true, pairs: [key], limits: { perTradeUsd: 100, maxOpen: 1, dailyLossUsd: 20, slippageBps: 30 } }, T0);
+  let clock = T0;
+  const placed: string[] = [];
+  const trader = (venue: string) => ({
+    async place(order: { side: string; qty: number; limit: number; reduceOnly: boolean }) {
+      placed.push(`${venue} ${order.side}`);
+      return { kind: 'done' as const, filledQty: order.qty, avgPrice: order.limit, note: '替身' };
+    },
+    async resolve() { return { kind: 'absent' as const, reason: '替身' }; },
+  });
+  const account = (index: number) => ({ code: 200, accounts: [{ account_index: index, collateral: '1000', available_balance: '1000', total_asset_value: '1000', positions: [] }] });
+  const market = { symbol: 'BTC', market_id: 1, market_type: 'perp', status: 'active', size_decimals: 4, price_decimals: 2, min_base_amount: '0.001', min_quote_amount: '10', taker_fee: '0', mark_price: '100' };
+  const sockets = new Map<string, FakeSocket>();
+  const engine = createVarLighterEngine({ store, now: () => clock,
+    fetchImpl: async (url: string) => url.includes('/account?') ? Response.json(account(Number(new URL(url).searchParams.get('value')))) : Response.json({ code: 200, order_book_details: [market] }),
+    connect: url => { const socket = new FakeSocket(); sockets.set(venueOf(url), socket); return socket; },
+    liveKeys: keys, signerProblem: () => null, traders: venue => trader(venue) as never });
+  const push = (venue: string, at: number, mid: number, type = 'update') => {
+    clock = at;
+    sockets.get(venue)!.push({ type: `${type}/market_stats`, channel: 'market_stats:all', market_stats: { 1: { market_id: 1, best_bid_price: String(mid - 0.01), best_ask_price: String(mid + 0.01), mark_price: String(mid) } } });
+  };
+  const book = (venue: string, mid: number) => sockets.get(venue)!.push({ type: 'subscribed/order_book', channel: 'order_book:1', order_book: { code: 0, bids: [{ price: String(mid - 0.01), size: '1000' }], asks: [{ price: String(mid + 0.01), size: '1000' }] } });
+  const saveLive = store.saveLive;
+  let sampledBeforeIntent: number | null | undefined;
+  t.mock.method(store, 'saveLive', (position: LivePosition) => { if (sampledBeforeIntent === undefined) sampledBeforeIntent = store.latest(key)?.t ?? null; return saveLive(position); });
+  try {
+    engine.startStreams();
+    for (const socket of sockets.values()) socket.open();
+    for (const venue of ['rh', 'lighter'] as const) await engine.refreshCatalog(new AbortController().signal, venue);
+    await engine.refreshAccounts(() => AbortSignal.timeout(1000));
+    push('rh', T0, 100, 'subscribed'); push('lighter', T0, 100, 'subscribed');
+    book('rh', 100); book('lighter', 100);
+    assert.equal(store.liveActive().length, 0);
+    // RH 冲高约 100 基点：卖 RH、买主网。
+    book('rh', 101); push('rh', T0 + 1_000, 101);
+    assert.equal(sampledBeforeIntent, T0 + 1_000, '写开仓意图前这一刻的样本已经落盘');
+    await engine.live()!.idle();
+    const [opened] = store.liveActive();
+    assert.deepEqual([opened?.state, opened?.direction, opened?.paperId, placed], ['open', 'a_rich', opened?.id, ['rh sell', 'lighter buy']]);
+    assert.equal(opened.strategy!.notionalUsd, 100, '名义取配对名义与单笔上限中较小的');
+    assert.equal(opened.strategy!.rules, undefined, '手动参数不带平仓规则');
+    const position = engine.views.symbol(key, '1').position!;
+    const aEntry = opened.a.entryQuote / opened.a.qty, bEntry = opened.b.entryQuote / opened.b.qty;
+    assert.ok(Math.abs(position.entrySpread - (aEntry - bEntry) / bEntry * 1e4) < 1e-9, '入场价差按两腿实际成交均价');
+    assert.deepEqual([position.state, engine.views.state().trading.open], ['open', 1]);
+  } finally { engine.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('实盘持仓还原成策略持仓：旧记录没有策略读数时名义取 A 腿成交额，部分平掉后按剩余数量，乘数折算 B 腿；失联配对的实盘持仓可手动平仓一次', async () => {
+  const gone = 'rh:GONE|lighter:GONE', key = 'rh:BTC|lighter:BTC@2', dir = mkdtempSync(path.join(tmpdir(), 'tp-live-strategy-'));
+  const store = openVarLighterStore(path.join(dir, 'varlighter.sqlite')), keys = createLiveKeysStore(dir);
+  // 假值私钥，不对应任何真实账户。
+  keys.set('rh', { accountIndex: 11, apiKeyIndex: 5, privateKey: 'cd'.repeat(40) });
+  keys.set('lighter', { accountIndex: 12, apiKeyIndex: 5, privateKey: 'ab'.repeat(40) });
+  const params = { ...DEFAULT_SYMBOL, enabled: true };
+  store.setState(SETTINGS_KEY, { ...settings2({ [gone]: params, [key]: params }, { ...DEFAULT_GLOBAL, minSamples: 10 }, ['rh|lighter']),
+    pairs: [{ a: { venue: 'rh', symbol: 'BTC' }, b: { venue: 'lighter', symbol: 'BTC' }, ratio: 2, kind: 'crypto', note: '' }] }, T0);
+  store.setState(LIVE_SETTINGS_KEY, { on: true, pairs: [key, gone], limits: { perTradeUsd: 100, maxOpen: 3, dailyLossUsd: 20, slippageBps: 30 } }, T0);
+  const leg = (venue: 'rh' | 'lighter', symbol: string, side: 'buy' | 'sell', qty: number, entry: number, exitQty = 0) =>
+    ({ venue, symbol, side, qty, entryQuote: qty * entry, exitQty, exitQuote: exitQty * entry, feesUsd: 0, estimated: false });
+  const base = { ratio: 1, step: 'settle' as const, openedAt: T0 - 60_000, updatedAt: T0 - 60_000, closedAt: null, plan: { qty: 2, limit: 100 }, pending: null, tries: 0, retryAt: 0,
+    closeReason: null, singleLeg: false, netUsd: null, note: '' };
+  // v0.111.2 的旧记录：没有 strategy，A 腿 2 个已平掉 0.5，持仓卡住等人工。乘数 2：B 腿每单位折 2 倍。
+  store.saveLive({ ...base, id: 'l-old', symbol: key, paperId: 'p-old', direction: 'a_rich', ratio: 2, state: 'stuck',
+    a: leg('rh', 'BTC', 'sell', 2, 100.4, 0.5), b: leg('lighter', 'BTC', 'buy', 4, 50, 1) });
+  store.saveLive({ ...base, id: 'l-gone', symbol: gone, direction: 'a_cheap', state: 'open',
+    a: leg('rh', 'GONE', 'buy', 1, 10), b: leg('lighter', 'GONE', 'sell', 1, 10.02) });
+  const market = (symbol: string) => ({ symbol, market_id: 1, market_type: 'perp', status: 'active', size_decimals: 4, price_decimals: 2, taker_fee: '0', mark_price: '100' });
+  const sockets = new Map<string, FakeSocket>();
+  const engine = createVarLighterEngine({ store, now: () => T0, fetchImpl: async () => Response.json({ code: 200, order_book_details: [market('BTC')] }),
+    connect: url => { const socket = new FakeSocket(); sockets.set(venueOf(url), socket); return socket; },
+    liveKeys: keys, signerProblem: () => null, traders: () => ({ async place() { return { kind: 'rejected' as const, reason: '替身不下单' }; }, async resolve() { return { kind: 'absent' as const, reason: '替身' }; } }) as never });
+  try {
+    engine.startStreams();
+    for (const socket of sockets.values()) socket.open();
+    for (const venue of ['rh', 'lighter'] as const) await engine.refreshCatalog(new AbortController().signal, venue);
+    for (const socket of sockets.values()) socket.push(RH_SNAPSHOT);
+    const held = engine.views.symbol(key, '1').position!;
+    assert.deepEqual([held.state, held.qty, held.notionalUsd, held.aEntry, held.bEntry, held.ratio], ['stuck', 1.5, 200.8, 100.4, 100, 2]);
+    assert.ok(Math.abs(held.entrySpread - 40) < 1e-9, `入场价差 (100.4 − 2×50) / (2×50)：${held.entrySpread}`);
+    const orphan = engine.views.state().orphans.find(item => item.key === gone)!;
+    assert.deepEqual([orphan.key, orphan.position?.id, orphan.position?.state, orphan.position?.direction], [gone, 'l-gone', 'open', 'a_cheap']);
+    assert.deepEqual(engine.views.liveClose({ id: 'l-gone' }), { ok: true });
+    assert.equal(store.liveActive().find(item => item.id === 'l-gone')?.state, 'closing');
+    assert.deepEqual(code(() => engine.views.liveClose({ id: 'l-gone' })), [409, 'busy'], '平仓中的不能再发');
+    assert.deepEqual(code(() => engine.views.liveClose({ id: 'l-old' })), [409, 'busy'], '需要人工处理的不能发平仓');
+  } finally { engine.close(); rmSync(dir, { recursive: true, force: true }); }
 });

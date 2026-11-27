@@ -210,7 +210,7 @@ function SourcesPanel({ view }: { view: StateView }) {
         <small>报价收到时已过去 {varSource.quoteAgeMedianMs === null ? '—' : `${plain(varSource.quoteAgeMedianMs / 1000, 0)} 秒`}（中位数）</small></td></tr>
       <tr><td>行情流配对<small>两腿都是行情流</small></td><td className="wrap">{live ? `上次 ${age(live.at, now)}：到期 ${live.due}，写入 ${live.written}，缺一档 ${live.noTop}` : '还没有采样'}
         {live && Object.keys(live.blocked).length ? <small>{Object.entries(live.blocked).map(([reason, count]) => `${reason} ${count}`).join('；')}</small> : null}
-        {push ? <small>按推送判断（启动以来）：{push.checks.toLocaleString('zh-CN')} 次，成交 {push.trades} 次{push.lastTradeAt === null ? '' : `，最近 ${age(push.lastTradeAt, now)}`}{push.lastBlocked ? `；最近被挡：${push.lastBlocked.symbol} ${push.lastBlocked.reason}（${age(push.lastBlocked.at, now)}）` : ''}</small> : null}</td></tr>
+        {push ? <small>按推送判断（启动以来）：{push.checks.toLocaleString('zh-CN')} 次，发出开平仓 {push.trades} 次{push.lastTradeAt === null ? '' : `，最近 ${age(push.lastTradeAt, now)}`}{push.lastBlocked ? `；最近被挡：${push.lastBlocked.symbol} ${push.lastBlocked.reason}（${age(push.lastBlocked.at, now)}）` : ''}</small> : null}</td></tr>
       {token ? <tr><td>Var token 询价</td><td className="wrap">{token.status === 'ready' ? token.statusName : <span className="vl-down">{token.statusName}</span>}
         {token.okAt === null ? ' · 还没有成功过' : ` · 最近成功 ${age(token.okAt, now)}${token.lagMs === null ? '' : `，收到时距 Var 报价时刻 ${plain(token.lagMs / 1000, 1)} 秒`}`}
         {poll ? <small>上次：成功 {poll.tokenOk ?? 0}，失败 {poll.tokenFailed ?? 0}，未询 {poll.tokenSkipped ?? 0}{token.expiresAt === null ? '' : `；token 到期 ${new Date(token.expiresAt).toLocaleString('zh-CN', { hour12: false })}`}</small> : null}

@@ -904,8 +904,10 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       sample.decisionAt = now();
       const mark = markToMarket(position, decision.spread);
       return () => {
-        store.event(now(), 'live', pair.key, `平仓信号（${CLOSE_REASON_NAMES[decision.reason]}）：价差 ${fmt(mark.exitSpread, 1)} 基点，相对入场 ${fmt(mark.pnlBps, 1)} 基点`);
+        // 先交给实盘平仓，事件写失败也不影响平仓。
         liveTrader?.signalClose(pair.key, decision.reason);
+        try { store.event(now(), 'live', pair.key, `平仓信号（${CLOSE_REASON_NAMES[decision.reason]}）：价差 ${fmt(mark.exitSpread, 1)} 基点，相对入场 ${fmt(mark.pnlBps, 1)} 基点`); }
+        catch (error) { log(`varlighter: 平仓信号事件写入失败：${message(error)}`); }
       };
     }
     if (decision.kind !== 'open' || !baseline) throw new Error('缺少开仓信号或基线');

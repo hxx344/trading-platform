@@ -58,13 +58,19 @@ export function createMarketReader({ connectors, accounts, symbols, now = Date.n
   const pushedFor = (venue: Venue, symbol: string): PushedBook | null => {
     try { return pushed?.(venue, symbol) ?? null; } catch { return null; }
   };
+  // Whether the source a pushed book came from still stands. Age alone does not end it: the next round reads the leg over
+  // REST, and every user of a book applies its own age limit. A source that cannot tell is trusted only while it has a
+  // usable book, and a lookup that throws counts as lost.
+  const pushedLive = (venue: Venue, symbol: string): boolean => {
+    try { return pushed?.live ? pushed.live(venue, symbol) : !!pushed?.(venue, symbol); } catch { return false; }
+  };
   const slot = (venue: Venue, symbol: string): BookSlot => {
     const key = `${venue}:${symbol}`;
     let found = books.get(key);
     if (!found) { found = { bid: null, ask: null, receivedAt: null, source: null, failedAt: null, error: null }; books.set(key, found); }
     if (marketEpoch && found.receivedAt !== null && !found.error) {
       const epoch = marketEpoch();
-      if (!epoch || epochs.get(found) !== epoch || (found.source === 'pushed' && !pushedFor(venue, symbol))) {
+      if (!epoch || epochs.get(found) !== epoch || (found.source === 'pushed' && !pushedLive(venue, symbol))) {
         found.error = '原盘口来源已失效，等待新盘口';
       }
     }

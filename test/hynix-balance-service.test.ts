@@ -10,6 +10,7 @@ import type { AddressInfo } from 'node:net';
 import { ContractError } from '../src/contracts.ts';
 import { SIM_ACCOUNTS, SIM_BINDINGS, createSimulatedVenues } from '../src/simulation.ts';
 import { createHynixMarket, RULES_READ_MS, type BalanceRow } from '../src/hynix/market.ts';
+import { pushedBooks, type CollectorBook } from '../src/oil/pushed.ts';
 import { DEFAULT_BALANCE_SETTINGS } from '../src/hynix/balance.ts';
 import { createBalanceStore, HYNIX_DATABASE } from '../src/hynix/balance-store.ts';
 import { BALANCE_ALERT_DELAY_MS, BALANCE_ALERT_REPEAT_MS, BALANCE_FAILURE_LOG_MS, createBalanceAlerts, fixed2 } from '../src/hynix/balance-alert.ts';
@@ -108,6 +109,28 @@ test('读数不可用：持仓未读到、读取失败或过期，盘口缺失�
   assert.match(reason(binance()), /^持仓读数已过期$/);
   await v.market.refreshPositions();
   assert.equal(binance().status, 'paired');
+});
+
+test('读数（独立行情服务）：两轮读取之间推送盘口过了 3 秒，读数照常给出；采集器不再持有该腿盘口才不可用', async () => {
+  const clock = { now: START };
+  const { binance, bybit } = createSimulatedVenues(() => clock.now);
+  const books: Record<string, CollectorBook> = {
+    'binance:SKHYUSDT': { bid: 41.2, ask: 41.24, at: START - 2_500, multiplier: 1 },
+    'bybit:SKHYNIXUSDT': { bid: 400.1, ask: 400.3, at: START - 2_500, multiplier: 1 },
+  };
+  const market = createHynixMarket({ connectors: [binance, bybit], accounts: SIM_BINDINGS, now: () => clock.now, marketEpoch: () => 'a/1',
+    pushed: pushedBooks(() => ({ book: (exchange, symbol) => books[`${exchange}:${symbol}`] ?? null }), () => clock.now) });
+  binance.setPosition(SIM_ACCOUNTS.binance, 'SKHYUSDT', 'short', '10');
+  binance.setPosition(SIM_ACCOUNTS.binance, 'SKHYNIXUSDT', 'long', '0.9');
+  await market.refreshQuotes(); await market.refreshPositions();
+  assert.deepEqual(market.view().books.filter(item => item.source === 'pushed').map(item => `${item.venue}:${item.symbol}`), ['binance:SKHYUSDT', 'bybit:SKHYNIXUSDT']);
+  clock.now += 1_000;
+  const rows = market.balanceView(WIDE);
+  assert.deepEqual([row(rows, 'binance').status, row(rows, 'bybit').status], ['paired', 'none'], `${reason(row(rows, 'binance'))} / ${reason(row(rows, 'bybit'))}`);
+  delete books['bybit:SKHYNIXUSDT'];
+  const after = market.balanceView(WIDE);
+  assert.equal(row(after, 'binance').status, 'paired');
+  assert.equal(reason(row(after, 'bybit')), 'SKHYNIXUSDT 盘口最近一次读取失败：原盘口来源已失效，等待新盘口');
 });
 
 test('合约规则：随持仓读取读一次，10 分钟内不重读；没读到时不可用；重读失败保留上次的值，下一轮再读', async () => {

@@ -37,6 +37,11 @@ test('推送盘口可用性：两边齐全且买一 < 卖一、乘数为 1、交
   assert.equal(source('binance', 'BZUSDT'), null);
   late = collector({ 'binance:BZUSDT': at() });
   assert.equal(source('binance', 'BZUSDT')?.bid, '74.1');
+  // `live`: the collector holds a book for the leg, whatever its age or shape; OKX by instrument id, as the book itself.
+  assert.equal(pushedBooks(() => null, () => NOW).live!('binance', 'BZUSDT'), false, '没有采集器');
+  const held = pushedBooks(() => collector({ 'binance:BZUSDT': at({ at: NOW - 60_000 }), 'okx:SKHY-USDT-SWAP': at(), 'okx:CLUSDT': at() }), () => NOW);
+  assert.deepEqual([held('binance', 'BZUSDT'), held.live!('binance', 'BZUSDT')], [null, true], '过期的盘口不可用，但来源仍在');
+  assert.deepEqual([held.live!('okx', 'SKHYUSDT'), held.live!('okx', 'CLUSDT'), held.live!('bybit', 'BZUSDT')], [true, false, false], 'OKX 按合约编号找；没有该腿');
 });
 
 /** A REST connector that counts its book reads. */
@@ -139,6 +144,59 @@ test('读取器：REST 失败（超时按读取开始时刻）后，早于失败
   assert.deepEqual([bz().source, bz().error, rest.reads.length - before], ['rest', null, 2], '推送查询抛错：改走 REST，不记为读取失败');
 });
 
+test('读取器（独立行情服务）：推送盘口过了 3 秒而采集器仍持有该腿盘口时不算来源失效，下一轮改读 REST；采集器不再持有、行情连接换代或断开才失效', async () => {
+  const clock = { now: NOW };
+  const books: Record<string, CollectorBook> = { 'binance:BZUSDT': at({ at: NOW - 2_500 }) };
+  const rest = restVenue('binance', clock, { BZUSDT: ['74.00', '74.05'], CLUSDT: ['70.00', '70.05'] });
+  let epoch: string | null = 'a/1';
+  const market = createOilMarket({ connectors: [rest.connector] as never, accounts: [], now: () => clock.now, pushed: pushedBooks(() => collector(books), () => clock.now), marketEpoch: () => epoch });
+  const bz = () => market.view().books.find(row => row.symbol === 'BZUSDT')!;
+  const lost = '原盘口来源已失效，等待新盘口';
+  await market.refreshQuotes();
+  assert.deepEqual([bz().source, bz().error], ['pushed', null]);
+  // Between two rounds the page reads the leg while its pushed book is already 3.5 s old (Binance pushes about every 5 s).
+  clock.now += 1_000;
+  assert.deepEqual([bz().source, bz().error, bz().receivedAt], ['pushed', null, NOW - 2_500], '只是过了 3 秒：盘口照旧，由各使用方自己的过期线判断');
+  clock.now += 2_000;
+  await market.refreshQuotes();
+  assert.deepEqual([bz().source, bz().error, bz().receivedAt], ['rest', null, clock.now], '下一轮没有 3 秒内的推送：读 REST');
+
+  // The collector no longer vouches for the leg (its venue connection closed): the book taken from it is not kept.
+  books['binance:BZUSDT'] = at({ at: clock.now + 10 });
+  clock.now += 100;
+  await market.refreshQuotes();
+  assert.deepEqual([bz().source, bz().error], ['pushed', null]);
+  delete books['binance:BZUSDT'];
+  assert.equal(bz().error, lost, '采集器不再持有该腿盘口');
+  await market.refreshQuotes();
+  assert.deepEqual([bz().source, bz().error], ['rest', null]);
+
+  // A new market connection, or none: every book read over the old one is refused until it is read again.
+  epoch = 'a/2';
+  assert.deepEqual(market.view().books.map(row => row.error), [lost, lost]);
+  clock.now += 100;
+  await market.refreshQuotes();
+  assert.deepEqual(market.view().books.map(row => row.error), [null, null]);
+  epoch = null;
+  assert.deepEqual(market.view().books.map(row => row.error), [lost, lost]);
+
+  // A source that cannot say whether it still holds the leg is judged as before: no usable pushed book, no trust.
+  epoch = 'a/3';
+  const source = pushedBooks(() => collector(books), () => clock.now);
+  const plain = createOilMarket({ connectors: [rest.connector] as never, accounts: [], now: () => clock.now, pushed: (venue, symbol) => source(venue, symbol), marketEpoch: () => epoch });
+  books['binance:BZUSDT'] = at({ at: clock.now - 2_500 });
+  await plain.refreshQuotes();
+  const plainBz = () => plain.view().books.find(row => row.symbol === 'BZUSDT')!;
+  assert.deepEqual([plainBz().source, plainBz().error], ['pushed', null]);
+  clock.now += 1_000;
+  assert.equal(plainBz().error, lost);
+  // A lookup that throws counts as a source that no longer holds the leg.
+  const throwing = Object.assign((venue: 'binance' | 'bybit' | 'okx', symbol: string) => source(venue, symbol), { live: () => { throw new Error('采集器异常'); } });
+  const guarded = createOilMarket({ connectors: [rest.connector] as never, accounts: [], now: () => clock.now, pushed: throwing, marketEpoch: () => epoch });
+  books['binance:BZUSDT'] = at({ at: clock.now - 100 });
+  await guarded.refreshQuotes();
+  assert.equal(guarded.view().books.find(row => row.symbol === 'BZUSDT')!.error, lost);
+});
 test('规则：推送盘口没变（交易所时间相同）不重复计数，新的推送盘口才计', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'tp-oil-pushed-'));
   const clock = { now: NOW };

@@ -13,8 +13,11 @@ export interface CollectorBook { bid: number; ask: number; at: number; multiplie
 export interface CollectorBooks { book(exchange: string, symbol: string): CollectorBook | null }
 /** A usable pushed book: decimal strings and the venue time. */
 export interface PushedBook { bid: string; ask: string; at: number }
-/** The book readers' source; null when the collector is not configured (or not open). */
-export type PushedBooks = (venue: Venue, symbol: string) => PushedBook | null;
+/**
+ * The book readers' source; null when the collector is not configured (or not open). `live` says whether the collector still
+ * holds a book for the leg at all, whatever its age: a reader keeps a book it took from here only while that holds.
+ */
+export type PushedBooks = ((venue: Venue, symbol: string) => PushedBook | null) & { live?: (venue: Venue, symbol: string) => boolean };
 
 /** The collector's symbol for a contract: OKX lists instrument ids, Binance and Bybit the contract name itself. */
 export function collectorSymbol(venue: Venue, symbol: string): string | null {
@@ -44,5 +47,11 @@ export function pushedBook(collector: CollectorBooks | null, venue: Venue, symbo
 
 /** The readers' source over a collector that may be opened (or not) after them. */
 export function pushedBooks(collector: () => CollectorBooks | null, now: () => number): PushedBooks {
-  return (venue, symbol) => pushedBook(collector(), venue, symbol, now());
+  // The collector returns no book once the leg's venue connection is closed or its market connection replaced; a venue that
+  // simply has not pushed for a while (Binance samples about every 5 s, a quiet contract longer) still has one.
+  const live = (venue: Venue, symbol: string): boolean => {
+    const key = collectorSymbol(venue, symbol);
+    return key !== null && !!collector()?.book(venue, key);
+  };
+  return Object.assign((venue: Venue, symbol: string) => pushedBook(collector(), venue, symbol, now()), { live });
 }

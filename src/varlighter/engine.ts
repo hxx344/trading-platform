@@ -14,8 +14,8 @@ import { ACCOUNT_HISTORY_LIMIT, ACCOUNT_HISTORY_WINDOW_MS, COLLATERAL_ASSET, fet
 import { KEY_VENUES, configuredVenues, type DexAccounts, type DexAccountsSource, type KeyVenue } from '../dex/keys.ts';
 import { ASSET_KINDS, COMBOS, DEFAULT_COMBOS, KIND_NAMES, LEG_SYMBOL, LIVE_VENUES, RATIO_MAX, RATIO_MIN, REGIME_NAMES, SAMPLE_FIELDS, SAMPLE_FORMAT, VENUE_IDS, VENUE_NAMES,
   bothLive, bucketOf, comboName, comboPairs, comboVenues, customPairInfo, formatRatio, isLive, legKey, lighterMarket, midBasis, pairKey, pairTitle, parsePairKey,
-  regimeOf, regimesOf, sameSymbol, sortPairs, spreadOf, upgradeKey, varHourly, varMarket, varQuoteQty,
-  type AssetKind, type Combo, type CustomPair, type Leg, type LegInfo, type LiveVenue, type MarketSpec, type PairInfo, type Sample, type SizeBucket, type VarListing, type VenueId } from './model.ts';
+  regimeOf, regimesOf, sameSymbol, sortPairs, spreadOf, targetSpread, upgradeKey, varHourly, varMarket, varQuoteQty,
+  type AssetKind, type Combo, type CustomPair, type Leg, type LegInfo, type LiveVenue, type MarketSpec, type PairInfo, type Sample, type SizeBucket, type Spread, type VarListing, type VenueId } from './model.ts';
 import { orderPlan, type OrderPlan } from './plan.ts';
 import { LiveError, createLiveTrader, type LiveTrader } from './live.ts';
 import { LiveKeysError, type LighterKey, type LiveKeys, type LiveKeysStore } from './livekeys.ts';
@@ -24,7 +24,7 @@ import { createEntropyTrader, createLighterTrader, scrub, type VenueTrader } fro
 import { BaselineTracker, LIVE_BASELINE_GAP_MS, suggestedEntryBps, symbolStats, type Baseline, type RegimeStats } from './stats.ts';
 import { DEFAULT_GLOBAL, DEFAULT_SYMBOL, DIRECTIONS, ParamsError, closePosition, closeSpread, confirmOpen, decide, openEconomics, slippageBudgetBps, fundingEstimate, legFeeBps,
   markToMarket, openBlocker, openPosition, readGlobalParams, readSymbolParams, recommendParams, upgradeDirection, upgradeGlobal,
-  CLOSE_REASON_NAMES, DIRECTION_NAMES, type ClosedTrade, type GlobalParams, type LegFees, type Position, type SymbolParams } from './strategy.ts';
+  CLOSE_REASON_NAMES, DIRECTION_NAMES, type CloseReason, type ClosedTrade, type GlobalParams, type LegFees, type Position, type SymbolParams } from './strategy.ts';
 import { COOLDOWN_KEY, SAMPLE_RETENTION_DAYS, SETTINGS_KEY, type LegacyUpgrade, type VarLighterStore } from './store.ts';
 import type { AccountsRefreshResult, AccountsView, AutoView, BacktestView, CatalogEntry, DepthStatus, LegRef, LiveStats, OrphanRow, PushStats, PaperView, PollStats, PositionMark, ReadinessItem, ReadinessView, SamplesView, Settings, SourceState, StateRow, StateView,
   SymbolPoint, SymbolView, VenueAccountView, VenuePositionView, VenueStatus, LiveView } from './views.ts';
@@ -71,6 +71,12 @@ const LIGHTER_AUTH_TTL_SEC = 3600;
 const LIGHTER_AUTH_RENEW_MS = 50 * 60_000;
 /** 「账户资金」就绪的下限：每个要用的场所可用余额不少于实盘起步的单笔名义金额（docs/dexspread.md 12.6）。 */
 export const READY_FUNDING_USD = 100;
+/**
+ * Lighter 主网与 RH 标准账户的吃单延迟（docs/dexspread.md 12.11）：模拟盘里这两个场所的腿按判断后这么久那一刻的一档成交，
+ * 其余场所（Var、Entropy）仍按判断时刻的价。
+ */
+export const LIGHTER_TAKER_DELAY_MS = 300;
+const TAKER_DELAYED: ReadonlySet<VenueId> = new Set(['lighter', 'rh']);
 
 export class VarLighterError extends Error {
   readonly status: number; readonly code: string;
@@ -95,7 +101,8 @@ export interface EngineOptions { store: VarLighterStore; fetchImpl?: FetchLike; 
   /** 页面录入的实盘凭据（第 13 节）；不给就没有实盘。 */ liveKeys?: LiveKeysStore;
   /** 下单连接器（测试里换成替身）。 */ traders?: (venue: KeyVenue, keys: LiveKeys) => VenueTrader;
   /** Lighter 签名器缺什么（测试里换成 null）。 */ signerProblem?: () => string | null;
-  /** Lighter 历史接口鉴权令牌（测试与本地预览可注入替身，返回 null 表示仅只读）。 */ lighterAuth?: (venue: 'lighter' | 'rh', key: LighterKey) => Promise<string | null> }
+  /** Lighter 历史接口鉴权令牌（测试与本地预览可注入替身，返回 null 表示仅只读）。 */ lighterAuth?: (venue: 'lighter' | 'rh', key: LighterKey) => Promise<string | null>;
+  /** Lighter 两个场所的吃单延迟（毫秒），默认 LIGHTER_TAKER_DELAY_MS；0 表示按判断时刻成交。 */ takerDelayMs?: number }
 /** Lighter 两条链的 chainId（签名用）。 */
 export const LIGHTER_CHAIN_ID = { lighter: 304, rh: 466324 } as const;
 
@@ -170,7 +177,7 @@ interface VenueRuntime {
 }
 interface DepthEntry { leg: LegInfo; snapshot: DepthSnapshot | null; error: string | null }
 
-export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now = Date.now, log = () => {}, quoter, accounts: envAccounts = () => ({ accounts: {}, problem: null }), liveKeys, traders, signerProblem = lighterSignerProblem, lighterAuth }: EngineOptions) {
+export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now = Date.now, log = () => {}, quoter, accounts: envAccounts = () => ({ accounts: {}, problem: null }), liveKeys, traders, signerProblem = lighterSignerProblem, lighterAuth, takerDelayMs = LIGHTER_TAKER_DELAY_MS }: EngineOptions) {
   /** 账户标识的来源：页面录入的凭据优先，没录的场所用安装时录入的账户（keys.env）。页面凭据文件读不懂时按有问题处理。 */
   const accountSource: DexAccountsSource = () => {
     const base = envAccounts(), page = liveKeys?.accounts() ?? {}, pageProblem = liveKeys?.read().problem ?? null;
@@ -300,6 +307,13 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
   const lastQuoteAt = new Map<string, number>(), lastLiveAt = new Map<string, number>(), latest = new Map<string, Sample>();
   const trackers = new Map<string, BaselineTracker>();
   const positions = new Map<string, Position>();
+  /**
+   * 等吃单延迟的模拟成交（按配对键）：开仓已按判断时刻记仓（实盘跟单不多等），到点后把延迟场所的腿改按那一刻的一档；
+   * 平仓到点后才按那一刻的一档结算。在等的配对不再判断开平仓。只在内存里：重启后开仓保留判断时刻的价，平仓由下一次判断重新触发。
+   */
+  type PendingFill = { id: string; due: number; sample: Sample } & ({ kind: 'open' } | { kind: 'close'; reason: CloseReason; spread: Spread });
+  const fills = new Map<string, PendingFill>();
+  const fillDelay = (pair: { a: Leg; b: Leg }): number => takerDelayMs > 0 && (TAKER_DELAYED.has(pair.a.venue) || TAKER_DELAYED.has(pair.b.venue)) ? takerDelayMs : 0;
   let cooldown = Object.fromEntries(Object.entries(store.state<Record<string, number>>(COOLDOWN_KEY) ?? {}).filter(([key, until]) => parsePairKey(key) && Number.isFinite(until)));
   /** 近 24 小时每个配对的样本数（按主键数，10 分钟内只数一次，其间随写入累加），每个配对首条样本时刻与全库首条（清理后重读）。 */
   const recent = new Map<string, { at: number; count: number }>();
@@ -391,7 +405,8 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     takerFeeBps: leg => legFeeBps(settings.global, leg.venue, leg.market.takerFeeBps) ?? 0,
     account: venue => { const read = accountReads.get(venue); return read && read.at !== null && read.snapshot ? { at: read.at, snapshot: read.snapshot } : null; },
     readAccount: (venue, signal) => fetchAccount(fetchImpl, signal, venue, accountSource().accounts),
-    hasPaper: (key, paperId) => positions.get(key)?.id === paperId,
+    // 模拟平仓在等吃单延迟时，对实盘来说这笔模拟仓已经平了：还没发出的开仓意图就此作废。
+    hasPaper: (key, paperId) => positions.get(key)?.id === paperId && fills.get(key)?.kind !== 'close',
     signalFor: () => anySignal([liveStop.signal], REQUEST_TIMEOUT_MS),
     stopped: () => liveStop.signal.aborted,
   }) : null;
@@ -681,9 +696,11 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
   /** 每个配对每批只有一条样本，先用已有历史判断信号。大多数样本批写，有模拟开平仓动作的按时序逐一决定。 */
   function ingest(fresh: { pair: PairInfo; sample: Sample }[], blocked: Record<string, number>, cursors: Map<string, number>): number {
     const passive: Sample[] = [], active: SampleStep[] = [], errors: unknown[] = [];
+    settleFills();
     fresh.sort((x, y) => x.sample.t - y.sample.t);
     for (const { pair, sample } of fresh) {
       try {
+        if (fills.has(pair.key)) { sample.decisionAt = now(); passive.push(sample); continue; }
         const track = tracker(pair), params = paramsOf(pair.key), position = positions.get(pair.key) ?? null;
         const baseline = track.value(sample.regime, sample.t), decision = decide(sample, baseline, position ? holdParams(position) : params, position);
         if ((decision.kind === 'open' && params.enabled) || decision.kind === 'close') {
@@ -798,12 +815,13 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
    * 有开平仓动作时才把这一刻的样本写库并成交（规则与定时采样的相同）；没有动作或被挡住的不写库，样本仍由定时采样留。
    */
   function onTop(venue: LiveVenue, marketId: number): void {
+    if (running) settleFills();
     const list = running ? pushPairs.get(`${venue}:${marketId}`) : undefined;
     if (!list) return;
     const time = now();
     for (const pair of list) {
       const position = positions.get(pair.key) ?? null;
-      if (!position && !storedOf(pair.key).enabled) continue;
+      if ((!position && !storedOf(pair.key).enabled) || fills.has(pair.key)) continue;
       try {
         const a = liveLeg(pair.a, time, time, undefined, PUSH_DEPTH_REUSE_MS), b = liveLeg(pair.b, time, time, undefined, PUSH_DEPTH_REUSE_MS);
         if (!a || !b) continue;
@@ -827,7 +845,9 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
   function tradeDecision({ pair, sample, params, position, baseline, decision }: SampleStep): string | (() => void) {
     if (decision.kind === 'close' && position) {
       sample.decisionAt = now();
-      const spread = closeSpread(sample, position) ?? decision.spread;
+      const spread = closeSpread(sample, position) ?? decision.spread, delay = fillDelay(pair);
+      // 实盘跟单马上平（真实下单自己就有吃单延迟），模拟盘到点后按那一刻的价结算。
+      if (delay) return () => { fills.set(pair.key, { kind: 'close', id: position.id, due: sample.decisionAt! + delay, sample, reason: decision.reason, spread }); followClose(position.symbol, decision.reason); };
       return () => { finish(position, sample, spread, decision.reason); };
     }
     if (decision.kind !== 'open' || !baseline) throw new Error('模拟盘缺少开仓信号或基线');
@@ -848,6 +868,8 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     return () => {
       store.openPosition(opened, { at: now(), kind: 'open', message: `${directionText(pair, opened.direction)} ${fmt(opened.notionalUsd, 0)} 美元，价差 ${fmt(opened.entrySpread, 1)} 基点，基线 ${fmt(baseline.median, 1)}，偏离 ${fmt(confirmed.deviation, 1)}（报价时刻 ${fmt(decision.deviation, 1)}）${autoRules ? `，入场线 ${fmt(params.entryBps, 1)}（自动配置）` : ''}${opened.entryVarSource === 'token' ? '，Var 按 token 询价' : opened.entryVarSource ? '，Var 按公开档位' : ''}` });
       positions.set(pair.key, opened);
+      const delay = fillDelay(pair);
+      if (delay) fills.set(pair.key, { kind: 'open', id: opened.id, due: sample.decisionAt! + delay, sample });
       if (autoRules) { exits.set(pair.key, autoRules); saveExits(); }
       updateDepth();
       // 实盘跟单：出错只记日志，不影响模拟盘。
@@ -855,18 +877,66 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     };
   }
 
-  function finish(position: Position, sample: Sample, spread: NonNullable<ReturnType<typeof spreadOf>>, reason: ClosedTrade['reason'], note = ''): ClosedTrade {
+  function finish(position: Position, sample: Sample, spread: NonNullable<ReturnType<typeof spreadOf>>, reason: ClosedTrade['reason'], note = '', follow = true): ClosedTrade {
     const trade = closePosition(position, sample.t, spread, reason, settings.global, fundingEstimate(position, sample.t, sample.aFunding, sample.bFunding));
     const at = now(), until = sample.t + paramsOf(position.symbol).cooldownMinutes * 60_000;
     const nextCooldown = Object.fromEntries(Object.entries({ ...cooldown, [position.symbol]: until }).filter(([, end]) => end > at));
     store.closePosition(trade, { at, kind: 'close', message: `${note}${CLOSE_REASON_NAMES[reason]}${spread.estimated ? '（盘口估算）' : ''}：净 ${fmt(trade.netUsd, 2)} 美元（${fmt(trade.netBps, 1)} 基点），持有 ${fmt((trade.closedAt - trade.openedAt) / 60_000, 0)} 分钟` }, nextCooldown);
     paperTotals = null;
     positions.delete(position.symbol);
+    fills.delete(position.symbol);
     cooldown = nextCooldown;
     updateDepth();
     dropExits(position.symbol);
-    try { liveTrader?.onPaperClose(position.symbol, reason); } catch (error) { log(`varlighter: 实盘跟随平仓失败：${message(error)}`); }
+    if (follow) followClose(position.symbol, reason);
     return trade;
+  }
+  function followClose(symbol: string, reason: CloseReason): void {
+    try { liveTrader?.onPaperClose(symbol, reason); } catch (error) { log(`varlighter: 实盘跟随平仓失败：${message(error)}`); }
+  }
+
+  /** 判断时刻的样本换上延迟场所的腿在 at 时刻的一档；某条腿那一刻没有可用一档时沿用判断时刻的，并标为估算。 */
+  function delayedSample(sample: Sample, at: number): { sample: Sample; missing: boolean } {
+    const pair = parsePairKey(sample.symbol), copy: Sample = { ...sample };
+    let missing = false;
+    for (const side of ['a', 'b'] as const) {
+      const leg = pair?.[side];
+      if (!leg || !TAKER_DELAYED.has(leg.venue)) continue;
+      const runtime = live.get(leg.venue as LiveVenue)!, market = runtime.bySymbol.get(leg.symbol);
+      const top = market ? runtime.stream?.topAt(market.id, at) ?? null : null;
+      if (top && top.bid > 0 && top.ask >= top.bid) { copy[`${side}BidRx`] = top.bid; copy[`${side}AskRx`] = top.ask; copy[`${side}RxAt`] = top.at; } else missing = true;
+    }
+    return { sample: copy, missing };
+  }
+  /**
+   * 处理到点的延迟成交。持仓已不在（手动平仓、清空）或已换了一笔的直接丢掉。
+   * 停服时（beforeStop）没到点的也按此刻的一档结算并标为估算，免得重启后模拟仓与已跟着平掉的实盘对不上。
+   */
+  function settleFills(beforeStop = false): void {
+    if (!fills.size) return;
+    const time = now();
+    for (const [key, fill] of [...fills]) {
+      if (!beforeStop && time < fill.due) continue;
+      fills.delete(key);
+      const position = positions.get(key);
+      if (!position || position.id !== fill.id) continue;
+      try {
+        const early = time < fill.due, delayed = delayedSample(fill.sample, early ? time : fill.due), missing = delayed.missing || early, sample = delayed.sample;
+        const delayText = `Lighter 吃单延迟 ${takerDelayMs} 毫秒后成交${early ? '（停服前提前结算）' : delayed.missing ? '（那一刻缺一档，沿用判断时刻的价）' : ''}`;
+        if (fill.kind === 'close') {
+          const spread = closeSpread(sample, position) ?? fill.spread;
+          finish(position, sample, missing ? { ...spread, estimated: true } : spread, fill.reason, `${delayText}；`, false);
+          continue;
+        }
+        const filled = targetSpread(sample, { notionalUsd: position.notionalUsd, symbol: position.symbol, ratio: position.ratio }, true)?.spread;
+        if (!filled) { log(`varlighter: ${key} 延迟成交缺可成交价，保留判断时刻的开仓价`); continue; }
+        const rich = position.direction === 'a_rich';
+        const next: Position = { ...position, entrySpread: rich ? filled.sellA : filled.buyA, aEntry: rich ? filled.prices.aBid : filled.prices.aAsk, bEntry: rich ? filled.prices.bAsk : filled.prices.bBid,
+          estimated: position.estimated || filled.estimated || missing };
+        store.openPosition(next, { at: now(), kind: 'fill', message: `${delayText}：入场价差 ${fmt(position.entrySpread, 1)} → ${fmt(next.entrySpread, 1)} 基点` });
+        positions.set(key, next);
+      } catch (error) { log(`varlighter: ${key} 延迟成交失败：${message(error)}`); }
+    }
   }
 
   function noteSamples(samples: readonly Sample[]): void {
@@ -1265,7 +1335,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     if (!isObject(body) || body.confirm !== 'RESET' || Object.keys(body).length !== 1) return reject('invalid_body', '需要确认文字 RESET');
     store.resetPaper(now());
     paperTotals = null;
-    positions.clear(); cooldown = {}; dropExits();
+    positions.clear(); fills.clear(); cooldown = {}; dropExits();
     updateDepth();
     return { ok: true };
   }
@@ -1665,6 +1735,8 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
               finally { if (historyScheduleEpoch === epoch) nextAccountHistory = now() + ACCOUNT_HISTORY_POLL_MS; }
             });
           }
+          // 先结算到点的延迟成交，实盘这一轮推进看到的模拟持仓才是最新的。
+          try { settleFills(); } catch (error) { log(`varlighter: 延迟成交失败：${message(error)}`); }
           liveTrader?.tick();
           const latestLiveClosed = liveTrader?.view().trades[0]?.id ?? null;
           if (latestLiveClosed !== lastSeenLiveClosedId) {
@@ -1676,7 +1748,9 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
           await context.pause(1_000);
         }
       } finally {
-        done = true; running = false; syncStreams();
+        done = true; running = false;
+        try { settleFills(true); } catch (error) { log(`varlighter: 停服前结算延迟成交失败：${message(error)}`); }
+        syncStreams();
         // 停止时掐断在途的下单请求（结果按「不明」落库，重启后先查询再决定，不重发），等这一轮推进收尾后才关库。
         liveStop.abort();
         await liveTrader?.idle();
@@ -1686,7 +1760,11 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     /** 实盘告警（经执行服务发飞书）。 */
     liveAlerts: () => liveTrader?.alerts() ?? [],
     live: () => liveTrader,
-    close(): void { running = false; if (replayWorker) void replayWorker.terminate(); liveStop.abort(); syncStreams(); store.close(); },
+    close(): void {
+      running = false; if (replayWorker) void replayWorker.terminate(); liveStop.abort();
+      try { settleFills(true); } catch (error) { log(`varlighter: 停服前结算延迟成交失败：${message(error)}`); }
+      syncStreams(); store.close();
+    },
   };
 }
 export type VarLighterEngine = ReturnType<typeof createVarLighterEngine>;

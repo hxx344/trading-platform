@@ -20,9 +20,11 @@ import { backtestRequest, chartEquity, runBacktest } from '../src/varlighter/bac
 import { BOOK_KEEP_LEVELS, CONNECT_TIMEOUT_MS, DEPTH_MAX_GAP_MS, HyperliquidStream, LighterStream, depthAt, depthSnapshot, vwap, type SocketLike } from '../src/varlighter/feeds.ts';
 import { orderPlan } from '../src/varlighter/plan.ts';
 import { MIGRATED_KEY, openVarLighterStore } from '../src/varlighter/store.ts';
-import { COOLDOWN_KEY, EXITS_KEY, LEGACY_UPGRADE, SETTINGS_KEY, createVarLighterEngine, customKey, downsample, readCustomPair, upgradeSettings } from '../src/varlighter/engine.ts';
+import { COOLDOWN_KEY, EXITS_KEY, LEGACY_UPGRADE, LIGHTER_TAKER_DELAY_MS, SETTINGS_KEY, createVarLighterEngine, customKey, downsample, readCustomPair, upgradeSettings } from '../src/varlighter/engine.ts';
 import { READ_TOKEN_MAX_BYTES } from '../src/read-token.ts';
 import { localDexForward, openVarLighter, varLighterLoop, varLighterViews } from '../src/dex/host.ts';
+import { createLiveKeysStore } from '../src/varlighter/livekeys.ts';
+import { LIVE_SETTINGS_KEY, type LivePosition } from '../src/varlighter/live.ts';
 
 const T0 = Date.parse('2026-11-23T15:00:00Z'); // 周一纽约 10:00（盘中）
 const RH_BTC = 'var:BTC|rh:BTC', LIGHTER_BTC = 'var:BTC|lighter:BTC';
@@ -844,7 +846,7 @@ test('引擎：各组合各自对齐样本写库，盘口快照，模拟盘开�
     ] });
   };
   const store = openVarLighterStore(path.join(dir, 'varlighter.sqlite'));
-  const engine = createVarLighterEngine({ store, fetchImpl, connect: url => { const socket = new FakeSocket(); sockets.set(venueOf(url), socket); return socket; }, now: () => clock });
+  const engine = createVarLighterEngine({ takerDelayMs: 0, store, fetchImpl, connect: url => { const socket = new FakeSocket(); sockets.set(venueOf(url), socket); return socket; }, now: () => clock });
   const rh = () => sockets.get('rh')!, main = () => sockets.get('lighter')!;
   const row = (key: string) => engine.views.state().rows.find(item => item.key === key);
   try {
@@ -874,7 +876,7 @@ test('引擎：各组合各自对齐样本写库，盘口快照，模拟盘开�
     main().push({ type: 'subscribed/order_book', channel: 'order_book:7', order_book: fullBook });
     // 新参数存在新键里；重开后读回。
     assert.equal(store.state<{ global: GlobalParams }>(SETTINGS_KEY)!.global.minNetBps, 5);
-    assert.equal(createVarLighterEngine({ store, fetchImpl, connect: () => new FakeSocket(), now: () => clock }).views.state().settings.global.minNetBps, 5);
+    assert.equal(createVarLighterEngine({ takerDelayMs: 0, store, fetchImpl, connect: () => new FakeSocket(), now: () => clock }).views.state().settings.global.minNetBps, 5);
     assert.throws(() => engine.views.settings({ revision: 0 }), (error: unknown) => (error as { status?: number }).status === 409);
     let tick = 0;
     /** 过一分钟：两个 Lighter 场所各推一条变化（真实行情每秒都有消息），再拉一次 Var。 */
@@ -1131,7 +1133,7 @@ function seededEngine(seed: (store: SeedStore) => void, options: { fetchImpl?: (
     return Response.json({ listings: [{ ticker: 'BTC', name: 'Bitcoin', mark_price: '100.2', quotes: { updated_at: new Date(now() - 2_000).toISOString(), base: { bid: '100.19', ask: '100.21' } } }] });
   });
   const sockets: FakeSocket[] = [];
-  const engine = createVarLighterEngine({ store: openVarLighterStore(file), fetchImpl, connect: () => { const socket = new FakeSocket(); sockets.push(socket); return socket; }, now, log: options.log });
+  const engine = createVarLighterEngine({ takerDelayMs: 0, store: openVarLighterStore(file), fetchImpl, connect: () => { const socket = new FakeSocket(); sockets.push(socket); return socket; }, now, log: options.log });
   return { dir, file, engine, sockets, dispose(keep = false) { engine.close(); if (!keep) rmSync(dir, { recursive: true, force: true }); } };
 }
 
@@ -1235,7 +1237,7 @@ test('失联判定：规格改判、数据源连续正常 30 分钟仍无样本�
   /** 启动一个引擎并连上行情流；advance 拨时钟并推一条消息（行情流按消息间隔判沉默）。 */
   const start = () => {
     const sockets: FakeSocket[] = [];
-    const engine = createVarLighterEngine({ store: openVarLighterStore(file), fetchImpl, connect: () => { const socket = new FakeSocket(); sockets.push(socket); return socket; }, now: () => time });
+    const engine = createVarLighterEngine({ takerDelayMs: 0, store: openVarLighterStore(file), fetchImpl, connect: () => { const socket = new FakeSocket(); sockets.push(socket); return socket; }, now: () => time });
     engines.push(engine);
     engine.startStreams();
     sockets[0].open();
@@ -1395,7 +1397,7 @@ test('两腿行情流的配对：启用或有持仓的每 5 秒、其余每 20 �
   seed.savePosition(position(LE_SNDK, { aEntry: 100, bEntry: 100.1, bFeeBps: 6.75 }));
   seed.close();
   const store = openVarLighterStore(file);
-  const engine = createVarLighterEngine({ store, fetchImpl, connect: url => { const socket = new FakeSocket(); sockets.set(venueOf(url), socket); return socket; }, now: () => clock });
+  const engine = createVarLighterEngine({ takerDelayMs: 0, store, fetchImpl, connect: url => { const socket = new FakeSocket(); sockets.set(venueOf(url), socket); return socket; }, now: () => clock });
   try {
     engine.startStreams();
     assert.deepEqual([...sockets.keys()].sort(), ['entropy', 'lighter'], '只连组合用到的场所');
@@ -2105,7 +2107,7 @@ test('引擎接 Var 询价：只给已启用的配对询价，按询价复核与
     view: () => ({ status: 'ready', statusName: '正常', expiresAt: T0 + 86_400_000, error: null, okAt: clock, lagMs: 300 }),
   };
   const store = openVarLighterStore(path.join(dir, 'varlighter.sqlite'));
-  const engine = createVarLighterEngine({ store, fetchImpl, connect: url => { const socket = new FakeSocket(); sockets.set(venueOf(url), socket); return socket; }, now: () => clock, quoter });
+  const engine = createVarLighterEngine({ takerDelayMs: 0, store, fetchImpl, connect: url => { const socket = new FakeSocket(); sockets.set(venueOf(url), socket); return socket; }, now: () => clock, quoter });
   const signal = AbortSignal.timeout(5000);
   const minute = async () => {
     clock += 60_000; tick++;
@@ -2251,7 +2253,7 @@ test('账户风控读取后才决定开仓；已提交样本只推进一次，�
     }) });
   };
   const makeEngine = (store: ReturnType<typeof openVarLighterStore>) => {
-    const socket = new FakeSocket(), engine = createVarLighterEngine({ store, fetchImpl, now: () => clock, connect: () => socket });
+    const socket = new FakeSocket(), engine = createVarLighterEngine({ takerDelayMs: 0, store, fetchImpl, now: () => clock, connect: () => socket });
     engine.startStreams(); socket.open();
     const poll = async () => {
       clock = quoteAt;
@@ -2342,7 +2344,7 @@ test('没有 Var 的双行情流也在风控读取后检查两腿年龄并落盘
   const sockets = new Map<string, FakeSocket>(), net = store.netSince;
   t.mock.method(store, 'netSince', (at: number) => { clock += riskWait; return net(at); });
   const market = { symbol: 'BTC', market_id: 1, market_type: 'perp', status: 'active', size_decimals: 4, price_decimals: 2, taker_fee: '0', mark_price: '100' };
-  const engine = createVarLighterEngine({ store, now: () => clock, fetchImpl: async () => Response.json({ code: 200, order_book_details: [market] }),
+  const engine = createVarLighterEngine({ takerDelayMs: 0, store, now: () => clock, fetchImpl: async () => Response.json({ code: 200, order_book_details: [market] }),
     connect: url => { const socket = new FakeSocket(); sockets.set(venueOf(url), socket); return socket; } });
   const snapshot = (at: number) => {
     clock = at;
@@ -2384,7 +2386,7 @@ test('两腿行情流的配对：一档推送到就按当时两腿判断并开�
   let clock = T0;
   const sockets = new Map<string, FakeSocket>();
   const market = { symbol: 'BTC', market_id: 1, market_type: 'perp', status: 'active', size_decimals: 4, price_decimals: 2, taker_fee: '0', mark_price: '100' };
-  const engine = createVarLighterEngine({ store, now: () => clock, fetchImpl: async () => Response.json({ code: 200, order_book_details: [market] }),
+  const engine = createVarLighterEngine({ takerDelayMs: 0, store, now: () => clock, fetchImpl: async () => Response.json({ code: 200, order_book_details: [market] }),
     connect: url => { const socket = new FakeSocket(); sockets.set(venueOf(url), socket); return socket; } });
   const push = (venue: string, at: number, mid: number, type = 'update') => {
     clock = at;
@@ -2413,6 +2415,168 @@ test('两腿行情流的配对：一档推送到就按当时两腿判断并开�
     engine.views.settings({ revision: engine.views.state().settings.revision, symbols: { [key]: { enabled: false } } });
     push('rh', T0 + 1_600, 101);
     assert.equal(stats().checks, 5, '停用且没有持仓的配对不按推送判断');
+  } finally { engine.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('Lighter 吃单延迟：模拟盘开仓先记仓再按 300 毫秒后的一档改价，平仓等 300 毫秒后按那一刻的一档结算，等待中不再判断', async () => {
+  const key = 'rh:BTC|lighter:BTC', dir = mkdtempSync(path.join(tmpdir(), 'tp-taker-delay-'));
+  const store = openVarLighterStore(path.join(dir, 'varlighter.sqlite'));
+  store.setState(SETTINGS_KEY, settings2({ [key]: { ...DEFAULT_SYMBOL, enabled: true } }, { ...DEFAULT_GLOBAL, minSamples: 10 }, ['rh|lighter']), T0);
+  store.addSamples(Array.from({ length: 12 }, (_, i) => sample(T0 - (12 - i) * 60_000, 100, 100, { symbol: key })));
+  let clock = T0;
+  const sockets = new Map<string, FakeSocket>();
+  const market = { symbol: 'BTC', market_id: 1, market_type: 'perp', status: 'active', size_decimals: 4, price_decimals: 2, taker_fee: '0', mark_price: '100' };
+  const engine = createVarLighterEngine({ store, now: () => clock, fetchImpl: async () => Response.json({ code: 200, order_book_details: [market] }),
+    connect: url => { const socket = new FakeSocket(); sockets.set(venueOf(url), socket); return socket; } });
+  const push = (venue: string, at: number, mid: number, type = 'update') => {
+    clock = at;
+    sockets.get(venue)!.push({ type: `${type}/market_stats`, channel: 'market_stats:all', market_stats: { 1: { market_id: 1, best_bid_price: String(mid - 0.01), best_ask_price: String(mid + 0.01), mark_price: String(mid) } } });
+  };
+  const near = (actual: number | undefined, expected: number, label: string) => assert.ok(actual !== undefined && Math.abs(actual - expected) < 1e-9, `${label}：${actual} ≠ ${expected}`);
+  try {
+    assert.equal(LIGHTER_TAKER_DELAY_MS, 300);
+    engine.startStreams();
+    for (const socket of sockets.values()) socket.open();
+    for (const venue of ['rh', 'lighter'] as const) await engine.refreshCatalog(new AbortController().signal, venue);
+    push('rh', T0, 100, 'subscribed'); push('lighter', T0, 100, 'subscribed');
+    push('rh', T0 + 1_000, 100.5);
+    near(store.positions()[0]?.aEntry, 100.49, '判断时刻先按当时的买一记仓');
+    push('rh', T0 + 1_200, 100.2);
+    near(store.positions()[0]?.aEntry, 100.49, '没到 300 毫秒不改价');
+    push('lighter', T0 + 1_350, 100.1);
+    const opened = store.positions()[0];
+    near(opened?.aEntry, 100.19, 'A 腿按判断后 300 毫秒（T0+1300）RH 的买一');
+    near(opened?.bEntry, 100.01, 'B 腿按 T0+1300 主网的卖一，之后 T0+1350 的变化不算');
+    near(opened?.entrySpread, (100.19 - 100.01) / 100 * 1e4, '入场价差随成交价重算');
+    assert.equal(opened?.openedAt, T0 + 1_000);
+    assert.ok(engine.views.paper().events.some(event => /吃单延迟 300 毫秒后成交：入场价差/.test(event.message)));
+    push('rh', T0 + 2_000, 100.1);
+    assert.deepEqual([store.positions().length, store.trades(5).length], [1, 0], '价差回到基线：平仓要等 300 毫秒');
+    push('rh', T0 + 2_200, 99.5);
+    assert.deepEqual([store.positions().length, store.trades(5).length], [1, 0], '等待中不再判断');
+    push('lighter', T0 + 2_400, 100.05);
+    const [trade] = store.trades(5);
+    assert.equal(store.positions().length, 0);
+    assert.deepEqual([trade?.reason, trade?.closedAt], ['revert', T0 + 2_000]);
+    near(trade?.aExit, 99.51, 'A 腿按 T0+2300 RH 的卖一买回');
+    near(trade?.bExit, 100.09, 'B 腿按 T0+2300 主网的买一卖出');
+    assert.ok(engine.views.paper().events.some(event => /吃单延迟 300 毫秒后成交；回归平仓/.test(event.message)));
+  } finally { engine.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('Lighter 吃单延迟：停服时还在等的平仓按此刻的一档提前结算并标估算，不再通知实盘', async () => {
+  const key = 'rh:BTC|lighter:BTC', dir = mkdtempSync(path.join(tmpdir(), 'tp-taker-delay-stop-')), file = path.join(dir, 'varlighter.sqlite');
+  const store = openVarLighterStore(file);
+  store.setState(SETTINGS_KEY, settings2({ [key]: { ...DEFAULT_SYMBOL, enabled: true } }, { ...DEFAULT_GLOBAL, minSamples: 10 }, ['rh|lighter']), T0);
+  store.addSamples(Array.from({ length: 12 }, (_, i) => sample(T0 - (12 - i) * 60_000, 100, 100, { symbol: key })));
+  let clock = T0;
+  const sockets = new Map<string, FakeSocket>();
+  const market = { symbol: 'BTC', market_id: 1, market_type: 'perp', status: 'active', size_decimals: 4, price_decimals: 2, taker_fee: '0', mark_price: '100' };
+  const logs: string[] = [];
+  const engine = createVarLighterEngine({ store, now: () => clock, log: line => { logs.push(line); }, fetchImpl: async () => Response.json({ code: 200, order_book_details: [market] }),
+    connect: url => { const socket = new FakeSocket(); sockets.set(venueOf(url), socket); return socket; } });
+  const push = (venue: string, at: number, mid: number, type = 'update') => {
+    clock = at;
+    sockets.get(venue)!.push({ type: `${type}/market_stats`, channel: 'market_stats:all', market_stats: { 1: { market_id: 1, best_bid_price: String(mid - 0.01), best_ask_price: String(mid + 0.01), mark_price: String(mid) } } });
+  };
+  let closed = false;
+  try {
+    engine.startStreams();
+    for (const socket of sockets.values()) socket.open();
+    for (const venue of ['rh', 'lighter'] as const) await engine.refreshCatalog(new AbortController().signal, venue);
+    push('rh', T0, 100, 'subscribed'); push('lighter', T0, 100, 'subscribed');
+    push('rh', T0 + 1_000, 100.5);
+    push('rh', T0 + 1_200, 100.2);
+    push('lighter', T0 + 1_350, 100.1);
+    push('rh', T0 + 2_000, 100.1);
+    assert.deepEqual([store.positions().length, store.trades(5).length], [1, 0], '平仓在等 300 毫秒');
+    assert.ok(engine.views.paper().events.every(event => !/回归平仓/.test(event.message)));
+    clock = T0 + 2_100;
+    engine.close(); closed = true;
+    const reopened = openVarLighterStore(file);
+    try {
+      const [trade] = reopened.trades(5);
+      assert.equal(reopened.positions().length, 0, `停服前已结算，重启后不留模拟仓；日志：${logs.join(' | ')}`);
+      assert.deepEqual([trade?.reason, trade?.closedAt, trade?.estimated], ['revert', T0 + 2_000, true]);
+      assert.ok(reopened.events(20).some(event => /停服前提前结算/.test(event.message)));
+    } finally { reopened.close(); }
+  } finally { if (!closed) engine.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('Lighter 吃单延迟：Var 对 RH 的配对按 Var 报价开仓后，Var 腿仍按判断时刻的价，RH 腿按 300 毫秒后的一档', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'tp-taker-delay-var-'));
+  const store = openVarLighterStore(path.join(dir, 'varlighter.sqlite'));
+  store.setState(SETTINGS_KEY, settings2({ [RH_BTC]: { ...DEFAULT_SYMBOL, enabled: true } }, { ...DEFAULT_GLOBAL, minSamples: 10 }, ['var|rh']), T0);
+  store.addSamples(Array.from({ length: 12 }, (_, i) => sample(T0 - (12 - i) * 60_000, 100, 100, { symbol: RH_BTC })));
+  let clock = T0;
+  const sockets = new Map<string, FakeSocket>();
+  const market = { symbol: 'BTC', market_id: 1, market_type: 'perp', status: 'active', size_decimals: 4, price_decimals: 2, taker_fee: '0', mark_price: '100' };
+  const fetchImpl = async (url: string) => {
+    if (url.includes('orderBookDetails')) return Response.json({ code: 200, order_book_details: [market] });
+    const price = { bid: '100.19', ask: '100.21' };
+    return Response.json({ listings: [{ ticker: 'BTC', name: 'Bitcoin', mark_price: '100.2', quotes: { updated_at: new Date(clock - 2_000).toISOString(), base: price, size_1k: price } }] });
+  };
+  const engine = createVarLighterEngine({ store, now: () => clock, fetchImpl, connect: url => { const socket = new FakeSocket(); sockets.set(venueOf(url), socket); return socket; } });
+  const push = (at: number, mid: number, type = 'update') => {
+    clock = at;
+    sockets.get('rh')!.push({ type: `${type}/market_stats`, channel: 'market_stats:all', market_stats: { 1: { market_id: 1, best_bid_price: String(mid - 0.01), best_ask_price: String(mid + 0.01), mark_price: String(mid) } } });
+  };
+  const near = (actual: number | undefined, expected: number, label: string) => assert.ok(actual !== undefined && Math.abs(actual - expected) < 1e-9, `${label}：${actual} ≠ ${expected}`);
+  try {
+    engine.startStreams();
+    for (const socket of sockets.values()) socket.open();
+    await engine.refreshCatalog(new AbortController().signal, 'rh');
+    push(T0 - 5_000, 100, 'subscribed');
+    clock = T0;
+    await engine.pollVar(AbortSignal.timeout(5_000));
+    near(store.positions()[0]?.aEntry, 100.19, '按 Var 报价开仓');
+    near(store.positions()[0]?.bEntry, 100.01, '判断时刻先按 RH 当时的卖一');
+    push(T0 + 200, 99.9);
+    near(store.positions()[0]?.bEntry, 100.01, '没到 300 毫秒不改价');
+    push(T0 + 400, 99.95);
+    near(store.positions()[0]?.aEntry, 100.19, 'Var 腿不受吃单延迟影响');
+    near(store.positions()[0]?.bEntry, 99.91, 'RH 腿按 T0+300 的卖一');
+  } finally { engine.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('Lighter 吃单延迟：模拟平仓在等成交时，实盘还没发出的开仓意图作废，不下单', async () => {
+  const key = 'rh:BTC|lighter:BTC', dir = mkdtempSync(path.join(tmpdir(), 'tp-taker-delay-live-'));
+  const store = openVarLighterStore(path.join(dir, 'varlighter.sqlite')), keys = createLiveKeysStore(dir);
+  // 假值私钥，不对应任何真实账户。
+  keys.set('rh', { accountIndex: 11, apiKeyIndex: 5, privateKey: 'cd'.repeat(40) });
+  keys.set('lighter', { accountIndex: 12, apiKeyIndex: 5, privateKey: 'ab'.repeat(40) });
+  store.setState(SETTINGS_KEY, settings2({ [key]: { ...DEFAULT_SYMBOL, enabled: true } }, { ...DEFAULT_GLOBAL, minSamples: 10 }, ['rh|lighter']), T0);
+  store.addSamples(Array.from({ length: 12 }, (_, i) => sample(T0 - (12 - i) * 60_000, 100, 100, { symbol: key })));
+  store.setState(LIVE_SETTINGS_KEY, { on: true, pairs: [key], limits: { perTradeUsd: 100, maxOpen: 1, dailyLossUsd: 20, slippageBps: 30 } }, T0);
+  store.openPosition({ id: 'p1', symbol: key, direction: 'a_rich', openedAt: T0, qty: 10, notionalUsd: 1000, entrySpread: 40, entryBaseline: 0, entryRegime: 'all',
+    aEntry: 100.4, bEntry: 100, estimated: false, ratio: 1, aFeeBps: 0, bFeeBps: 0 }, { at: T0, kind: 'open', message: '模拟开仓：测试' });
+  const leg = (venue: 'rh' | 'lighter', side: 'buy' | 'sell') => ({ venue, symbol: 'BTC', side, qty: 0, entryQuote: 0, exitQty: 0, exitQuote: 0, feesUsd: 0, estimated: false });
+  // 跟着 p1 的实盘开仓意图已落库、第一腿还没发出（上一轮推进还在忙）。
+  const intent: LivePosition = { id: 'l-1', symbol: key, paperId: 'p1', direction: 'a_rich', ratio: 1, state: 'opening', step: 'a', openedAt: T0, updatedAt: T0, closedAt: null,
+    a: leg('rh', 'sell'), b: leg('lighter', 'buy'), plan: { qty: 1, limit: 90, bLimit: 110 }, pending: null, tries: 0, retryAt: 0, closeReason: null, singleLeg: false, netUsd: null, note: '' };
+  store.saveLive(intent);
+  let clock = T0, orders = 0;
+  const sockets = new Map<string, FakeSocket>();
+  const market = { symbol: 'BTC', market_id: 1, market_type: 'perp', status: 'active', size_decimals: 4, price_decimals: 2, taker_fee: '0', mark_price: '100' };
+  const engine = createVarLighterEngine({ store, now: () => clock, fetchImpl: async () => Response.json({ code: 200, order_book_details: [market] }),
+    connect: url => { const socket = new FakeSocket(); sockets.set(venueOf(url), socket); return socket; },
+    liveKeys: keys, signerProblem: () => null, traders: () => { orders++; throw new Error('不该下单'); } });
+  const push = (venue: string, at: number, mid: number, type = 'update') => {
+    clock = at;
+    sockets.get(venue)!.push({ type: `${type}/market_stats`, channel: 'market_stats:all', market_stats: { 1: { market_id: 1, best_bid_price: String(mid - 0.01), best_ask_price: String(mid + 0.01), mark_price: String(mid) } } });
+  };
+  try {
+    engine.startStreams();
+    for (const socket of sockets.values()) socket.open();
+    for (const venue of ['rh', 'lighter'] as const) await engine.refreshCatalog(new AbortController().signal, venue);
+    push('rh', T0 + 1_000, 100, 'subscribed');
+    push('lighter', T0 + 1_000, 100, 'subscribed');
+    await engine.live()!.idle();
+    assert.deepEqual([store.positions().length, store.trades(5).length], [1, 0], '价差回到基线：模拟平仓在等 300 毫秒');
+    assert.equal(orders, 0, '等待期间实盘不下单');
+    assert.deepEqual([store.liveActive().length, store.liveClosed(5)[0]?.note], [0, '开仓意图已过期，没有下单'], '实盘把模拟仓当作已平，作废开仓意图');
+    push('lighter', T0 + 1_400, 100.01);
+    assert.deepEqual([store.positions().length, store.trades(5)[0]?.reason], [0, 'revert'], '到点后模拟仓结算');
   } finally { engine.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 

@@ -208,7 +208,7 @@ test('实盘接口：场所有实盘持仓时只能给同一个账户换密钥�
   store.event(1, 'live', null, '实盘开仓：测试');
   store.event(2, 'paper', null, '模拟开仓：测试');
   const silent = (): SocketLike => { const s: SocketLike = { readyState: 0, onopen: null, onmessage: null, onclose: null, onerror: null, send() {}, close() { s.readyState = 3; } }; return s; };
-  const engine = createVarLighterEngine({ store, connect: silent, now: () => 10_000, liveKeys: keys, signerProblem: () => null,
+  const engine = createVarLighterEngine({ takerDelayMs: 0, store, connect: silent, now: () => 10_000, liveKeys: keys, signerProblem: () => null,
     fetchImpl: async () => new Response('{}', { status: 500 }), traders: () => { throw new Error('不该下单'); } });
   const status = (work: () => unknown): number | null => { try { work(); } catch (error) { assert.ok(error instanceof VarLighterError, String(error)); noSecret(error.message, 'error'); return error.status; } return null; };
   const file = path.join(dir, LIVE_KEYS_FILE), before = readFileSync(file, 'utf8');

@@ -31,7 +31,7 @@ test('DEX 模拟盘在 SQLite 提交后发布持仓、成交、冷却和参数�
       ...(withQuote ? { quotes: { updated_at: new Date(time).toISOString(), base: prices, size_1k: prices, size_100k: prices } } : {}) }] });
   };
   const socket: SocketLike = { readyState: 1, onopen: null, onmessage: null, onclose: null, onerror: null, send() {}, close() {} };
-  const start = (s: VarLighterStore, withQuote: boolean) => createVarLighterEngine({ store: s, now, fetchImpl: fetcher(withQuote), connect: () => socket });
+  const start = (s: VarLighterStore, withQuote: boolean) => createVarLighterEngine({ takerDelayMs: 0, store: s, now, fetchImpl: fetcher(withQuote), connect: () => socket });
   let engine = start(store, true);
   async function poll(price: number) {
     time += 60_000; mid = price;

@@ -61,7 +61,9 @@ test('服务配置：默认值、预留额度与配对校验；密钥文件须�
   assert.throws(() => parseServiceSecrets({ ...secretsRaw, feishu: { webhook: 'http://example.com/hook' } }, []), /飞书/);
   // A key that does not derive the signer is named by account, never quoted.
   const wrong = { ...LONG, signer: SHORT.signer };
-  assert.throws(() => parseServiceSecrets({ accounts: { a: wrong } }, []), (error: unknown) => error instanceof Error && /账户 a/.test(error.message) && !error.message.includes(LONG.privateKey.slice(2, 12)));
+  assert.throws(() => parseServiceSecrets({ accounts: { a: wrong } }, ['a']), (error: unknown) => error instanceof Error && /账户 a/.test(error.message) && !error.message.includes(LONG.privateKey.slice(2, 12)));
+  assert.throws(() => parseServiceSecrets({ accounts: { 'unexpected-account-field': wrong } }, []),
+    (error: unknown) => error instanceof Error && error.message.includes('signer') && !error.message.includes('unexpected-account-field'));
   // A transfer carries no user, so the main account's API wallet must not also sign for a sub-account.
   const sharedWallet = parseServiceSecrets({ accounts: { main: { user: MAIN.user, signer: LONG.signer, privateKey: LONG.privateKey }, a: LONG, b: SHORT } }, ['main', 'a', 'b']);
   assert.throws(() => assertDistinctSigners(config, sharedWallet), /主账户 main 与子账户 a 使用同一个 API 钱包/);

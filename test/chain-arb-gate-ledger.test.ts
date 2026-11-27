@@ -84,13 +84,13 @@ test('地址缺失、不能重放或重放期间换账户均不输出净收益�
   assert.equal(state.queried.length, 2);
 });
 
-test('手工缺少成本保留实际地址毛值；不支持的场所和外部自带地址不会发起私有查询', async t => {
+test('手工缺少成本保留实际地址毛值；缺少对应账本和外部自带地址不会发起私有查询', async t => {
   const { service, state } = setup(t);
   await assert.rejects(service.chainArb({ ...manual, recipient: TEST_DEPOSIT }, signal), /未知参数/);
   await assert.rejects(service.chainArb({ ...manual, venue: 'binance' }, signal), /账本/);
   await assert.rejects(service.scanChainArb({ ...form, venue: 'binance' }, 'scan', signal), /账本/);
-  await assert.rejects(service.chainArb({ ...manual, venue: 'bitget' }, signal), /尚未接入/);
-  assert.deepEqual((await service.scanChainArb({ ...form, venue: 'bitget' }, 'scan', signal)).rows, []);
+  await assert.rejects(service.chainArb({ ...manual, venue: 'bitget' }, signal), /Bitget 只读账户/);
+  await assert.rejects(service.scanChainArb({ ...form, venue: 'bitget' }, 'scan', signal), /Bitget 只读账户/);
   assert.equal(state.reads,0);
   const gross = await service.chainArb({ ...manual, spotCosts: '', perpCosts: '' }, signal);
   assert.equal(gross.dex.execution?.depositVenue, 'gate');

@@ -415,7 +415,7 @@ async function startWired({ config, secrets, dir, fetchImpl, connect, notifyFetc
   if (config.monitor) {
     const alertHooks = marketAlertHooks({ secrets, notifier, monitorOutbox, monitorOutboxError, send: (secret, text, opportunityReceipt) => sendFeishu(secret, { msg_type: 'text', content: { text } }, { fetchImpl: notifyFetch, opportunityReceipt }) });
     try { monitor = openMonitor(config.monitor, dir, { ...(monitorFetch ? { fetchImpl: monitorFetch } : {}),
-      okxLedger: asset ?? undefined, gateLedger: asset ?? undefined, binanceLedger: asset ?? undefined, alertHooks, marketClient }); collector = monitor.perpetual; }
+      okxLedger: asset ?? undefined, gateLedger: asset ?? undefined, binanceLedger: asset ?? undefined, bitgetLedger: asset ?? undefined, alertHooks, marketClient }); collector = monitor.perpetual; }
     catch (error) { monitorError = error instanceof Error ? error.message.slice(0, 200) : String(error); process.stderr.write(`行情监控库无法打开，行情监控页不可用：${monitorError}\n`); }
   }
   const closeMonitorStore = () => { if (monitor) closeMonitor(monitor); };

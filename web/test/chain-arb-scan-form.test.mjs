@@ -36,7 +36,7 @@ test('旧版报价和未通过模拟的报价均不进入有效机会或最近�
     row('NO_EXPIRY', { execution: { ...valid.execution, depositExpiresAt: undefined } }),
     row('INFINITE_EXPIRY', { execution: { ...valid.execution, depositExpiresAt: Infinity } }),
     row('WRONG_VENUE', { venue: 'okx', execution: valid.execution }),
-    row('UNSUPPORTED', { venue: 'bitget', execution: valid.execution }),
+    row('BITGET_WITH_GATE_PROOF', { venue: 'bitget', execution: valid.execution }),
     row('TOO_LONG', { expiresAt: source + 15_001 }),
     row('NO_TRANSFER', { execution: { ...valid.execution, transferQuantity: null } }),
     row('TOO_THIN', { execution: { ...valid.execution, impactBps: 501 } }),
@@ -125,7 +125,7 @@ test('跨所榜单使用各快照生成时间和本次 GET 往返耗时，单所
   const gate = row('ARB', { netBps: 10 }), okx = row('ARB', { venue: 'okx', netBps: 90 });
   const proofExpired = row('PAST', { venue: 'okx', expiresAt: source + 200 });
   proofExpired.execution.depositExpiresAt = proofExpired.expiresAt;
-  const bitget = row('ARB', { venue: 'bitget', netBps: 99, at: source - 200 });
+  const bitget = row('ARB', { venue: 'bitget', netBps: 99, at: source - 200, execution: undefined });
   const settings = { ...DEFAULT_BACKGROUND_SETTINGS, venues: ALL_SCAN_VENUES, enabled: true };
   let mono = 100;
   const result = await readTimedScan(async () => { mono += 220; return { revision: 3, robot: null, error: null, settings,
@@ -143,17 +143,17 @@ test('跨所榜单使用各快照生成时间和本次 GET 往返耗时，单所
   assert.deepEqual(backgroundBands(result, true, 100 + SCAN_HISTORY_MS).history, []);
 });
 
-test('Binance 两条路线按净收益率与其他所合并排序，阈值仅用于提醒，地址证明失效即撤下两条路线', () => {
+for (const venue of ['binance', 'bitget']) test(venue + ' 两条路线按净收益率与其他所合并排序，阈值仅用于提醒，地址证明失效即撤下两条路线', () => {
   const settings = { ...DEFAULT_BACKGROUND_SETTINGS, enabled: true, thresholdBps: 100 };
-  const spot = row('ABC', { venue: 'binance', kind: 'spot', netBps: 100, netUsdt: 10, expiresAt: source + 2_000 });
-  const perp = row('ABC', { venue: 'binance', kind: 'perp', netBps: 125, netUsdt: 12.5, expiresAt: spot.expiresAt });
+  const spot = row('ABC', { venue, kind: 'spot', netBps: 100, netUsdt: 10, expiresAt: source + 2_000 });
+  const perp = row('ABC', { venue, kind: 'perp', netBps: 125, netUsdt: 12.5, expiresAt: spot.expiresAt });
   spot.execution.depositExpiresAt = spot.expiresAt;
   perp.execution.depositExpiresAt = perp.expiresAt;
   const gate = row('XYZ', { netBps: 110, netUsdt: 11 });
   const unverified = { ...spot, execution: { ...spot.execution, depositVenue: undefined } };
   const wrongVenue = { ...perp, execution: { ...perp.execution, depositVenue: 'okx' } };
   const sample = { startedAt: 50, view: { settings, results: {
-    gate: view([gate]), binance: view([spot, wrongVenue, perp, unverified], [wrongVenue, unverified]),
+    gate: view([gate]), [venue]: view([spot, wrongVenue, perp, unverified], [wrongVenue, unverified]),
   } } };
   const current = backgroundBands(sample, false, 50);
   assert.deepEqual(current.live, [perp, gate, spot]);

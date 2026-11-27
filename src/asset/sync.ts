@@ -38,7 +38,7 @@ import { isGateProject, isHyperliquidProject, isVariationalProject } from './sou
 import { saveSetting, saveSnapshot, type PositionsPeek } from './writes.ts';
 // store.ts imports this module too; the cycle is safe, nothing is called while the modules load.
 import { currentLedger } from './store.ts';
-import type { AsterAccountInput, ConnectionExchange, Credentials } from './validation.ts';
+import { parseConnection, type AsterAccountInput, type ConnectionExchange, type Credentials } from './validation.ts';
 import { mapConcurrent, settleIndependent } from './sources/concurrency.ts';
 import type { Fetcher } from './sources/http.ts';
 import { sharePublicReads } from './sources/shared-reads.ts';
@@ -47,6 +47,7 @@ import { quotes } from './sources/quotes.ts';
 import { syncBinance, syncBybit, type BinanceCredential, type BybitCredential } from './sources/exchanges.ts';
 import { syncAster, validateAsterWallet, type AsterCredential, type AsterWallet } from './sources/aster.ts';
 import { syncOkx, type OkxCredential } from './sources/okx.ts';
+import type { BitgetCredential } from './sources/bitget-deposit.ts';
 import { syncGate, type GateCredential } from './sources/gate.ts';
 import { syncHyperliquid, type HyperliquidCredential } from './sources/hyperliquid.ts';
 import { syncRhLighter, type RhLighterCredential } from './sources/rh-lighter.ts';
@@ -141,7 +142,28 @@ const MATCHED_BY_PROJECT: Partial<Record<ConnectionExchange, (project: string) =
 };
 const CREATABLE: readonly ConnectionExchange[] = ['binance', 'okx', 'gate', 'variational', 'hyperliquid', 'rh-lighter'];
 
-export async function connect(ctx: SyncContext, input: Credentials): Promise<void> {
+// This connection proves deposit routes only. Keep the balances, manually valued Bitget rows and daily snapshots intact.
+export function saveBitgetConnection(ctx: SyncContext, c: BitgetCredential, verifiedAt: number) {
+  const status = { configured: true, accountMode: c.accountMode, lastSync: iso(verifiedAt), error: null,
+    scope: c.accountMode === 'uta' ? '统一账户充值核验' : '经典账户充值核验' };
+  return ctx.lease.write(() => {
+    const saved = storedConnection(ctx.database, 'bitget');
+    let same = false;
+    if (saved) {
+      try {
+        const prior = parseConnection(ctx.vault.unseal(saved.encrypted, 'bitget'));
+        same = prior.exchange === 'bitget' && prior.accountMode === c.accountMode && prior.apiKey === c.apiKey &&
+          prior.apiSecret === c.apiSecret && prior.passphrase === c.passphrase;
+      } catch { /* A newly verified connection can replace damaged ciphertext. */ }
+    }
+    // Preserve the generation across verification of the same key, including explicit refusals still in flight.
+    if (!same) saveConnection(ctx.database, 'bitget', ctx.vault.seal(c, 'bitget'), ctx.now())();
+    saveSetting(ctx.database, 'bitget-status', status);
+    return !same;
+  });
+}
+
+export async function connect(ctx: SyncContext, input: Exclude<Credentials, BitgetCredential>): Promise<void> {
   if (input.exchange === 'aster') return connectAsterAccount(ctx, { ...input, id: 'default', name: '默认账号' }, 'legacy');
   const { database, sources, vault } = ctx;
   const ledger = ledgerReader(database, ctx.now());
@@ -177,6 +199,13 @@ export async function connect(ctx: SyncContext, input: Credentials): Promise<voi
 }
 
 export async function disconnect(ctx: SyncContext, exchange: ConnectionExchange): Promise<void> {
+  if (exchange === 'bitget') {
+    ctx.lease.write(() => {
+      deleteConnection(ctx.database, exchange)();
+      ctx.database.prepare("DELETE FROM settings WHERE key='bitget-status'").run();
+    });
+    return;
+  }
   if (exchange === 'aster') return deleteAsterAccount(ctx, 'default', 'disconnect');
   const { database } = ctx;
   const ledger = ledgerReader(database, ctx.now()), asset = ledger.assets.find(a => a.mode === exchange);

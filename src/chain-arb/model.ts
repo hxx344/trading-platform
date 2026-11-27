@@ -3,9 +3,9 @@ export const CHAIN_ARB_CLOCK_SKEW_MS = 2_000;
 export const CHAIN_ARB_MAX_IMPACT_BPS = 500;
 export type Chain = 'ethereum' | 'arbitrum' | 'bsc';
 export const VENUE_NAMES = { gate: 'Gate', binance: 'Binance', bitget: 'Bitget', okx: 'OKX' } as const;
-export type DepositVenue = 'gate' | 'okx' | 'binance';
+export type DepositVenue = 'gate' | 'okx' | 'binance' | 'bitget';
 export function isDepositVenue(venue: unknown): venue is DepositVenue {
-  return venue === 'gate' || venue === 'okx' || venue === 'binance';
+  return venue === 'gate' || venue === 'okx' || venue === 'binance' || venue === 'bitget';
 }
 export type ChainArbVenue = keyof typeof VENUE_NAMES;
 export function isChainArbVenue(value: unknown): value is ChainArbVenue {

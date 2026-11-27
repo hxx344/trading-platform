@@ -828,6 +828,8 @@ v0.101.2 的单币页和排名使用所选 Gate 或 OKX 账户当前充值地址
 
 「行情监控 → 合约价差」沿用工作台 `7745181` 的 `modules/monitor/app/perpetual-panel.tsx`、买卖方向、分组与筛选口径。展示按币种分组的价格和资金费机会、费差 24h、回本时间与本金收益估算，支持星标组合、屏蔽组合与币种、查看关联持仓、报价健康和提醒。使用同源的平台接口和现有账户会话。跨所对冲预填须匹配当前可用合约目录。样式来自同版本的 perpetual、scanner、health、alerts 和 related-strip 规则。回退版本为 v0.102.0。
 
+Bitget 在「资产 → 交易所连接」提供充值核验入口，可选择经典或统一账户。连接卡片显示核验状态。扫描页在「扫描交易所」中勾选 Bitget 后，可单独设置两条路线的费率；现货和永续与其他交易所一同按整笔预算的预计净收益率排序。「单币复核」沿用对应交易所、链、完整合约、预算和费率。回滚与测算口径见[链上折价套利](chain-arb.md)。
+
 ## 资金费组合页（v0.105.0）
 
 **对照的工作台页面**：工作台没有这个页面，骨架与样式沿用本仓库的 Var/Lighter 价差页（`varlighter.css`，`parts.tsx` 的 `Badge`、`Metric`、`useWrite`），`fundingbook.css` 只放本页特有的少量排版；回退版本 v0.104.0。代码在 `web/src/fundingbook/`，内容与接口见 [fundingbook.md](fundingbook.md)。

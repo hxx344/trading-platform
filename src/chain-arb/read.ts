@@ -21,9 +21,11 @@ export function createChainArbMarket({ fetchImpl = fetch, now = Date.now, venueR
   venueReaders?: Record<Exclude<ChainArbVenue, 'okx'>, VenueReader>;
 } = {}) {
   const options = { fetchImpl, now };
+  const socket = WebSocketImpl ? (url: string) => new WebSocketImpl(url) : undefined;
   const readers = venueReaders ?? {
     gate: { read: createGateReader({ fetcher: fetchImpl, clock: now }), catalog: createScanCatalog(options) },
-    binance: createBinanceReader({ ...options, ...(WebSocketImpl ? { binanceSocket: (url: string) => new WebSocketImpl(url) } : {}) }), bitget: createBitgetReader(options),
+    binance: createBinanceReader({ ...options, binanceSocket: socket }),
+    bitget: createBitgetReader({ ...options, bitgetSocket: socket }),
   };
   const acquire = createQuoteBudget(now), closing = new AbortController();
   async function quote(raw: unknown, signal: AbortSignal, scanning: boolean, reader: VenueReader): Promise<ChainArbView> {

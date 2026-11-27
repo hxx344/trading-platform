@@ -33,6 +33,9 @@ test('巡检心跳配置：地址须为不带账号的 http(s)，令牌 32~256 �
   assert.equal(parseServiceConfig({ secretsFile: '/etc/tp/secrets.json', pairs: [] }).watch, undefined);
   assert.deepEqual(parseServiceSecrets({ accounts: {}, watch: { token: TOKEN } }, []).watch, { token: TOKEN });
   assert.equal(parseServiceSecrets({ accounts: {} }, []).watch, undefined);
+  for (const invalid of [{ accounts: {}, [TOKEN]: true }, { accounts: {}, watch: { token: TOKEN, [TOKEN]: true } }, { accounts: {}, feishu: { webhook: '', [TOKEN]: true } }]) {
+    assert.throws(() => parseServiceSecrets(invalid, []), { message: '包含不支持的字段' });
+  }
 });
 
 test('心跳正文与签名：main-watch 的格式，签名为令牌对正文字节的 HMAC-SHA256', () => {

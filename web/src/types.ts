@@ -50,7 +50,7 @@ export interface ServiceState {
 // ---- the read-only detail endpoints -------------------------------------------------
 /** A row the server could not parse keeps its place in the paging. */
 export interface Unreadable { id: string; pairId: string; unreadable: true; preparedAt?: number; createdAt?: number }
-export interface HistoryPage<T> { items: (T | Unreadable)[]; next: string | null }
+export interface HistoryPage<T> { items: (T | Unreadable)[]; next: string | null; pendingWrites?: number }
 export interface BalancePoint { at: number; long: { available: string; equity: string }; short: { available: string; equity: string }; fresh: boolean }
 export interface BalanceHistory { pairId: string; range: string; from: number; to: number; bucketMs: number; sampleEveryMs: number; points: BalancePoint[]; unavailable?: string }
 

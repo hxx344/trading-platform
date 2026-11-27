@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { createServer as createNetServer, type AddressInfo } from 'node:net';
 import { createExecutorServer, sessionCookieName } from '../src/http.ts';
 import { writeAccessUrl } from '../src/data-dir.ts';
-import { FAILURE_MEMORY_MS, FREE_FAILURES, GLOBAL_LOGIN_LIMITS, LoginThrottle, checkPasswordStrength, hashPassword, loadPasswordHash, parsePasswordHash, verifyPassword } from '../src/login-password.ts';
+import { FAILURE_MEMORY_MS, FREE_FAILURES, GLOBAL_LOGIN_LIMITS, LoginThrottle, checkPasswordStrength, hashPassword, loadPasswordHash, parsePasswordHash, throttleAddress, verifyPassword } from '../src/login-password.ts';
 import { parseListenHost, parseServiceConfig, urlHost } from '../src/service/config.ts';
 import { runExecutor } from '../src/runtime.ts';
 import type { Executor } from '../src/executor.ts';
@@ -152,6 +152,12 @@ test('HTTP 密码登录：连续输错后锁定，锁定期间正确密码也被
   assert.equal((await form(base, PASSWORD)).status, 303);
 }));
 
+test('登录限速按 IPv6 网络前缀区分，IPv4 映射地址沿用 IPv4', () => {
+  assert.equal(throttleAddress('2001:db8:1234:42::1'), throttleAddress('2001:0db8:1234:0042:ffff::5'));
+  assert.notEqual(throttleAddress('2001:db8:1234:42::1'), throttleAddress('2001:db8:1234:43::1'));
+  assert.equal(throttleAddress('::ffff:192.0.2.7'), '192.0.2.7');
+});
+
 /** A password form posted from another loopback address, so the server sees another client. */
 function formFrom(base: string, local: string, password: string): Promise<number> {
   const url = new URL(base);
@@ -168,11 +174,12 @@ test('HTTP 密码登录：按来源地址分别限速，一处的猜测锁不住
   for (let i = 0; i < FREE_FAILURES; i++) assert.equal(await formFrom(base, '127.0.0.3', `guess-${i}-xxxx`), 401);
   assert.equal(await formFrom(base, '127.0.0.3', PASSWORD), 429, '猜测的来源被锁');
   assert.equal(await formFrom(base, '127.0.0.4', PASSWORD), 303, '别的来源照常登录');
-  // Many addresses together reach the loose limit: everyone waits a little, at most a minute.
+  // The global backoff applies to prior failures; a clean source can still log in.
   for (let i = 0; i < GLOBAL_LOGIN_LIMITS.freeFailures; i++) await formFrom(base, `127.0.${1 + Math.floor(i / 4)}.${10 + (i % 4)}`, `spread-${i}-xxxx`);
-  assert.equal(await formFrom(base, '127.0.0.5', PASSWORD), 429);
-  clock.now += GLOBAL_LOGIN_LIMITS.maxLockMs;
+  assert.equal(await formFrom(base, '127.0.1.10', PASSWORD), 429);
   assert.equal(await formFrom(base, '127.0.0.5', PASSWORD), 303);
+  clock.now += GLOBAL_LOGIN_LIMITS.maxLockMs;
+  assert.equal(await formFrom(base, '127.0.1.10', PASSWORD), 303);
 }));
 
 test('HTTP 会话：每次登录各一个；退出只结束本浏览器并清 cookie，注销全部让所有浏览器重新登录；须请求标记', () => withPasswordServer(async (base, port) => {
@@ -186,7 +193,9 @@ test('HTTP 会话：每次登录各一个；退出只结束本浏览器并清 co
   const post = (path: string, cookie: string, headers: Record<string, string> = { 'x-pa-executor': '1' }) =>
     fetch(`${base}${path}`, { method: 'POST', headers: { cookie, 'content-type': 'application/json', ...headers }, body: '{}' });
   assert.equal((await post('/api/session/logout', first, {})).status, 403);
-  const out = await post('/api/session/logout', first);
+  const duplicate = `${sessionCookieName(port)}=old; ${first}`;
+  assert.equal((await read(duplicate)).status, 200);
+  const out = await post('/api/session/logout', duplicate);
   assert.equal(out.status, 200);
   assert.match(out.headers.get('set-cookie') ?? '', new RegExp(`^${sessionCookieName(port)}=; .*Max-Age=0`));
   assert.equal((await read(first)).status, 401);

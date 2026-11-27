@@ -79,12 +79,12 @@ test('资产接口：未导入时 200 与空数据，导入后给出账本；期
   } finally { w.done(); }
 });
 
-test('资产接口：读取失败时 500 asset_unreadable 并带原因', async () => {
+test('资产接口：数据库读取失败时返回固定 503 文案', async () => {
   const failing = { ...createAssetStore(join(tmpdir(), 'tp-asset-none', ASSET_DB_FILE)), ledger: async () => { throw new Error('database disk image is malformed'); } };
   await withServer({ asset: failing }, async get => {
     const response = await get('/api/asset/ledger');
-    assert.equal(response.status, 500);
-    assert.deepEqual(await response.json(), { code: 'asset_unreadable', message: '资产账本读取失败：database disk image is malformed' });
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), { code: 'asset_unavailable', message: '服务暂时不可用，已保留上次数据，请稍后重试' });
     assert.equal((await get('/api/asset/state')).status, 200);
   });
 });

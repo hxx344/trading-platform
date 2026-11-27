@@ -2,6 +2,7 @@
 // events that need a person into messages; the messages wait in an outbox of their own database (notify.sqlite), so a
 // slow or failing robot never touches the executor's database or holds up a transfer or an ADL pass. Delivery is at
 // least once: the cursor and the queued messages move in one transaction, and a send whose answer is lost is retried.
+import { redactDiagnostic } from '../redact-diagnostic.ts';
 import { createHmac } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import type { FeishuSecret } from './config.ts';
@@ -100,7 +101,7 @@ export interface NotifierOptions {
 }
 
 const short = (value: unknown): string => typeof value === 'string' ? value.slice(0, 8) : '?';
-const clip = (value: unknown, length = 300): string => (typeof value === 'string' ? value : JSON.stringify(value ?? '')).slice(0, length);
+const clip = (value: unknown, length = 300): string => redactDiagnostic(typeof value === 'string' ? value : JSON.stringify(value ?? '')).slice(0, length);
 /** Residuals left by a completed ADL incident (inside the 0.5 % tolerance or below one lot): they are not hedged, so they are listed. */
 const residualNote = (value: unknown): string => {
   if (!Array.isArray(value) || value.length === 0) return '';
@@ -357,7 +358,7 @@ export async function sendFeishu(feishu: FeishuSecret, message: Record<string, u
       ...(opportunityReceipt ? { redirect: 'error' } : {}), signal: AbortSignal.timeout(SEND_TIMEOUT_MS) });
   } catch (error) {
     if (opportunityReceipt) throw Object.assign(new Error('飞书连接失败或超时'), { uncertain: true });
-    throw error;
+    throw new Error(redactDiagnostic(error instanceof Error ? error.message : String(error)));
   }
   let answer: { code?: unknown; StatusCode?: unknown; msg?: unknown } = {};
   try { answer = await response.json() as typeof answer; } catch { /* judged by status below */ }
@@ -368,7 +369,7 @@ export async function sendFeishu(feishu: FeishuSecret, message: Record<string, u
     if (code !== 0) throw new Error(`飞书拒绝本次提醒（业务码 ${String(code)}）`);
     return;
   }
-  if (!response.ok || (code !== undefined && code !== 0)) throw new Error(`飞书返回 HTTP ${response.status}${code !== undefined ? ` code ${String(code).slice(0, 12)}` : ''}${typeof answer.msg === 'string' ? ` ${answer.msg.slice(0, 80)}` : ''}`);
+  if (!response.ok || (code !== undefined && code !== 0)) throw new Error(`飞书返回 HTTP ${response.status}${code !== undefined ? ` code ${redactDiagnostic(String(code)).slice(0, 12)}` : ''}${typeof answer.msg === 'string' ? ` ${redactDiagnostic(answer.msg).slice(0, 80)}` : ''}`);
 }
 
 export function createNotifier({ file, events, latestSeq, pairs, incidentPair, job, feishu, now = Date.now, fetchImpl = (url, init) => fetch(url, init), log = line => process.stderr.write(`${line}\n`), chainArbNotificationExpiry }: NotifierOptions) {
@@ -379,7 +380,10 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
       attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL, sent_at INTEGER, last_error TEXT, repeat_key TEXT, guarded_due_at INTEGER);
     CREATE INDEX IF NOT EXISTS outbox_due ON outbox(sent_at, next_at);
     CREATE TABLE IF NOT EXISTS repeats (key TEXT PRIMARY KEY, at INTEGER NOT NULL);
-    CREATE TABLE IF NOT EXISTS once (key TEXT PRIMARY KEY, at INTEGER NOT NULL);`);
+    CREATE TABLE IF NOT EXISTS once (key TEXT PRIMARY KEY, at INTEGER NOT NULL);
+    CREATE INDEX IF NOT EXISTS outbox_created ON outbox(created_at);
+    CREATE INDEX IF NOT EXISTS repeats_at ON repeats(at);
+    CREATE INDEX IF NOT EXISTS once_at ON once(at);`);
   // A fresh outbox starts at the current end of the log: history from before the notifier existed is not replayed.
   if (!db.prepare('SELECT 1 FROM cursor').get()) db.prepare('INSERT INTO cursor(id, seq) VALUES (1, ?)').run(latestSeq());
   const tx = <T>(operation: () => T): T => {
@@ -399,6 +403,7 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
   });
   /** The queued message's id, or null without a robot (the text is only logged then). */
   const insert = (text: string, at: number, repeatKey: string | null = null): number | null => {
+    text = redactDiagnostic(text);
     // Logged once the row is in (a rolled-back insert would otherwise read as an alert that went out).
     const guarded = repeatKey !== null || text.startsWith('【链上折价套利】');
     const id = feishu ? Number(db.prepare('INSERT INTO outbox(created_at, text, next_at, repeat_key, guarded_due_at) VALUES (?, ?, ?, ?, ?)')
@@ -464,7 +469,7 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
       // other pairs are still checked this round.
       const queued = (text: string): boolean => {
         try { tx(() => insert(text, at)); return true; }
-        catch (error) { log(`保证金平衡告警未能入队，下一轮重试：${error instanceof Error ? error.message.slice(0, 160) : String(error)}`); return false; }
+        catch (error) { log(`保证金平衡告警未能入队，下一轮重试：${error instanceof Error ? redactDiagnostic(error.message).slice(0, 160) : redactDiagnostic(String(error))}`); return false; }
       };
       const pending = recoveries.get(pair.id);
       if (pending && queued(pending.additional ? `${pending.text}。等待入队期间另有 ${pending.additional} 次异常已恢复` : pending.text)) recoveries.delete(pair.id);
@@ -537,6 +542,9 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
   }
 
   let sending = false, pruneAt = 0;
+  const expireOutbox = db.prepare('DELETE FROM outbox WHERE created_at < ?');
+  const expireRepeats = db.prepare('DELETE FROM repeats WHERE at < ?');
+  const expireOnce = db.prepare('DELETE FROM once WHERE at < ?');
   /** Sends what is due, oldest first, several messages per post; a failure backs off the whole batch. */
   async function flush(): Promise<void> {
     if (sending) return;
@@ -547,10 +555,11 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
       // first flush after a start: the retention is seven days, and each DELETE scans its table. A clock set back by
       // more than the interval prunes at once instead of waiting for the old time to come round again.
       if (at >= pruneAt || at < pruneAt - PRUNE_EVERY_MS) {
+        const cutoff = at - RETENTION_MS;
+        expireOutbox.run(cutoff);
+        expireRepeats.run(cutoff);
+        expireOnce.run(cutoff);
         pruneAt = at + PRUNE_EVERY_MS;
-        db.prepare('DELETE FROM outbox WHERE created_at < ?').run(at - RETENTION_MS);
-        db.prepare('DELETE FROM repeats WHERE at < ?').run(at - RETENTION_MS);
-        db.prepare('DELETE FROM once WHERE at < ?').run(at - RETENTION_MS);
       }
       if (!feishu) return;
       const due = db.prepare('SELECT id, text, attempts, repeat_key AS key, created_at AS created FROM outbox WHERE sent_at IS NULL AND COALESCE(guarded_due_at, next_at) <= ? ORDER BY id LIMIT ?').all(at, LINES_PER_POST) as { id: number; text: string; attempts: number; key: string | null; created: number }[];
@@ -567,11 +576,11 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
       const sendingAt = now(), ready = due.filter((_, index) => deadlines[index]! > sendingAt);
       try {
         if (ready.length) {
-          await post(ready.map(row => row.text).join('\n'));
+          await post(ready.map(row => redactDiagnostic(row.text)).join('\n'));
           tx(() => { for (const row of ready) db.prepare('UPDATE outbox SET sent_at = ?, last_error = NULL WHERE id = ?').run(now(), row.id); });
         }
       } catch (error) {
-        const reason = error instanceof Error ? error.message.slice(0, 200) : '未知错误';
+        const reason = error instanceof Error ? redactDiagnostic(error.message).slice(0, 200) : '未知错误';
         log(`飞书发送失败：${reason}`);
         tx(() => {
           for (const row of ready) {
@@ -601,7 +610,7 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
       const failed = db.prepare('SELECT last_error AS error, COALESCE(guarded_due_at, next_at) AS nextAt FROM outbox WHERE sent_at IS NULL AND last_error IS NOT NULL ORDER BY id DESC LIMIT 1').get() as { error: string; nextAt: number } | undefined;
       const recent = (db.prepare(`SELECT id, created_at AS createdAt, text, attempts, COALESCE(guarded_due_at, next_at) AS nextAt, sent_at AS sentAt, last_error AS lastError FROM outbox ORDER BY id DESC LIMIT ${STATUS_RECENT}`).all() as unknown as
         { id: number; createdAt: number; text: string; attempts: number; nextAt: number; sentAt: number | null; lastError: string | null }[]);
-      return { configured: feishu !== null, pending: counts.pending, retrying: counts.retrying, lastSentAt: sent.at, lastError: failed?.error ?? null, nextRetryAt: failed?.nextAt ?? null, retentionMs: RETENTION_MS, recent };
+      return { configured: feishu !== null, pending: counts.pending, retrying: counts.retrying, lastSentAt: sent.at, lastError: failed ? redactDiagnostic(failed.error) : null, nextRetryAt: failed?.nextAt ?? null, retentionMs: RETENTION_MS, recent: recent.map(row => ({ ...row, text: redactDiagnostic(row.text), lastError: row.lastError && redactDiagnostic(row.lastError) })) };
     },
     /** Delivery of queued messages by id (market alert history); an id missing from the result has left the outbox (retention). */
     delivery(ids: readonly number[]): Map<number, { sentAt: number | null; attempts: number; lastError: string | null; nextAt: number }> {
@@ -609,7 +618,7 @@ export function createNotifier({ file, events, latestSeq, pairs, incidentPair, j
       const read = db.prepare('SELECT sent_at AS sentAt, attempts, last_error AS lastError, COALESCE(guarded_due_at, next_at) AS nextAt FROM outbox WHERE id = ?');
       for (const id of ids) {
         const row = read.get(id) as { sentAt: number | null; attempts: number; lastError: string | null; nextAt: number } | undefined;
-        if (row) result.set(id, { sentAt: row.sentAt, attempts: row.attempts, lastError: row.lastError, nextAt: row.nextAt });
+        if (row) result.set(id, { sentAt: row.sentAt, attempts: row.attempts, lastError: row.lastError && redactDiagnostic(row.lastError), nextAt: row.nextAt });
       }
       return result;
     },

@@ -94,7 +94,7 @@ sudo bash install.sh --watch-url http://<副服务器 IP>:8792/heartbeat --watch
 - `sudo bash install.sh --watch-import`：地址与令牌取自本机工作台推送端的配置 `/etc/main-watch/sender`。
 - 本机装着工作台的推送端（`main-watch-sender.timer`）且它推往同一个地址时，脚本会停用那个定时器（文件保留）。否则两个推送端轮流上报，接收端以最新一条为准，结果会来回跳。停用后副服务器只知道本服务是否就绪，**工作台是否正常不再上报**；还要盯工作台的话，在副服务器能直连它时用 `install-watch.sh --checks http://<主服务器地址>:3100/api/ready` 加一个检查目标。
 - `sudo bash install.sh --watch-off`：去掉两段并重启。
-- 令牌写在命令行上会进 shell 历史；它只能用来伪造“就绪”心跳，不能访问任何账户。在意的话执行后清掉那条历史，或在副服务器用 `--heartbeat-token` 换一个再重设。
+- 自动化可用 `--watch-token-stdin < /path/to/heartbeat-token`，从标准输入读取一行令牌，使令牌留在命令行参数和 shell 历史之外。
 - 核对：页面「运行状态」→「副服务器巡检心跳」显示最近送达时刻；副服务器上 `sudo main-watch probe` 显示正常。
 - 状态页显示 `HTTP 403` 时，核对两端令牌是否一致、两台服务器时间是否准确。主服务器的时间被往回调过并重启了服务时，在时间追上副服务器上一次收下的那条之前也会是 403。
 - 显示超时或连接被拒时，核对副服务器安全组与 `main-watch-heartbeat` 服务。本服务配了代理（`/etc/trading-platform/environment` 里的 `NODE_USE_ENV_PROXY=1`）时心跳也走代理，副服务器看到的来源是代理的 IP；要直连就在同一个文件里加 `NO_PROXY=<副服务器 IP>`。

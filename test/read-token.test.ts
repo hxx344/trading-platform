@@ -76,6 +76,8 @@ test('只读令牌：没有令牌文件、令牌错误一律 401；连续错误�
     const used = s.tokens!.view().tokens[0]!;
     clock.now += 1_000;
     assert.equal((await s.read(`${token}x`, '/api/status')).status, 401);
+    const mixed = await s.read(token, '/api/status', { headers: { cookie: s.cookie } });
+    assert.equal(mixed.status, 403);
     assert.equal((await fetch(`${s.base}/api/status`, { headers: { authorization: token } })).status, 401, '缺少 Bearer');
     let locked = false;
     for (let i = 0; i < 12 && !locked; i += 1) locked = (await s.read(`tpr_${'B'.repeat(43)}`, '/api/status')).status === 429;
@@ -317,6 +319,9 @@ test('打码：字段名不分大小写与下划线；地址类字段里的地�
   assert.equal(out.at, '1970-01-01T00:00:00.000Z');
   assert.equal(out.price, '1.25');
   assert.equal(out.label, 'xau');
+  const article = 'https://eqn.news/main/1234';
+  const details = redact({ text: '失败 https://example.test/private 来自 192.0.2.7、2001:db8::8 vr-token=example', link: article });
+  assert.deepEqual(details, { text: '失败 [URL] 来自 [IP]、[IP] vr-token=[隐藏]', link: article });
   const words = redact({ text: '子账户 50000 USDT 已划转；UID 88776655 已暂停；账户 1234567 的余额 12.5%', users: 3, user: 123456 }) as Record<string, unknown>;
   assert.match(String(words.text), /^子账户 50000 USDT 已划转；UID acct-[0-9a-f]{8} 已暂停；账户 acct-[0-9a-f]{8} 的余额/, '数字后跟单位是金额，不打码');
   assert.equal(words.users, 3, '计数字段的数字不打码');

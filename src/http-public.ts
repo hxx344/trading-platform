@@ -1,4 +1,4 @@
-import type { IncomingMessage, Server, ServerResponse } from 'node:http';
+import { createServer, type IncomingMessage, type RequestListener, type Server, type ServerResponse } from 'node:http';
 import { createServer as createNetServer, type AddressInfo } from 'node:net';
 import { ContractError } from './contracts.ts';
 import type { WebAsset } from './web-assets.ts';
@@ -73,20 +73,44 @@ export function sendJsonText(response: ServerResponse, status: number, payload: 
   response.end(payload);
 }
 
-export function readJson(request: IncomingMessage, maxBytes = 16 * 1024, tooLarge = '请求体过大'): Promise<unknown> {
-  return new Promise((resolve, fail) => {
-    let size = 0; const chunks: Buffer[] = [];
+export const MAX_LOGIN_BYTES = 4 * 1024;
+
+export function boundedHttpServer(handler: RequestListener): Server {
+  const server = createServer({ headersTimeout: 10_000, requestTimeout: 30_000, keepAliveTimeout: 5_000, connectionsCheckingInterval: 1_000 }, handler);
+  server.maxConnections = 256;
+  return server;
+}
+
+/** Deliver the short rejection before closing the socket, including clients that never finish their body. */
+export function closeAfterResponse(response: ServerResponse): void {
+  const socket = response.socket;
+  response.setHeader('connection', 'close');
+  response.once('finish', () => socket?.destroy());
+}
+
+export function readBody(request: IncomingMessage, maxBytes: number, tooLarge = '请求体过大'): Promise<Buffer> {
+  if (Number(request.headers['content-length']) > maxBytes) return Promise.reject(new ContractError(413, 'body_too_large', tooLarge));
+  return new Promise((resolve, reject) => {
+    let count = 0;
+    const chunks: Buffer[] = [];
     const onData = (chunk: Buffer) => {
-      size += chunk.length;
-      if (size <= maxBytes) { chunks.push(chunk); return; }
-      // Drain instead of destroying so the client still receives the 413; the connection closes after it.
-      request.off('data', onData); request.resume();
-      fail(new ContractError(413, 'body_too_large', tooLarge));
+      count += chunk.length;
+      if (count <= maxBytes) { chunks.push(chunk); return; }
+      request.off('data', onData);
+      request.pause();
+      reject(new ContractError(413, 'body_too_large', tooLarge));
     };
     request.on('data', onData);
-    request.on('end', () => { try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || 'null')); } catch { fail(new ContractError(400, 'invalid_json', '请求体不是有效 JSON')); } });
-    request.on('error', fail);
+    request.once('end', () => resolve(Buffer.concat(chunks)));
+    request.once('error', reject);
+    request.once('close', () => { if (!request.complete) reject(new ContractError(400, 'body_incomplete', '请求未完成')); });
   });
+}
+
+export async function readJson(request: IncomingMessage, maxBytes = 16 * 1024, tooLarge = '请求体过大'): Promise<unknown> {
+  const body = await readBody(request, maxBytes, tooLarge);
+  try { return JSON.parse(body.toString('utf8') || 'null'); }
+  catch { throw new ContractError(400, 'invalid_json', '请求体不是有效 JSON'); }
 }
 
 export interface PublicListenOptions {
@@ -101,6 +125,7 @@ export interface PublicListenOptions {
 /** Both addresses feed one HTTP server. Failure of the optional address leaves loopback available while it retries. */
 export function listenPublic(server: Server, { port, listen, listenRetry = { firstMs: 2_000, maxMs: 30_000 }, log = line => process.stderr.write(`${line}\n`), onListening, onError }: PublicListenOptions): () => void {
   const extra = listen ? createNetServer(socket => { server.emit('connection', socket); }) : null;
+  if (extra) extra.maxConnections = server.maxConnections;
   let stopped = false;
   let retry: ReturnType<typeof setTimeout> | undefined;
   server.on('error', error => {

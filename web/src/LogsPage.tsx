@@ -22,6 +22,7 @@ export function LogsPage({ onExpired }: { onExpired: () => void }) {
   // Lines are numbered in the order written; newest first, also when two share a millisecond.
   const sorted = [...rows].sort((a, b) => Number(b.id) - Number(a.id));
   return <section className="panel" aria-label="服务日志" data-logs>
+    {live.data?.pendingWrites ? <p role="status">页面日志暂时无法写入，显示已落盘的记录。待写 {live.data.pendingWrites} 行。</p> : null}
     <div className="section-head">
       <h2>服务日志</h2>
       <div className="account-controls" role="group" aria-label="筛选">

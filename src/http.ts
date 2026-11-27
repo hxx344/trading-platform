@@ -2,13 +2,14 @@
 // checks the Host header against DNS rebinding, hands the session cookie out only in exchange for the access token
 // written to the data directory or for the login password, and requires that cookie plus a custom header on every
 // write, so neither another site nor another process that merely reaches the port can drive it.
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { isIP } from 'node:net';
+import { setTimeout as delay } from 'node:timers/promises';
 import { ContractError, TRANSFER_CONFIG_KEYS, VENUES, exactKeys, parsePage, type Venue } from './contracts.ts';
 import type { Executor } from './executor.ts';
-import { APP_HEADERS, CLIENT_ADDRESS_HEADER, CONFIG_CHECK_HEADER, CONFIG_MATCH_HEADER, CONTROL_HEADER, EXECUTION_HEADER, LEGACY_UPDATE_HEADER, LISTEN_HEADER, PAGE_HEADERS, controlRoute, readJson, sendJson, sendJsonText, sendWebAsset, sessionCookieName } from './http-public.ts';
-import { GLOBAL_LOGIN_LIMITS, LoginThrottle, MAX_PASSWORD_LENGTH, verifyPassword, type PasswordHash, type ThrottleLimits } from './login-password.ts';
+import { APP_HEADERS, CLIENT_ADDRESS_HEADER, CONFIG_CHECK_HEADER, CONFIG_MATCH_HEADER, CONTROL_HEADER, EXECUTION_HEADER, LEGACY_UPDATE_HEADER, LISTEN_HEADER, PAGE_HEADERS, MAX_LOGIN_BYTES, boundedHttpServer, closeAfterResponse, controlRoute, readBody, readJson, sendJson, sendJsonText, sendWebAsset, sessionCookieName } from './http-public.ts';
+import { GLOBAL_LOGIN_LIMITS, LoginThrottle, MAX_PASSWORD_LENGTH, throttleAddress, verifyPassword, type PasswordHash, type ThrottleLimits } from './login-password.ts';
 import { openSessionStore, type SessionInfo, type SessionStore } from './sessions.ts';
 import { READ_SCOPE_NAMES, READ_TOKEN_MAX_BYTES, ReadTokenError, readTokenNewsView, readTokenScope, readTokenSystemStatus, readTokenUpdateView, type ReadScope, type ReadTokens } from './read-token.ts';
 import type { Redactor } from './read-redact.ts';
@@ -37,7 +38,6 @@ import { fillsQueryMarket } from './asset/fills-service.ts';
 
 export { sessionCookieName } from './http-public.ts';
 
-const MAX_LOGIN_BYTES = 4 * 1024;
 const LOOPBACK = /^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/;
 const UUID_PATH = /^\/api\/jobs\/([0-9a-f-]{36})(?:\/(stop|acknowledge|adopt-strategy|confirm-not-created|release-strategy))?$/i;
 
@@ -63,7 +63,7 @@ const ASSET_WRITES = { '/api/asset/assets/edit': 'edit', '/api/asset/fx': 'fx', 
 } as const;
 const IMPORT_TOO_LARGE = '导入文件不能超过 5 MB';
 /** The workbench's database and network failures (modules/asset/lib/api.ts failure at 0014655). */
-const ASSET_UNAVAILABLE = /D1_|SQLITE|decrypt|OperationError|fetch failed|network|aborted|timeout/i;
+const ASSET_UNAVAILABLE = /D1_|SQLITE|database disk image is malformed|decrypt|OperationError|fetch failed|network|aborted|timeout/i;
 /**
  * A failed asset write as the workbench answers it (lib/api.ts failure), with this service's codes: invalid input 400
  * with one fixed text, a refusal because of the ledger's state 409, a database error 503 without its SQL or text, an
@@ -229,6 +229,32 @@ export interface HttpOptions {
 
 const TOKEN_THROTTLES = 1_024;
 
+// Only failures allocate entries. When full, retain every active lock.
+function addressFailures(make: () => LoginThrottle) {
+  const entries = new Map<string, LoginThrottle>();
+  return {
+    get: (key: string) => entries.get(key),
+    clear: () => entries.clear(),
+    failed(key: string) {
+      let entry = entries.get(key);
+      if (!entry) {
+        if (entries.size >= TOKEN_THROTTLES) {
+          let unlocked: string | undefined;
+          for (const [name, item] of entries) {
+            if (!item.hasFailures()) { unlocked = name; break; }
+            if (unlocked === undefined && item.waitMs() === 0) unlocked = name;
+          }
+          if (unlocked === undefined) return;
+          entries.delete(unlocked);
+        }
+        entry = make();
+        entries.set(key, entry);
+      }
+      entry.failed();
+    },
+  };
+}
+
 // Hashing first gives equal-length inputs, so the comparison does not leak the token length either.
 const sameSecret = (given: string, expected: string): boolean =>
   timingSafeEqual(createHash('sha256').update(given).digest(), createHash('sha256').update(expected).digest());
@@ -238,11 +264,11 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
   if (session !== undefined && sameSecret(session, accessToken)) throw new Error('会话值不能与访问令牌相同');
   const sessions = given ?? openSessionStore({ seed: session === undefined ? [] : [session] });
   // The executor records which session asked for each command; it gets a digest, so the stored rows never hold the cookie.
-  const requestSessions = new WeakMap<IncomingMessage, SessionInfo>();
+  const requestSessions = new WeakMap<IncomingMessage, { value: string; session: SessionInfo }>();
   const sessionId = (request: IncomingMessage): string => {
     const found = requestSessions.get(request);
     if (!found) throw new ContractError(401, 'session', '需要登录');
-    return found.id;
+    return found.session.id;
   };
   const privateSocket = browserPort !== undefined;
   const cookieName = (request: IncomingMessage) => sessionCookieName(browserPort ?? request.socket.localPort ?? 0);
@@ -250,58 +276,42 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
     const address = privateSocket ? request.headers[CLIENT_ADDRESS_HEADER] : request.socket.remoteAddress;
     return typeof address === 'string' && isIP(address) ? address : '未知地址';
   };
-  const cookieValue = (request: IncomingMessage): string | undefined => {
-    const name = cookieName(request);
-    return (request.headers.cookie ?? '').split(';').map(part => part.trim()).find(part => part.startsWith(`${name}=`))?.slice(name.length + 1);
-  };
-  /** Whether the request carries a live session; the session is then remembered for the request (sessionId). */
+  function activeCookie(request: IncomingMessage): { value: string; session: SessionInfo } | null {
+    const prefix = cookieName(request) + '=';
+    for (const raw of (request.headers.cookie ?? '').split(';')) {
+      const cookie = raw.trim();
+      if (!cookie.startsWith(prefix)) continue;
+      const value = cookie.slice(prefix.length), session = sessions.check(value);
+      if (session) return { value, session };
+    }
+    return null;
+  }
   const authorized = (request: IncomingMessage): boolean => {
-    const value = cookieValue(request);
-    const found = value === undefined ? null : sessions.check(value);
-    if (found) requestSessions.set(request, found);
-    return found !== null;
+    const active = activeCookie(request);
+    if (active) requestSessions.set(request, active);
+    return active !== null;
   };
   // Loopback by any port (a tunnel may map it), the chosen address by itself or with a port.
   const allowedHost = (value: string): boolean => LOOPBACK.test(value) || (host !== undefined && (value === host || (value.startsWith(`${host}:`) && /^\d{1,5}$/.test(value.slice(host.length + 1)))));
   /** A new session for the browser, with its cookie; the one the browser still carried, if any, ends (it is replaced). */
   const sessionCookie = (request: IncomingMessage): string => {
-    const previous = cookieValue(request);
+    const previous = activeCookie(request)?.value;
     if (previous) sessions.remove(previous);
     return `${cookieName(request)}=${sessions.create()}; HttpOnly; SameSite=Strict; Path=/${sessions.maxAgeS ? `; Max-Age=${sessions.maxAgeS}` : ''}`;
   };
   const clearedCookie = (request: IncomingMessage): string => `${cookieName(request)}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0`;
-  // Wrong passwords per client address (at most TOKEN_THROTTLES of them, the oldest goes first), and a loose count over all.
-  const loginThrottles = new Map<string, LoginThrottle>();
+  const loginThrottles = addressFailures(() => makeThrottle());
   const globalThrottle = makeThrottle(GLOBAL_LOGIN_LIMITS);
-  const loginThrottleFor = (address: string): LoginThrottle => {
-    let found = loginThrottles.get(address);
-    if (!found) {
-      found = makeThrottle();
-      loginThrottles.set(address, found);
-      if (loginThrottles.size > TOKEN_THROTTLES) loginThrottles.delete(loginThrottles.keys().next().value!);
-    }
-    return found;
+  const loginWaitMs = (key: string): number => {
+    const local = loginThrottles.get(key);
+    return local?.hasFailures() ? Math.max(local.waitMs(), globalThrottle.waitMs()) : 0;
   };
-  const loginWaitMs = (address: string): number => Math.max(loginThrottleFor(address).waitMs(), globalThrottle.waitMs());
   // The form's own page sends its real Origin with the post (no-referrer would make it "null", as sandboxed pages send).
   const loginPage = (response: ServerResponse, status: number, notice = '') => {
     response.writeHead(status, { ...PAGE_HEADERS, 'referrer-policy': 'same-origin' });
     response.end(password ? loginForm(notice) : LOGIN_REQUIRED);
   };
   let verifying = false;
-  const readForm = (request: IncomingMessage): Promise<URLSearchParams | 'too-large' | null> => new Promise((resolve, fail) => {
-    let size = 0; const chunks: Buffer[] = [];
-    const onData = (chunk: Buffer) => {
-      size += chunk.length;
-      if (size <= MAX_LOGIN_BYTES) { chunks.push(chunk); return; }
-      request.off('data', onData); resolve('too-large');
-    };
-    request.on('data', onData);
-    request.on('end', () => { if (size <= MAX_LOGIN_BYTES) resolve(new URLSearchParams(Buffer.concat(chunks).toString('utf8'))); });
-    // A client gone before the end leaves nothing to check; resolving twice is a no-op.
-    request.on('close', () => resolve(null));
-    request.on('error', fail);
-  });
   // The form posts from this page only. Browsers name the fetch site on every post; an older one without it still names
   // the origin, which must be this one ("null" comes from sandboxed and data: pages). No Origin at all is not a browser.
   const sameOrigin = (request: IncomingMessage): boolean => {
@@ -312,30 +322,36 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
   async function passwordLogin(request: IncomingMessage, response: ServerResponse): Promise<void> {
     if (!password) { request.resume(); return loginPage(response, 401); }
     if (!sameOrigin(request) || !String(request.headers['content-type'] ?? '').startsWith('application/x-www-form-urlencoded')) { request.resume(); return loginPage(response, 403, '请从登录页提交'); }
-    const address = clientAddress(request), throttle = loginThrottleFor(address);
-    const busy = () => loginPage(response, 429, `尝试次数过多，请 ${Math.max(1, Math.ceil(loginWaitMs(address) / 1000))} 秒后再试`);
-    if (loginWaitMs(address) > 0) { request.resume(); return busy(); }
+    const address = clientAddress(request), key = throttleAddress(address);
+    const busy = () => loginPage(response, 429, `尝试次数过多，请 ${Math.max(1, Math.ceil(loginWaitMs(key) / 1000))} 秒后再试`);
+    if (loginWaitMs(key) > 0) { request.resume(); return busy(); }
     // The body is read before taking the check, so a client that sends it slowly holds up nobody else.
-    const form = await readForm(request);
-    if (response.writableEnded || request.socket.destroyed) return;
-    if (form === 'too-large') {
-      response.writeHead(413, { ...PAGE_HEADERS, connection: 'close' });
-      response.end('请求体过大', () => request.socket.destroy());
-      return;
+    let form: URLSearchParams;
+    try { form = new URLSearchParams((await readBody(request, MAX_LOGIN_BYTES)).toString('utf8')); }
+    catch (error) {
+      if (!(error instanceof ContractError) || error.status !== 413) throw error;
+      closeAfterResponse(response);
+      return loginPage(response, 413, '请求体过大');
     }
+    if (response.destroyed || request.socket.destroyed) return;
     // One check at a time, so parallel guesses cannot outrun the counter.
-    if (loginWaitMs(address) > 0 || verifying) return busy();
+    if (loginWaitMs(key) > 0 || verifying) return busy();
     verifying = true;
     let ok: boolean;
-    try { ok = form !== null && await verifyPassword(form.get('password') ?? '', password); }
+    try {
+      // Fresh prefixes can still authenticate under global backoff. Bound the cost even if every table slot is locked.
+      if (globalThrottle.waitMs() > 0) await delay(500);
+      ok = await verifyPassword(form.get('password') ?? '', password);
+    }
     finally { verifying = false; }
     if (!ok) {
-      throttle.failed(); globalThrottle.failed();
-      const locked = loginWaitMs(address);
+      loginThrottles.failed(key); globalThrottle.failed();
+      const locked = loginWaitMs(key);
       log(`页面登录密码错误（来自 ${address}）${locked ? `，已锁定 ${Math.ceil(locked / 1000)} 秒` : ''}`);
       return loginPage(response, 401, locked ? `密码错误，已锁定 ${Math.ceil(locked / 1000)} 秒` : '密码错误');
     }
-    throttle.succeeded();
+    loginThrottles.get(key)?.succeeded();
+    globalThrottle.succeeded();
     const cookie = sessionCookie(request);
     log(`页面密码登录成功（来自 ${address}，当前 ${sessions.count()} 个会话）`);
     response.writeHead(303, { ...PAGE_HEADERS, location: '/', 'set-cookie': cookie });
@@ -392,9 +408,19 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
     const address = clientAddress(request);
     let tokenId: string | null = null;
     // A locked address is answered without a log line, so wrong tokens cannot fill the log (as with the password).
-    const throttle = throttleFor(address);
-    const wait = throttle.waitMs();
-    if (wait > 0) return sendJson(response, 429, { code: 'token_locked', message: `令牌错误次数过多，请 ${Math.ceil(wait / 1000)} 秒后再试` }, { 'retry-after': String(Math.ceil(wait / 1000)) });
+    const key = throttleAddress(address);
+    const localWait = tokenThrottles.get(key)?.waitMs() ?? 0;
+    const locked = (wait: number) => sendJson(response, 429, { code: 'token_locked', message: `令牌错误次数过多，请 ${Math.ceil(wait / 1000)} 秒后再试` }, { 'retry-after': String(Math.ceil(wait / 1000)) });
+    if (localWait > 0) return locked(localWait);
+    const mixed = request.headers.cookie !== undefined;
+    const bearer = !mixed && /^Bearer ([^\s]{1,200})$/.exec(String(request.headers.authorization));
+    const checked = bearer && readTokens ? readTokens.check(bearer[1]!) : { ok: false as const, reason: 'invalid' as const };
+    if (!checked.ok) {
+      const wait = globalTokenFailures.waitMs();
+      if (wait > 0) return locked(wait);
+      tokenThrottles.failed(key);
+      globalTokenFailures.failed();
+    }
     // One line per request, in the service log (logs.sqlite, 14 days); never the token itself. Only a request with the
     // valid token counts as a use on the page.
     response.once('close', () => {
@@ -403,14 +429,9 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
       const outcome = response.writableFinished ? `${response.statusCode}，${bytes} 字节` : '连接中断';
       log(`只读令牌${tokenId ? ` ${tokenId}` : '（无效）'} ${request.method ?? '?'} ${url.pathname} → ${outcome}，${Math.round(performance.now() - started)} ms（来自 ${address}）`);
     });
-    if (request.headers.cookie !== undefined) return sendJson(response, 403, { code: 'token_cookie', message: '令牌请求不能同时带会话 cookie' });
-    const bearer = /^Bearer ([^\s]{1,200})$/.exec(String(request.headers.authorization));
-    const checked = readTokens && bearer ? readTokens.check(bearer[1]!) : { ok: false as const, reason: 'invalid' as const };
-    if (!checked.ok) {
-      throttle.failed();
-      return sendJson(response, 401, { code: 'token', message: checked.reason === 'expired' ? '令牌已到期，请在设置页重新生成' : '令牌无效或已吊销' });
-    }
-    throttle.succeeded();
+    if (mixed) return sendJson(response, 403, { code: 'token_cookie', message: '令牌请求不能同时带会话 cookie' });
+    if (!checked.ok) return sendJson(response, 401, { code: 'token', message: checked.reason === 'expired' ? '令牌已到期，请在设置页重新生成' : '令牌无效或已吊销' });
+    tokenThrottles.get(key)?.succeeded();
     tokenId = checked.id;
     // The token's own name, scopes and expiry, for the MCP server to list only the tools it may call; the session gets 404.
     // Not on the whitelist and needing no scope, but under the same limits as every other token request.
@@ -430,17 +451,8 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
     tokenAnswers.set(response, { redact, bytes: 0, scopes: checked.scopes });
     return serve(request, response, url, controlRoute(request.method, url.pathname));
   }
-  // One throttle per client address, at most TOKEN_THROTTLES of them (the oldest goes first).
-  const tokenThrottles = new Map<string, LoginThrottle>();
-  const throttleFor = (address: string): LoginThrottle => {
-    let throttle = tokenThrottles.get(address);
-    if (!throttle) {
-      throttle = tokenThrottle();
-      tokenThrottles.set(address, throttle);
-      if (tokenThrottles.size > TOKEN_THROTTLES) tokenThrottles.delete(tokenThrottles.keys().next().value!);
-    }
-    return throttle;
-  };
+  const tokenThrottles = addressFailures(tokenThrottle);
+  const globalTokenFailures = makeThrottle(GLOBAL_LOGIN_LIMITS);
   const handOff = (response: ServerResponse): void => {
     response.writeHead(204, { [CONTROL_HEADER]: '1', 'cache-control': 'no-store' });
     response.end();
@@ -458,7 +470,7 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
       // Without a token it is the password form (or the access-url notice when no password is set).
       if (token === null || !sameSecret(token, accessToken)) return loginPage(response, token === null && password ? 200 : 401, token === null ? '' : '登录链接无效或已过期');
       // Whoever reads access-url may lift a lockout a guesser left, anywhere.
-      for (const item of loginThrottles.values()) item.succeeded();
+      loginThrottles.clear();
       globalThrottle.succeeded();
       const cookie = sessionCookie(request);
       log(`登录链接登录成功（来自 ${clientAddress(request)}，当前 ${sessions.count()} 个会话）`);
@@ -499,16 +511,16 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
     }
     if (!url.pathname.startsWith('/api/')) return send(response, 404, { code: 'not_found', message: '不存在' });
     if (!authorized(request)) return send(response, 401, { code: 'session', message: password ? '会话无效，请刷新页面重新登录' : '会话无效，请使用数据目录 access-url 中的登录链接重新打开' });
-    if ((request.method === 'POST' || request.method === 'PUT') && (request.headers['x-pa-executor'] !== '1' || !String(request.headers['content-type'] ?? '').startsWith('application/json'))) return send(response, 403, { code: 'csrf', message: '缺少本页面请求标记' });
+    if (request.method !== 'GET' && request.method !== 'HEAD' && (request.headers['x-pa-executor'] !== '1' || !String(request.headers['content-type'] ?? '').startsWith('application/json'))) return send(response, 403, { code: 'csrf', message: '缺少本页面请求标记' });
     // The page's own session: what it is, logging this browser out, or every browser (sessions.ts).
     if (url.pathname === '/api/session' && request.method === 'GET') {
-      const current = requestSessions.get(request)!;
+      const current = requestSessions.get(request)!.session;
       return send(response, 200, { createdAt: current.createdAt, expiresAt: current.expiresAt === Number.MAX_SAFE_INTEGER ? null : current.expiresAt, count: sessions.count() });
     }
     if (request.method === 'POST' && (url.pathname === '/api/session/logout' || url.pathname === '/api/session/logout-all')) {
       exactKeys(await readJson(request), []);
       const all = url.pathname.endsWith('-all');
-      const removed = all ? sessions.removeAll() : Number(sessions.remove(cookieValue(request) ?? ''));
+      const removed = all ? sessions.removeAll() : Number(sessions.remove(requestSessions.get(request)!.value));
       // The sessions are gone from this process either way, so the cookie is cleared either way. Only a removal on disk
       // is reported as done: otherwise a restart would bring them back (sessions.ts persisted()).
       if (!sessions.persisted()) {
@@ -833,9 +845,8 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
       const read = async <T>(run: () => Promise<T>): Promise<T> => {
         try { return await run(); }
         catch (error) {
-          // A JSON parse error quotes the text it failed on; the stored data stays out of the answer.
-          const reason = error instanceof SyntaxError ? '库里有一项数据格式无效，请重新导入' : error instanceof Error ? error.message.slice(0, 200) : String(error);
-          throw new ContractError(500, 'asset_unreadable', `资产账本读取失败：${reason}`);
+          if (error instanceof Error && ((error as NodeJS.ErrnoException).code === 'ERR_SQLITE_ERROR' || ASSET_UNAVAILABLE.test(error.message))) throw assetWriteError(error);
+          throw new ContractError(500, 'asset_unreadable', error instanceof SyntaxError ? '资产账本读取失败：库里有一项数据格式无效，请重新导入' : '资产账本读取失败，请查看服务状态');
         }
       };
       // A-5: the workbench's app/api/hub/positions and hub/fills routes at 7745181 (their checks and messages; any failure is 503).
@@ -1118,9 +1129,10 @@ export function createExecutorServer({ executor, accessToken, sessions: given, s
     return send(response, 404, { code: 'not_found', message: '不存在' });
   }
 
-  return createServer((request, response) => {
+  return boundedHttpServer((request, response) => {
     route(request, response).catch((error: unknown) => {
-      if (response.headersSent) { response.destroy(); return; }
+      if (response.destroyed || response.headersSent) { response.destroy(); return; }
+      if (error instanceof ContractError && error.status === 413) closeAfterResponse(response);
       if (error instanceof ContractError) send(response, error.status, { code: error.code, message: error.message }, error.status === 413 ? { connection: 'close' } : {});
       else send(response, 500, { code: 'internal', message: '执行器内部错误' });
     });

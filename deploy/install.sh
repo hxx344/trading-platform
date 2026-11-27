@@ -33,7 +33,7 @@
 #                                             一并导入 API Key（写入 secrets.json 的 ondo）；没有工作台 Ondo 数据时也可启用（只观察）
 #   sudo bash install.sh --set-password       设置或更换页面登录密码（输入两次，不回显；只存 scrypt 摘要，已登录的页面须重新登录，只读接口令牌全部吊销；
 #                                             沿用当前已装版本，不联网升级；脚本化时加 --password-stdin 从标准输入读一行）
-#   sudo bash install.sh --watch-url <地址> --watch-token <令牌>
+#   sudo bash install.sh --watch-url <地址> --watch-token-stdin < /path/to/heartbeat-token
 #                                             开启副服务器巡检心跳：每 30 秒向副服务器 main-watch 的心跳地址（如 http://<副服务器 IP>:8792/heartbeat）
 #                                             推送签名心跳；地址与令牌由副服务器的 install-watch.sh 打印。只换地址时可不带 --watch-token
 #   sudo bash install.sh --watch-import       同上，地址与令牌取自本机工作台版本的心跳推送端配置 /etc/main-watch/sender，并停用那个推送端
@@ -152,6 +152,7 @@ set_password=0
 password_stdin=0
 watch_url=''
 watch_token=''
+watch_token_stdin=0
 watch_import=0
 watch_off=0
 set_mev=0
@@ -181,6 +182,7 @@ while (($#)); do
     --set-password) set_password=1; shift ;;
     --password-stdin) password_stdin=1; shift ;;
     --watch-url) [[ $# -ge 2 && -n "$2" ]] || usage 2; watch_url=$2; shift 2 ;;
+    --watch-token-stdin) watch_token_stdin=1; shift ;;
     --watch-token) [[ $# -ge 2 && -n "$2" ]] || usage 2; watch_token=$2; shift 2 ;;
     --watch-import) watch_import=1; shift ;;
     --watch-off) watch_off=1; shift ;;
@@ -217,6 +219,13 @@ watch_change=0
 if [[ -n "$watch_url" ]] || ((watch_import || watch_off)); then watch_change=1; fi
 [[ -z "$watch_url" ]] || ((!watch_import && !watch_off)) || fail '--watch-url、--watch-import、--watch-off 只能用一个'
 ((!watch_import || !watch_off)) || fail '--watch-url、--watch-import、--watch-off 只能用一个'
+if ((watch_token_stdin)); then
+  [[ -n "$watch_url" && -z "$watch_token" ]] || fail '--watch-token-stdin 须与 --watch-url 一起使用，且不能同时给出 --watch-token'
+  ((!password_stdin && !mev_stdin && !dex_keys_stdin)) || fail '多个参数同时读取标准输入，请分开执行'
+  [[ -f "$0" ]] || fail '请先下载 install.sh 再使用 --watch-token-stdin'
+  IFS= read -r watch_token || [[ -n "$watch_token" ]] || fail '没有从标准输入读到心跳令牌'
+  [[ -n "$watch_token" ]] || fail '心跳令牌不能为空'
+fi
 [[ -z "$watch_token" || -n "$watch_url" ]] || fail '--watch-token 须和 --watch-url 一起使用'
 [[ -z "$watch_token" || "$watch_token" =~ ^[A-Za-z0-9_-]{32,256}$ ]] || fail '--watch-token 须为 32~256 位字母、数字、- 或 _（副服务器 /etc/main-watch/config 的 HEARTBEAT_TOKEN）'
 mev_change=0
@@ -425,10 +434,13 @@ ensure_node() {
   if [[ ! -x "$runtime_dir/bin/node" ]] || ! node_supported "$runtime_dir/bin/node"; then
     command -v xz >/dev/null || fail '缺少命令 xz（解压 Node.js 需要）'
     log "下载 Node.js $NODE_VERSION（约 30 MB）并核验官方 SHA-256。"
-    fetch "https://nodejs.org/dist/v${NODE_VERSION}/SHASUMS256.txt" "$work_dir/NODE_SUMS"
+    # nodejs.org/dist/v24.15.0/SHASUMS256.txt, pinned with the version.
+    case "$archive" in
+      node-v24.15.0-linux-x64.tar.xz) checksum=472655581fb851559730c48763e0c9d3bc25975c59d518003fc0849d3e4ba0f6 ;;
+      node-v24.15.0-linux-arm64.tar.xz) checksum=f3d5a797b5d210ce8e2cb265544c8e482eaedcb8aa409a8b46da7e8595d0dda0 ;;
+      *) fail '缺少此版本 Node.js 包的固定校验值' ;;
+    esac
     fetch "https://nodejs.org/dist/v${NODE_VERSION}/${archive}" "$work_dir/$archive"
-    checksum=$(awk -v name="$archive" '$2 == name { print $1 }' "$work_dir/NODE_SUMS")
-    [[ "$checksum" =~ ^[a-f0-9]{64}$ ]] || fail '官方校验文件里找不到当前 Node.js 包。'
     (cd "$work_dir" && printf '%s  %s\n' "$checksum" "$archive" | sha256sum --check --status) || fail 'Node.js 包 SHA-256 不一致。'
     as_root_dir "$APP_DIR/runtime" 755
     rm -rf "$runtime_dir"

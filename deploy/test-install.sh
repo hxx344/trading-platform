@@ -401,8 +401,8 @@ run --package "$tmp/a" --watch-url "$watch_to" --watch-token "$watch_token" && s
 check '--watch-url 写入地址与令牌并通过配置检查' '[[ $status -eq 0 ]] && grep -q "巡检心跳：每 30 秒推送到 $watch_to" "$tmp/out" && grep -q "，巡检心跳推送到 $watch_to" "$tmp/out" && [[ "$("$TP_NODE_BIN" -p "JSON.parse(require(\"fs\").readFileSync(process.argv[1], \"utf8\")).watch.url" "$TP_CONF_DIR/config.json")" == "$watch_to" && "$("$TP_NODE_BIN" -p "JSON.parse(require(\"fs\").readFileSync(process.argv[1], \"utf8\")).watch.token" "$TP_CONF_DIR/secrets.json")" == "$watch_token" ]]'
 check '心跳令牌只在密钥文件里，两个文件仍为 600' '! grep -q "$watch_token" "$tmp/out" "$TP_CONF_DIR/config.json" && [[ "$(stat -c %a "$TP_CONF_DIR/config.json")" == 600 && "$(stat -c %a "$TP_CONF_DIR/secrets.json")" == 600 ]]'
 check '开启心跳不动其余配置' '[[ "$("$TP_NODE_BIN" -e "const f = p => { const v = JSON.parse(require(\"fs\").readFileSync(p, \"utf8\")); delete v.watch; return JSON.stringify(v); }; process.stdout.write(String(f(process.argv[1]) === f(process.argv[2]) && f(process.argv[3]) === f(process.argv[4])))" "$tmp/config.before" "$TP_CONF_DIR/config.json" "$tmp/secrets.before" "$TP_CONF_DIR/secrets.json")" == true ]]'
-run --package "$tmp/a" --watch-url "$watch_to" --watch-token "$watch_token" && status=0 || status=$?
-check '重复开启心跳不改动配置' '[[ $status -eq 0 ]] && grep -q "巡检心跳已是推送到 $watch_to，配置未改动" "$tmp/out" && grep -q "无变化" "$tmp/out"'
+run --package "$tmp/a" --watch-url "$watch_to" --watch-token-stdin <<<"$watch_token" && status=0 || status=$?
+check '从标准输入重复开启心跳不改动配置' '[[ $status -eq 0 ]] && grep -q "巡检心跳已是推送到 $watch_to，配置未改动" "$tmp/out" && grep -q "无变化" "$tmp/out"'
 run --package "$tmp/a" --watch-url http://203.0.113.10:8792/heartbeat && status=0 || status=$?
 check '只换心跳地址时沿用已存的令牌' '[[ $status -eq 0 ]] && grep -q "，巡检心跳推送到 http://203.0.113.10:8792/heartbeat" "$tmp/out" && grep -q "\"token\": \"$watch_token\"" "$TP_CONF_DIR/secrets.json"'
 TP_WATCH_SENDER="$tmp/none/sender" run --package "$tmp/a" --watch-import && status=0 || status=$?

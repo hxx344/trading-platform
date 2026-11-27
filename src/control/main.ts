@@ -1,12 +1,12 @@
 // Public TCP listener. Only the execution process can authenticate a browser or accept a trading command.
-import { createServer, request as httpRequest, type IncomingMessage, type OutgoingHttpHeaders, type ServerResponse } from 'node:http';
+import { request as httpRequest, type IncomingMessage, type OutgoingHttpHeaders, type ServerResponse } from 'node:http';
 import { readFileSync, realpathSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { readComponentBuild } from '../component-build.ts';
 import { ContractError, exactKeys } from '../contracts.ts';
-import { APP_HEADERS, ASSET_PATH, CLIENT_ADDRESS_HEADER, CONTROL_HEADER, EXECUTION_HEADER, LEGACY_UPDATE_HEADER, LISTEN_HEADER, controlRoute, listenPublic, readJson, sendJson, sendWebAsset } from '../http-public.ts';
+import { APP_HEADERS, ASSET_PATH, CLIENT_ADDRESS_HEADER, CONTROL_HEADER, EXECUTION_HEADER, LEGACY_UPDATE_HEADER, LISTEN_HEADER, MAX_LOGIN_BYTES, boundedHttpServer, closeAfterResponse, controlRoute, listenPublic, readBody, readJson, sendJson, sendWebAsset } from '../http-public.ts';
 import { readTokenUpdateView } from '../read-token.ts';
 import { parseListenConfig, urlHost } from '../service/listen-config.ts';
 import { createUpdates, readInstalledVersion, updateReadyFile, type UpdateFetch, type UpdateView } from '../service/update.ts';
@@ -49,6 +49,7 @@ function relay(upstream: IncomingMessage, response: ServerResponse, proof?: stri
     if (name.startsWith('x-trading-platform-') || ['connection', 'keep-alive', 'transfer-encoding', 'upgrade', 'trailer'].includes(name)) delete headers[name];
   }
   if (proof) headers[PROBE_HEADER] = proof;
+  if (upstream.statusCode === 413) closeAfterResponse(response);
   response.writeHead(upstream.statusCode ?? 502, headers);
   response.flushHeaders();
   upstream.on('error', () => response.destroy());
@@ -59,6 +60,7 @@ function failure(response: ServerResponse, error: unknown): void {
   if (response.destroyed || response.writableEnded) return;
   if (response.headersSent) { response.destroy(); return; }
   if (error instanceof ContractError) {
+    if (error.status === 413) closeAfterResponse(response);
     sendJson(response, error.status, { code: error.code, message: error.message }, error.status === 413 ? { connection: 'close' } : {});
   } else {
     sendJson(response, 503, { code: 'control_unavailable', message: '控制面暂时无法提供服务' });
@@ -66,7 +68,7 @@ function failure(response: ServerResponse, error: unknown): void {
 }
 
 export function createControl(options: {
-  current: string; socketPath: string; host?: string | null; importDir?: string; updateFetch?: UpdateFetch; log?: (line: string) => void;
+  current: string; socketPath: string; host?: string | null; upstreamLimit?: number; importDir?: string; updateFetch?: UpdateFetch; log?: (line: string) => void;
 }) {
   const log = options.log ?? (line => process.stderr.write(`${line}\n`));
   const controlBuild = readComponentBuild(CODE_ROOT, 'control');
@@ -114,7 +116,8 @@ export function createControl(options: {
     sendJson(response, 200, request.headers.authorization !== undefined && route === 'update' ? readTokenUpdateView(view) : view);
   }
 
-  const server = createServer((request, response) => {
+  let upstreamCount = 0;
+  async function handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     if (!request.headers.host) { request.resume(); sendJson(response, 421, { code: 'host', message: '访问地址不在允许范围内' }); return; }
     const path = request.url ?? '/';
     if (!path.startsWith('/') || path.startsWith('//') || path.includes('\\')) {
@@ -136,7 +139,17 @@ export function createControl(options: {
       headers[LEGACY_UPDATE_HEADER] = '1';
       if (route === 'apply') headers['x-trading-platform-update-since'] = String(updates.status().job?.startedAt ?? 0);
     }
+    const login = request.method === 'POST' && pathname === '/login';
+    const form = login ? await readBody(request, MAX_LOGIN_BYTES) : null;
+    if (response.destroyed || request.socket.destroyed) return;
     const forwardedWrite = !route && request.method !== 'GET' && request.method !== 'HEAD';
+    if (upstreamCount >= (options.upstreamLimit ?? 192)) {
+      // This may be a retry of a committed command with a lost reply. Keep the browser's request ID.
+      if (forwardedWrite && !login) { response.destroy(); return; }
+      closeAfterResponse(response);
+      sendJson(response, 503, { code: 'control_busy', message: '控制面繁忙，请稍后重试' });
+      return;
+    }
     // One upstream request, even if a write loses its response. The caller resolves it using its original request ID.
     const backend = httpRequest({ socketPath: options.socketPath, path, method: request.method, agent: false, setHost: false, headers }, upstream => {
       if (!route) {
@@ -164,6 +177,8 @@ export function createControl(options: {
         else { upstream.resume(); failure(response, new Error('执行面协议不匹配')); }
       }
     });
+    upstreamCount++;
+    backend.once('close', () => { upstreamCount--; });
     backend.setTimeout(route ? 10_000 : 180_000, () => backend.destroy(new Error('执行面应答超时')));
     backend.on('error', () => {
       request.resume();
@@ -175,8 +190,10 @@ export function createControl(options: {
     request.on('error', () => backend.destroy());
     response.on('close', () => backend.destroy());
     if (route) backend.end(); // Authorize the original method and path. Its JSON body stays here.
+    else if (form !== null) backend.end(form);
     else request.pipe(backend);
-  });
+  }
+  const server = boundedHttpServer((request, response) => { void handle(request, response).catch(error => failure(response, error)); });
   async function readLegacyJob(upstream: IncomingMessage): Promise<UpdateView['job']> {
     const chunks: Buffer[] = [];
     let bytes = 0;

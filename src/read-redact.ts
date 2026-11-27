@@ -2,6 +2,7 @@
 // passes over every value: by value, any 0x hex string of 40 or more digits (an address, a transaction hash or a
 // signature) in any string or object key; by field name, the whole value of an identifier field whatever its format.
 // Each original becomes a stable alias (an HMAC of it under the token's key), so rows still match up across reads.
+import { redactClientAddresses, redactDiagnostic } from './redact-diagnostic.ts';
 import { createHmac } from 'node:crypto';
 
 export type AliasKind = 'acct' | 'addr' | 'tx';
@@ -75,7 +76,12 @@ export function createRedactor(key: Buffer, seen: (alias: string, original: stri
     const plain = typeof (value as { toJSON?: unknown }).toJSON === 'function' ? (value as { toJSON(): unknown }).toJSON() : value;
     if (plain !== value) return walk(plain);
     const out: Record<string, unknown> = {};
-    for (const [name, field] of Object.entries(value)) out[text(name)] = identifierField(name) ? whole(field, name) : walk(field);
+    for (const [name, field] of Object.entries(value)) {
+      // Only diagnostics contain transport details. Structured data such as a news link retains its API contract.
+      const diagnostic = typeof field === 'string' && /^(?:text|line|message|(?:last)?error|reason|detail|stack)$/i.test(name);
+      const cleaned = diagnostic ? redactClientAddresses(redactDiagnostic(field)) : field;
+      out[text(name)] = identifierField(name) ? whole(cleaned, name) : walk(cleaned);
+    }
     return out;
   };
   return walk;

@@ -41,11 +41,17 @@ export type Environment = 'simulated' | 'mainnet';
 
 type Json = Record<string, unknown>;
 export const isObject = (value: unknown): value is Json => value !== null && typeof value === 'object' && !Array.isArray(value);
+export function exactSecretKeys(value: unknown, required: readonly string[], optional: readonly string[] = []): Json {
+  return validateKeys(value, required, optional, false);
+}
 export function exactKeys(value: unknown, required: readonly string[], optional: readonly string[] = []): Json {
+  return validateKeys(value, required, optional, true);
+}
+function validateKeys(value: unknown, required: readonly string[], optional: readonly string[], echoField: boolean): Json {
   if (!isObject(value)) return reject('invalid_shape', '参数必须是对象');
   const allowed = new Set([...required, ...optional]);
   const extra = Object.keys(value).find(key => !allowed.has(key));
-  if (extra) reject('unknown_field', `不支持的字段：${extra.slice(0, 40)}`);
+  if (extra !== undefined) reject('unknown_field', echoField ? `不支持的字段：${extra.slice(0, 40)}` : '包含不支持的字段');
   const missing = required.find(key => !Object.hasOwn(value, key));
   if (missing) reject('missing_field', `缺少字段：${missing}`);
   return value;

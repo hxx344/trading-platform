@@ -4,7 +4,7 @@
 import { parseListenConfig } from './listen-config.ts';
 export { DEFAULT_PORT, parseListenHost, urlHost } from './listen-config.ts';
 import { isAbsolute } from 'node:path';
-import { ContractError, PAIR_ID, VENUES, exactKeys, integer, parseTransferConfig, reject, type TransferConfig } from '../contracts.ts';
+import { ContractError, PAIR_ID, VENUES, exactKeys, exactSecretKeys, integer, parseTransferConfig, reject, type TransferConfig } from '../contracts.ts';
 import { IP_CEILING, parseAsterCredentials, type AsterCredentials } from '../aster/client.ts';
 import { DEFAULT_ADL_BUDGETS } from '../adl.ts';
 import { parseAdlConfig, type AdlConfig } from '../adl-contracts.ts';
@@ -188,12 +188,12 @@ export function parseServiceConfig(raw: unknown): ServiceConfig {
 }
 
 export function parseServiceSecrets(raw: unknown, needed: readonly string[], oilVenues: readonly Venue[] = [], options = false, crossex = false, ondo = false): ServiceSecrets {
-  const value = exactKeys(raw, ['accounts'], ['feishu', 'feishuScheduled', 'feishuMonitor', 'watch', 'mev', ...(oilVenues.length ? VENUES : []), ...(options ? ['bybitOptions'] : []), ...(crossex ? ['gate'] : []), ...(ondo ? ['ondo'] : [])]);
+  const value = exactSecretKeys(raw, ['accounts'], ['feishu', 'feishuScheduled', 'feishuMonitor', 'watch', 'mev', ...(oilVenues.length ? VENUES : []), ...(options ? ['bybitOptions'] : []), ...(crossex ? ['gate'] : []), ...(ondo ? ['ondo'] : [])]);
   if (value.accounts === null || typeof value.accounts !== 'object' || Array.isArray(value.accounts)) throw new Error('accounts 须为 { 账户名: { user, signer, privateKey } }');
   const accounts = new Map<string, AsterCredentials>();
   for (const [name, item] of Object.entries(value.accounts as Record<string, unknown>)) {
     if (!ACCOUNT_NAME.test(name)) throw new Error('账户名须为字母、数字、_ 或 -');
-    accounts.set(name, parseAsterCredentials(item, `账户 ${name}`));
+    accounts.set(name, parseAsterCredentials(item, needed.includes(name) ? `账户 ${name}` : '密钥文件中的账户'));
   }
   for (const name of needed) if (!accounts.has(name)) throw new Error(`缺少账户 ${name} 的密钥`);
   const users = [...accounts.values()].map(item => item.user);
@@ -210,7 +210,7 @@ export function parseServiceSecrets(raw: unknown, needed: readonly string[], oil
 
 function parseFeishu(raw: unknown, name: string): FeishuSecret | null {
   if (raw === undefined || raw === null) return null;
-  const hook = exactKeys(raw, ['webhook'], ['secret']);
+  const hook = exactSecretKeys(raw, ['webhook'], ['secret']);
   if (typeof hook.webhook !== 'string' || !FEISHU_HOOK.test(hook.webhook)) throw new Error(`${name}.webhook 须为飞书或 Lark 自定义机器人的 https 地址`);
   if (hook.secret !== undefined && hook.secret !== null && (typeof hook.secret !== 'string' || !/^[\x21-\x7e]{1,128}$/.test(hook.secret))) throw new Error(`${name}.secret 格式无效`);
   return { webhook: hook.webhook, secret: typeof hook.secret === 'string' ? hook.secret : null };

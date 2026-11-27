@@ -4,6 +4,7 @@
 // alert, since a crash skips the stop alert and systemd's restart alone only says 【服务启动】.
 import { readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { redactDiagnostic } from './redact-diagnostic.ts';
 import { randomBytes } from 'node:crypto';
 
 export const CRASH_FILE = 'last-crash.json';
@@ -21,8 +22,8 @@ const KIND_TEXT: Record<CrashRecord['kind'], string> = { uncaughtException: '未
 
 export function describeCrash(reason: unknown, kind: CrashRecord['kind'], name: string, at: number): CrashRecord {
   const error = reason instanceof Error ? reason : null;
-  const message = (error ? `${error.name === 'Error' ? '' : `${error.name}: `}${error.message}` : String(reason)).slice(0, 300);
-  const stack = (error?.stack ?? '').split('\n').slice(1, 7).map(line => line.trim()).filter(Boolean).join('\n').slice(0, 1_200);
+  const message = redactDiagnostic(error ? `${error.name === 'Error' ? '' : `${error.name}: `}${error.message}` : String(reason)).slice(0, 300);
+  const stack = redactDiagnostic(error?.stack ?? '').split('\n').slice(1, 7).map(line => line.trim()).filter(Boolean).join('\n').slice(0, 1_200);
   return { at, process: name, kind, message, stack };
 }
 
@@ -74,7 +75,7 @@ export function readCrashRecord(dir: string): CrashRecord | null {
     const value = JSON.parse(text) as Partial<CrashRecord>;
     if (typeof value.at !== 'number' || typeof value.process !== 'string' || typeof value.message !== 'string'
       || (value.kind !== 'uncaughtException' && value.kind !== 'unhandledRejection')) return unreadable();
-    return { at: value.at, process: value.process.slice(0, 40), kind: value.kind, message: value.message.slice(0, 300), stack: typeof value.stack === 'string' ? value.stack.slice(0, 1_200) : '' };
+    return { at: value.at, process: value.process.slice(0, 40), kind: value.kind, message: redactDiagnostic(value.message).slice(0, 300), stack: typeof value.stack === 'string' ? redactDiagnostic(value.stack).slice(0, 1_200) : '' };
   } catch { return unreadable(); }
 }
 

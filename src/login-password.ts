@@ -57,6 +57,21 @@ export function loadPasswordHash(path: string, read = readPrivateFile): Password
   return parsePasswordHash(text);
 }
 
+// Kernel-reported IPv4-mapped addresses share the IPv4 bucket. Other IPv6 clients share a /64.
+export function throttleAddress(address: string): string {
+  if (!address.includes(':')) return address;
+  const host = new URL(`http://[${address.split('%')[0]}]/`).hostname.slice(1, -1);
+  const mapped = /^::ffff:([a-f0-9]+):([a-f0-9]+)$/.exec(host);
+  if (mapped) {
+    const high = parseInt(mapped[1]!, 16), low = parseInt(mapped[2]!, 16);
+    return [high >> 8, high & 255, low >> 8, low & 255].join('.');
+  }
+  const [left, right] = host.split('::');
+  const prefix = left ? left.split(':') : [], suffix = right ? right.split(':') : [];
+  const parts = [...prefix, ...Array(8 - prefix.length - suffix.length).fill('0'), ...suffix];
+  return parts.slice(0, 4).join(':') + '::/64';
+}
+
 /** Consecutive wrong passwords allowed before the first lockout. */
 export const FREE_FAILURES = 5;
 const FIRST_LOCK_MS = 30_000;
@@ -68,8 +83,7 @@ export interface ThrottleLimits { freeFailures: number; firstLockMs: number; max
 /** One client address: five tries, then 30 s doubling up to 15 min. */
 export const ADDRESS_LOGIN_LIMITS: ThrottleLimits = { freeFailures: FREE_FAILURES, firstLockMs: FIRST_LOCK_MS, maxLockMs: MAX_LOCK_MS };
 /**
- * Every address together: only a guesser spread over many addresses gets here, and it is slowed, never locked out for
- * long, so the owner's own address is at worst kept waiting a minute.
+ * Combined failure count; password backoff applies only to sources that previously failed.
  */
 export const GLOBAL_LOGIN_LIMITS: ThrottleLimits = { freeFailures: 50, firstLockMs: 5_000, maxLockMs: 60_000 };
 
@@ -87,6 +101,7 @@ export class LoginThrottle {
   constructor(now: () => number = Date.now, limits: ThrottleLimits = ADDRESS_LOGIN_LIMITS) { this.now = now; this.limits = limits; }
   /** Milliseconds until the next attempt is accepted; 0 when it is now. */
   waitMs(): number { return Math.max(0, this.lockedUntil - this.now()); }
+  hasFailures(): boolean { return this.failures > 0 && this.now() - this.lastFailure <= FAILURE_MEMORY_MS; }
   failed(): void {
     if (this.now() - this.lastFailure > FAILURE_MEMORY_MS) this.failures = 0;
     this.lastFailure = this.now();

@@ -22,10 +22,12 @@ ExecStart=@NODE@ @APP_DIR@/executor/src/service/main.ts --config @CONF_DIR@/conf
 Restart=always
 RestartSec=5
 TimeoutStopSec=30
+LimitNOFILE=65536
 UMask=0077
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
+ProtectProc=invisible
 # The import hand-off directory is optional ("-"): the service runs without it, the page then offers no import.
 ReadWritePaths=@DATA_DIR@ -@IMPORT_DIR@
 PrivateTmp=yes

@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Writable } from 'node:stream';
+import { DatabaseSync } from 'node:sqlite';
 import { LOG_RETENTION_MS, createServiceLog, logLevel, teeStream } from '../src/service/service-log.ts';
 
 const withLog = (run: (log: ReturnType<typeof createServiceLog>, clock: { at: number }) => void) => {
@@ -34,12 +35,41 @@ test('页面日志：每分钟最多 1200 行，超出的下一分钟记一行�
   assert.equal(log.page({ limit: 1 }).items[0]!.text, '第 1199 行');
   clock.at += 60_000;
   log.append('下一分钟');
-  assert.deepEqual(log.page({ limit: 2 }).items.map(row => row.text), ['下一分钟', '日志过多：上一分钟有 5 行未写入页面日志（服务日志 journalctl 里完整）']);
+  assert.deepEqual(log.page({ limit: 2 }).items.map(row => row.text), ['下一分钟', '日志过多：有 5 行未写入页面日志（服务日志 journalctl 里完整）']);
   clock.at += LOG_RETENTION_MS + 60_000;
   log.append('两周后');
   log.prune();
   assert.deepEqual(log.page({}).items.map(row => row.text), ['两周后']);
 }));
+
+test('普通日志跨分钟填满缓冲区后仍写入问题和交易告警', () => withLog((log, clock) => {
+  for (let round = 0; round < 2; round++) {
+    for (let i = 0; i < 1300; i++) log.append('普通记录');
+    clock.at += 60_000;
+  }
+  log.append('行情连接断开');
+  log.append('告警：订单需要核对');
+  assert.deepEqual(log.page({ filter: 'problems' }).items.map(row => row.level), ['alert', 'problem']);
+  clock.at += 60_000;
+  log.append('恢复');
+  assert.match(log.page({limit: 2}).items[1].text, /有 1061 行未写入/);
+}));
+
+test('批量写入失败时仍可读历史，恢复后只补写一次', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tp-log-retry-')), file = join(dir, 'log.sqlite');
+  const log = createServiceLog({ file }), admin = new DatabaseSync(file);
+  try {
+    log.append('旧记录');
+    assert.equal(log.page({}).items.length, 1);
+    admin.exec("CREATE TRIGGER hold BEFORE INSERT ON lines BEGIN SELECT RAISE(ABORT, 'temporary'); END");
+    log.append('新记录');
+    const pending = log.page({});
+    assert.equal(pending.pendingWrites, 1);
+    assert.deepEqual(pending.items.map(row => row.text), ['旧记录']);
+    admin.exec('DROP TRIGGER hold');
+    assert.deepEqual(log.page({}).items.map(row => row.text), ['新记录', '旧记录']);
+  } finally { admin.close(); log.close(); rmSync(dir, {recursive: true, force: true}); }
+});
 
 test('页面日志：复制写入的流，原输出不变，撤销后不再复制', () => withLog(log => {
   const seen: string[] = [];

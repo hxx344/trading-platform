@@ -1,13 +1,15 @@
 // The service's own log lines, kept for the page's 日志 tab. Everything the service writes to stdout and stderr (which
 // systemd puts in the journal) is copied here line by line, so the page shows the same text as `journalctl -u trading-platform`
 // without a shell on the server. The journal stays the complete record: this copy keeps 14 days and at most 50000
-// lines, and drops lines past 1200 a minute (noted once the minute is over).
+// lines. Alerts, problems and ordinary messages have separate ingestion and retention budgets.
 import { DatabaseSync } from 'node:sqlite';
 
 export const LOG_RETENTION_MS = 14 * 86_400_000;
-const MAX_ROWS = 50_000;
+const ROW_LIMIT = { info: 40_000, problem: 8_000, alert: 2_000 } as const;
+const MINUTE_LIMIT = { info: 1200, problem: 240, alert: 120 } as const;
+const BUFFER_LIMIT = { info: 1440, problem: 416, alert: 192 } as const;
+const FLUSH_MS = 250;
 const MAX_LINE = 2_000;
-const MAX_PER_MINUTE = 1_200;
 const MAX_PARTIAL = 8_192;
 const PAGE_MAX = 200;
 const PRUNE_EVERY_MS = 10 * 60_000;
@@ -26,32 +28,63 @@ export function createServiceLog({ file, now = Date.now }: { file: string; now?:
   const db = new DatabaseSync(file);
   db.exec(`PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 2000;
     CREATE TABLE IF NOT EXISTS lines (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, level TEXT NOT NULL, text TEXT NOT NULL);
+    PRAGMA journal_size_limit=4194304;
+    CREATE INDEX IF NOT EXISTS lines_at ON lines (at);
     CREATE INDEX IF NOT EXISTS lines_level ON lines (level, id);`);
   const insert = db.prepare('INSERT INTO lines (at, level, text) VALUES (?, ?, ?)');
-  let minute = Math.floor(now() / 60_000), written = 0, dropped = 0, prunedAt = 0;
+  let minute = Math.floor(now() / 60_000), dropped = 0, prunedAt = -Infinity;
+  const written = { info: 0, problem: 0, alert: 0 };
+  const buffered = { info: 0, problem: 0, alert: 0 };
+  const pending: { text: string; at: number; level: LogLevel }[] = [];
+  const expired = db.prepare('DELETE FROM lines WHERE at < ?');
+  const excess = db.prepare('DELETE FROM lines WHERE level = ? AND id <= (SELECT id FROM lines WHERE level = ? ORDER BY id DESC LIMIT 1 OFFSET ?)');
+  let timer: NodeJS.Timeout | undefined;
+
+  function flush(forcePrune = false): void {
+    if (timer) clearTimeout(timer);
+    timer = undefined;
+    if (!pending.length && !forcePrune) return;
+    const at = now(), prune = forcePrune || at < prunedAt || at - prunedAt >= PRUNE_EVERY_MS;
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const row of pending) insert.run(row.at, row.level, row.text);
+      if (prune) {
+        expired.run(at - LOG_RETENTION_MS);
+        for (const level of ['info', 'problem', 'alert'] as const) excess.run(level, level, ROW_LIMIT[level]);
+      }
+      db.exec('COMMIT');
+      pending.length = 0;
+      buffered.info = buffered.problem = buffered.alert = 0;
+      if (prune) prunedAt = at;
+    } catch (error) { if (db.isTransaction) db.exec('ROLLBACK'); throw error; }
+  }
+  const onExit = () => { try { flush(); } catch { /* journalctl retains the original lines */ } };
+  process.once('exit', onExit);
   // Unfinished lines, one per source, so a half line on stdout never joins a line on stderr.
   const partials = new Map<string, string>();
 
-  const write = (text: string, at: number) => { insert.run(at, logLevel(text), text); };
+  function write(text: string, at: number, level: LogLevel = 'info') {
+    if (buffered[level] < BUFFER_LIMIT[level]) { pending.push({ text, at, level }); buffered[level]++; }
+    else dropped++;
+    timer ??= setTimeout(onExit, FLUSH_MS).unref();
+  }
   function append(raw: string): void {
     const at = now();
     const current = Math.floor(at / 60_000);
     if (current !== minute) {
-      if (dropped) write(`日志过多：上一分钟有 ${dropped} 行未写入页面日志（服务日志 journalctl 里完整）`, at);
-      minute = current; written = 0; dropped = 0;
+      if (dropped && buffered.info < BUFFER_LIMIT.info) {
+        write(`日志过多：有 ${dropped} 行未写入页面日志（服务日志 journalctl 里完整）`, at);
+        dropped = 0;
+      }
+      minute = current; written.info = written.problem = written.alert = 0;
     }
     // Control characters (escape sequences included) are not shown; tabs become spaces.
     const text = raw.replace(/[\x00-\x1f\x7f]+/g, ' ').trimEnd().slice(0, MAX_LINE);
     if (!text.trim()) return;
-    if (written >= MAX_PER_MINUTE) { dropped += 1; return; }
-    written += 1;
-    write(text, at);
-    if (at - prunedAt >= PRUNE_EVERY_MS) prune();
-  }
-  function prune(): void {
-    prunedAt = now();
-    db.prepare('DELETE FROM lines WHERE at < ?').run(prunedAt - LOG_RETENTION_MS);
-    db.prepare('DELETE FROM lines WHERE id <= (SELECT MAX(id) FROM lines) - ?').run(MAX_ROWS);
+    const level = logLevel(text);
+    if (written[level] >= MINUTE_LIMIT[level]) { dropped += 1; return; }
+    written[level]++;
+    write(text, at, level);
   }
 
   return {
@@ -65,16 +98,21 @@ export function createServiceLog({ file, now = Date.now }: { file: string; now?:
       for (const line of lines) append(line);
     },
     /** Newest first; `before` is the id the previous page ended with. */
-    page({ filter = 'all', before = null, limit = 100 }: { filter?: LogFilter; before?: number | null; limit?: number }): { items: LogRow[]; next: string | null } {
+    page({ filter = 'all', before = null, limit = 100 }: { filter?: LogFilter; before?: number | null; limit?: number }): { items: LogRow[]; next: string | null; pendingWrites?: number } {
+      try { flush(); } catch { /* Reads stay available while the journal copy cannot write. */ }
       const size = Math.max(1, Math.min(PAGE_MAX, Math.floor(limit)));
       const where = [...(before === null ? [] : ['id < ?']), ...(filter === 'problems' ? ["level IN ('alert', 'problem')"] : [])];
       const rows = db.prepare(`SELECT id, at, level, text FROM lines ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY id DESC LIMIT ?`)
         .all(...(before === null ? [] : [before]), size + 1) as { id: number; at: number; level: LogLevel; text: string }[];
       const items = rows.slice(0, size).map(row => ({ id: String(row.id), at: row.at, level: row.level, text: row.text }));
-      return { items, next: rows.length > size ? items.at(-1)!.id : null };
+      return { items, next: rows.length > size ? items.at(-1)!.id : null, ...(pending.length ? { pendingWrites: pending.length } : {}) };
     },
-    prune,
-    close(): void { for (const rest of partials.values()) append(rest); partials.clear(); db.close(); },
+    prune: () => flush(true),
+    close(): void {
+      process.off('exit', onExit);
+      try { for (const rest of partials.values()) append(rest); partials.clear(); flush(); }
+      finally { db.close(); }
+    },
   };
 }
 export type ServiceLog = ReturnType<typeof createServiceLog>;

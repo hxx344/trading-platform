@@ -23,6 +23,22 @@ function fixture(t: TestContext) {
   return { file, state, sent, open };
 }
 
+test('升级前积压的诊断在历史列表和重试投递前脱敏', async t => {
+  const { file, open, state, sent } = fixture(t);
+  open().close();
+  const db = new DatabaseSync(file);
+  db.prepare('INSERT INTO outbox(created_at,text,next_at) VALUES (?,?,?)')
+    .run(state.at, '【交易服务异常退出】代理 https://example.invalid/private-path，vr-token=sample-secret', state.at);
+  db.close();
+  const notifier = open();
+  try {
+    const safe = '【交易服务异常退出】代理 [URL]，vr-token=[隐藏]';
+    assert.equal(notifier.status().recent[0].text, safe);
+    await notifier.flush();
+    assert.deepEqual(sent, [safe]);
+  } finally { notifier.close(); }
+});
+
 test('升级旧飞书库会清理未发送的旧机会，已投递历史和同批其他模块照常保留', async t => {
   const { file, open, state, sent } = fixture(t);
   const db = new DatabaseSync(file);

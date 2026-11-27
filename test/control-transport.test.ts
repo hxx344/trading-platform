@@ -18,13 +18,13 @@ import { RequestIds } from '../web/src/request-ids.ts';
 
 // Real public control listener, private HTTP socket and browser client. The private peer supplies faults the live
 // executor cannot be asked to generate (committing a command and losing the connection before its first header).
-async function listener(t: TestContext, upstream: RequestListener) {
+async function listener(t: TestContext, upstream: RequestListener, upstreamLimit?: number) {
   const dir = mkdtempSync(join(tmpdir(), 'tp-transport-'));
   mkdirSync(join(dir, 'web', 'dist'), { recursive: true });
   writeFileSync(join(dir, 'web', 'dist', 'index.html'), '<title>控制面</title>');
   writeFileSync(join(dir, 'VERSION'), 'v0.64.0 0123456789ab\n');
   const socketPath = process.platform === 'win32' ? `\\\\.\\pipe\\tp-transport-${randomUUID()}` : join(dir, 'execution.sock');
-  const engine = createServer(upstream), control = createControl({ current: dir, socketPath });
+  const engine = createServer(upstream), control = createControl({ current: dir, socketPath, upstreamLimit });
   t.after(async () => {
     control.close();
     engine.closeAllConnections();
@@ -35,6 +35,16 @@ async function listener(t: TestContext, upstream: RequestListener) {
   const port = (control.server.address() as AddressInfo).port;
   return { dir, port, base: `http://127.0.0.1:${port}`, server: control.server };
 }
+
+test('控制面没有上游容量时，查询可重试且交易写入保留原请求号', async t => {
+  const { base } = await listener(t, () => assert.fail('容量不足时不能转发'), 0);
+  assert.equal((await fetch(base + '/api/state')).status, 503);
+  const ids = new RequestIds(), key = '/api/jobs/start', input = 'same';
+  const before = ids.idFor(key, input);
+  await assert.rejects(ids.run(key, input, requestId => api(base + key, {body: {requestId}})),
+    error => error instanceof Error && !('status' in error));
+  assert.equal(ids.idFor(key, input), before);
+});
 
 test('定长写入的最后一段正文先到时，执行器等控制面结束请求后只处理一次', { timeout: 10_000 }, async t => {
   const body = JSON.stringify({ requestId: randomUUID() });
@@ -74,6 +84,22 @@ test('定长写入的最后一段正文先到时，执行器等控制面结束�
   assert.equal(response.status, 200);
   assert.deepEqual(await response.json(), JSON.parse(body));
   assert.equal(commands, 1);
+});
+
+test('控制面按登录表单上限收齐正文，超限表单不会交给执行面', async t => {
+  const received: string[] = [];
+  const { base, server } = await listener(t, async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(chunk);
+    received.push(Buffer.concat(chunks).toString());
+    response.writeHead(204).end();
+  });
+  assert.equal(server.headersTimeout, 10_000);
+  assert.equal(server.requestTimeout, 30_000);
+  const form = (body: string) => fetch(base + '/login', { method: 'POST', body });
+  assert.equal((await form('password=demo')).status, 204);
+  assert.equal((await form('a'.repeat(4_097))).status, 413);
+  assert.deepEqual(received, ['password=demo']);
 });
 
 test('转发保留空正文和分块 JSON，执行器仍能明确拒绝非法或超限正文', async t => {

@@ -3,7 +3,7 @@
 // so it needs no route into this server. The wire format is main-watch's (deploy/main-watch/main_watch.py): the body
 // {sent_at, ready, detail} and its HMAC-SHA256 under the shared token; the token itself is never sent.
 import { createHmac } from 'node:crypto';
-import { exactKeys } from '../contracts.ts';
+import { exactKeys, exactSecretKeys } from '../contracts.ts';
 import { anySignal } from '../any-signal.mjs';
 
 export const WATCH_INTERVAL_MS = 30_000;
@@ -31,7 +31,7 @@ export function parseWatchConfig(raw: unknown): WatchConfig {
 
 /** secrets.json `watch`: { token } — the same value as the receiver's HEARTBEAT_TOKEN. Messages never quote it. */
 export function parseWatchSecret(raw: unknown): WatchSecret {
-  const value = exactKeys(raw, ['token']);
+  const value = exactSecretKeys(raw, ['token']);
   if (typeof value.token !== 'string' || !TOKEN.test(value.token)) throw new Error('watch.token 须为 32~256 位字母、数字、- 或 _（与副服务器的 HEARTBEAT_TOKEN 相同）');
   return { token: value.token };
 }

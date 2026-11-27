@@ -10,7 +10,7 @@ import type { KeyVenue } from '../dex/keys.ts';
 import type { AccountSnapshot } from './accounts.ts';
 import type { LiveKeys, LiveKeysStore } from './livekeys.ts';
 import { VENUE_NAMES, type LegInfo, type MarketSpec, type PairInfo, type Sample } from './model.ts';
-import { ORDER_EXPIRY_MS, type OrderOutcome, type ResolveOutcome, type VenueOrder, type VenueTrader } from './orders.ts';
+import { ORDER_EXPIRY_MS, cloidOf, type OrderOutcome, type ResolveOutcome, type VenueOrder, type VenueTrader } from './orders.ts';
 import { floorTo, limitPrice, orderPlan } from './plan.ts';
 import type { Direction } from './strategy.ts';
 
@@ -62,6 +62,10 @@ export interface LiveDeps {
   /** 现读一次账户（核对结果未知的单时用）。 */ readAccount(venue: KeyVenue, signal: AbortSignal): Promise<AccountSnapshot>;
   /** 模拟盘里这笔持仓是否还在。 */ hasPaper(key: string, paperId: string): boolean;
   signalFor(): AbortSignal;
+  /** 记录发出 Entropy 实盘单的关联信息（写盘失败只记日志，不阻止发单）。 */
+  onOrderSent?: (info: { venue: KeyVenue; cloid: string; positionId: string; purpose: PendingOrder['purpose']; leg: LegInfo; assumedFeeBps: number; at: number }) => void;
+  /** Entropy 实盘成交后触发一次延迟成本同步。 */
+  onEntropyFill?: () => void;
 }
 export class LiveError extends Error { readonly code: string; readonly status: number; constructor(code: string, message: string, status = 400) { super(message); this.code = code; this.status = status; } }
 
@@ -222,6 +226,9 @@ export function createLiveTrader(deps: LiveDeps) {
       if (pending.purpose === 'open' || pending.purpose === 'hedge') { leg.qty += filled; leg.entryQuote += filled * price; }
       else { leg.exitQty += filled; leg.exitQuote += filled * price; }
       leg.feesUsd += filled * price * deps.takerFeeBps(info) / 10_000;
+      if (leg.venue === 'entropy') {
+        try { deps.onEntropyFill?.(); } catch (error) { log(`varlighter: 实盘触发 Entropy 成本同步失败：${message(error)}`); }
+      }
     }
     position.pending = null;
     lastOperationAt = now();
@@ -244,6 +251,13 @@ export function createLiveTrader(deps: LiveDeps) {
     const before = position.pending;
     position.pending = pending;
     try { save(position); } catch (error) { position.pending = before; throw new NotSentError(`保存下单意图失败：${message(error)}`); }
+    if (venue === 'entropy' && deps.onOrderSent) {
+      try {
+        deps.onOrderSent({ venue, cloid: cloidOf(pending.clientId), positionId: position.id, purpose: pending.purpose, leg: info, assumedFeeBps: deps.takerFeeBps(info), at: pending.sentAt });
+      } catch (error) {
+        log(`varlighter: 实盘保存 Entropy 订单关联失败：${message(error)}`);
+      }
+    }
     const outcome = sane(await deps.trader(venue, keys).place(orderOf(pending, info), deps.signalFor), pending, info);
     if (outcome.kind === 'unknown') { log(`varlighter: 实盘 ${position.symbol} ${VENUE_NAMES[venue]} 的单结果未知：${outcome.reason}`); position.retryAt = now() + 2_000; return false; }
     apply(position, pending, outcome, info);

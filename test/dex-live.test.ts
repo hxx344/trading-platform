@@ -1432,3 +1432,41 @@ test('单已成交、记成交的那次落库失败：不能当成没发出，�
     h.check();
   }
 });
+
+test('Entropy 发单关联与成交钩子：发单前记录 cloid 与假设费率，成交触发补采，钩子异常不阻断下单', async t => {
+  const h = harness(t), s = h.s;
+  const links: { cloid: string; positionId: string; purpose: string; assumedFeeBps: number }[] = [];
+  let fillHooks = 0;
+  const live = createLiveTrader({
+    store: h.store, stopped: () => s.stopped, now: () => s.clock, log: line => s.logs.push(line),
+    keys: { read: () => ({ keys: s.keys, problem: null }), view: () => ({ lighter: true, rh: true, entropy: true }), accounts: () => ({}), set() {}, remove() {} },
+    trader: (venue) => ({
+      async place(order) {
+        s.sent.push({ venue, symbol: venue === 'entropy' ? order.market.coin! : order.market.symbol, side: order.side, qty: order.qty, limit: order.limit, reduceOnly: order.reduceOnly, clientId: order.clientId, at: s.clock });
+        const key = `${venue}:${venue === 'entropy' ? order.market.coin! : order.market.symbol}`;
+        s.book.set(key, (s.book.get(key) ?? 0) + (order.side === 'buy' ? 1 : -1) * order.qty);
+        return done(order.qty, order.limit);
+      },
+      async resolve() { return absent(); },
+    }),
+    venueProblem: () => null, pairOf: key => s.pairs.get(key),
+    quote: info => s.quotes.get(bookKey(info.venue, info.symbol)) ?? null,
+    takerFeeBps: info => info.venue === 'entropy' ? 0.2 : 0,
+    account: venue => ({ at: s.clock, snapshot: { collateral: 1000, available: 1000, positions: [...s.book].filter(([k]) => k.startsWith(`${venue}:`)).map(([k, size]) => ({ symbol: k.slice(venue.length + 1), size, valueUsd: Math.abs(size) * 100 })) } }),
+    readAccount: async venue => ({ collateral: 1000, available: 1000, positions: [] }),
+    hasPaper: (key, id) => s.papers.has(`${key}#${id}`),
+    signalFor: () => new AbortController().signal,
+    onOrderSent: info => { links.push({ cloid: info.cloid, positionId: info.positionId, purpose: info.purpose, assumedFeeBps: info.assumedFeeBps }); throw new Error('link write failed'); },
+    onEntropyFill: () => { fillHooks++; throw new Error('sync schedule failed'); },
+  });
+  h.enable(live, [NVDA]);
+  await h.open(live, NVDA);
+  assert.deepEqual(links.map(l => [l.purpose, l.assumedFeeBps]), [['open' === links[0]?.purpose ? 'open' : 'hedge', 0.2]]);
+  assert.match(links[0]!.cloid, /^0x[0-9a-f]{32}$/);
+  assert.equal(fillHooks, 1, 'Entropy 成交触发补采钩子');
+  assert.equal(h.position(live, NVDA).state, 'open', '钩子抛出异常绝不阻断实盘开仓');
+  await h.closePaper(live, NVDA, 'revert');
+  assert.deepEqual(links.map(l => l.purpose), ['hedge', 'close']);
+  assert.equal(fillHooks, 2);
+  h.check();
+});

@@ -75,6 +75,24 @@ export interface AccountSnapshotRow {
   positions: number;
 }
 export const ACCOUNT_SNAPSHOT_RETENTION_DAYS = 30;
+export interface StoredEntropyFill {
+  accountHash: string; tid: number; oid: number; cloid: string | null; time: number; coin: string; side: 'B' | 'A'; dir: string | null;
+  crossed: boolean; px: number; sz: number; notionalUsd: number; feeUsd: number; feeToken: string; builderFeeUsd: number; closedPnl: number | null;
+  livePositionId: string | null; livePurpose: string | null;
+  assumedFeeBps: number | null; catalogFeeBps: number | null; deployerFeeScale: number | null; growthMode: string | null;
+  hlCrossRate: number | null; hlReferralDiscount: number | null; hlStakingDiscount: number | null; hypePriceUsd: number | null;
+  recordedAt: number;
+}
+export interface StoredEntropyFeeSnapshot {
+  id?: number; accountHash: string; at: number;
+  userCrossRate: number | null; userAddRate: number | null; referralDiscount: number | null; stakingDiscount: number | null;
+  hypePriceUsd: number | null; assumedFeeBps: number | null;
+}
+export interface StoredEntropyOrderLink {
+  cloid: string; accountHash: string; positionId: string; purpose: string; coin: string;
+  assumedFeeBps: number | null; catalogFeeBps: number | null; deployerFeeScale: number | null; growthMode: string | null;
+  at: number;
+}
 export type VarLighterStore = ReturnType<typeof openVarLighterStore>;
 /** 迁移用的转换：旧参数换成新参数（引擎提供），旧持仓的手续费取旧参数里的 Var 与 Lighter 手续费。 */
 export interface LegacyUpgrade { settings: (old: unknown) => unknown; cooldown: (old: unknown) => unknown; fees: (old: unknown) => LegFees }
@@ -140,6 +158,19 @@ export function openVarLighterStore(file: string) {
       PRIMARY KEY (venue, account_hash, at)
     );
     CREATE INDEX IF NOT EXISTS account_snapshots_at ON account_snapshots(at);
+    CREATE TABLE IF NOT EXISTS entropy_fills (account_hash TEXT NOT NULL, tid INTEGER NOT NULL, oid INTEGER NOT NULL, cloid TEXT, time INTEGER NOT NULL,
+      coin TEXT NOT NULL, side TEXT NOT NULL, dir TEXT, crossed INTEGER NOT NULL, px REAL NOT NULL, sz REAL NOT NULL, notional_usd REAL NOT NULL,
+      fee_usd REAL NOT NULL, fee_token TEXT NOT NULL, builder_fee_usd REAL NOT NULL, closed_pnl REAL, live_position_id TEXT, live_purpose TEXT,
+      assumed_fee_bps REAL, catalog_fee_bps REAL, deployer_fee_scale REAL, growth_mode TEXT,
+      hl_cross_rate REAL, hl_referral_discount REAL, hl_staking_discount REAL, hype_price_usd REAL, recorded_at INTEGER NOT NULL,
+      PRIMARY KEY (account_hash, tid)) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS entropy_fills_account_time ON entropy_fills(account_hash, time);
+    CREATE TABLE IF NOT EXISTS entropy_fee_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, account_hash TEXT NOT NULL, at INTEGER NOT NULL,
+      user_cross_rate REAL, user_add_rate REAL, referral_discount REAL, staking_discount REAL, hype_price_usd REAL, assumed_fee_bps REAL);
+    CREATE INDEX IF NOT EXISTS entropy_fee_snapshots_account_at ON entropy_fee_snapshots(account_hash, at);
+    CREATE TABLE IF NOT EXISTS entropy_order_links (cloid TEXT PRIMARY KEY, account_hash TEXT NOT NULL, position_id TEXT NOT NULL, purpose TEXT NOT NULL,
+      coin TEXT NOT NULL, assumed_fee_bps REAL, catalog_fee_bps REAL, deployer_fee_scale REAL, growth_mode TEXT, at INTEGER NOT NULL);
+    CREATE INDEX IF NOT EXISTS entropy_order_links_at ON entropy_order_links(at);
     CREATE INDEX IF NOT EXISTS events_at ON events(at);`);
     // v0.81.0、v0.82.0 给旧表加的可空列；新版本不再写旧表，但旧库可能还没有这些列（读旧样本时按列名读）。
     db.exec('BEGIN IMMEDIATE');
@@ -196,6 +227,54 @@ export function openVarLighterStore(file: string) {
   const pruneSnapshots = db.prepare('DELETE FROM account_snapshots WHERE at < ?');
   const readState = db.prepare('SELECT json FROM state WHERE key = ?');
   const writeState = db.prepare('INSERT INTO state(key, json, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET json = excluded.json, updated_at = excluded.updated_at');
+  const upsertEntropyLink = db.prepare('INSERT INTO entropy_order_links(cloid, account_hash, position_id, purpose, coin, assumed_fee_bps, catalog_fee_bps, deployer_fee_scale, growth_mode, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(cloid) DO UPDATE SET account_hash = excluded.account_hash, position_id = excluded.position_id, purpose = excluded.purpose, coin = excluded.coin, assumed_fee_bps = excluded.assumed_fee_bps, catalog_fee_bps = excluded.catalog_fee_bps, deployer_fee_scale = excluded.deployer_fee_scale, growth_mode = excluded.growth_mode, at = excluded.at');
+  const selectEntropyLink = db.prepare('SELECT cloid, account_hash, position_id, purpose, coin, assumed_fee_bps, catalog_fee_bps, deployer_fee_scale, growth_mode, at FROM entropy_order_links WHERE cloid = ?');
+  const pruneEntropyLinks = db.prepare('DELETE FROM entropy_order_links WHERE at < ?');
+  const insertEntropyFill = db.prepare(`INSERT OR IGNORE INTO entropy_fills(
+    account_hash, tid, oid, cloid, time, coin, side, dir, crossed, px, sz, notional_usd, fee_usd, fee_token, builder_fee_usd, closed_pnl,
+    live_position_id, live_purpose, assumed_fee_bps, catalog_fee_bps, deployer_fee_scale, growth_mode,
+    hl_cross_rate, hl_referral_discount, hl_staking_discount, hype_price_usd, recorded_at
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+  const backfillEntropyFillHype = db.prepare('UPDATE entropy_fills SET hype_price_usd = ? WHERE account_hash = ? AND tid = ? AND hype_price_usd IS NULL');
+  const selectEntropyFills = db.prepare(`SELECT account_hash, tid, oid, cloid, time, coin, side, dir, crossed, px, sz, notional_usd, fee_usd, fee_token, builder_fee_usd, closed_pnl,
+    live_position_id, live_purpose, assumed_fee_bps, catalog_fee_bps, deployer_fee_scale, growth_mode,
+    hl_cross_rate, hl_referral_discount, hl_staking_discount, hype_price_usd, recorded_at
+    FROM entropy_fills WHERE account_hash = ? AND time >= ? AND time <= ? ORDER BY time DESC, tid DESC LIMIT ?`);
+  const selectEntropyFillsAll = db.prepare(`SELECT account_hash, tid, oid, cloid, time, coin, side, dir, crossed, px, sz, notional_usd, fee_usd, fee_token, builder_fee_usd, closed_pnl,
+    live_position_id, live_purpose, assumed_fee_bps, catalog_fee_bps, deployer_fee_scale, growth_mode,
+    hl_cross_rate, hl_referral_discount, hl_staking_discount, hype_price_usd, recorded_at
+    FROM entropy_fills WHERE account_hash = ? AND time >= ? AND time <= ? ORDER BY time DESC, tid DESC`);
+  const insertEntropySnapshot = db.prepare('INSERT INTO entropy_fee_snapshots(account_hash, at, user_cross_rate, user_add_rate, referral_discount, staking_discount, hype_price_usd, assumed_fee_bps) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+  const selectLatestEntropySnapshot = db.prepare('SELECT id, account_hash, at, user_cross_rate, user_add_rate, referral_discount, staking_discount, hype_price_usd, assumed_fee_bps FROM entropy_fee_snapshots WHERE account_hash = ? ORDER BY id DESC LIMIT 1');
+  const mapEntropyFill = (row: Record<string, unknown>): StoredEntropyFill => ({
+    accountHash: row.account_hash as string,
+    tid: row.tid as number,
+    oid: row.oid as number,
+    cloid: (row.cloid as string | null) ?? null,
+    time: row.time as number,
+    coin: row.coin as string,
+    side: row.side as 'B' | 'A',
+    dir: (row.dir as string | null) ?? null,
+    crossed: row.crossed === 1,
+    px: row.px as number,
+    sz: row.sz as number,
+    notionalUsd: row.notional_usd as number,
+    feeUsd: row.fee_usd as number,
+    feeToken: row.fee_token as string,
+    builderFeeUsd: row.builder_fee_usd as number,
+    closedPnl: nullable(row.closed_pnl),
+    livePositionId: (row.live_position_id as string | null) ?? null,
+    livePurpose: (row.live_purpose as string | null) ?? null,
+    assumedFeeBps: nullable(row.assumed_fee_bps),
+    catalogFeeBps: nullable(row.catalog_fee_bps),
+    deployerFeeScale: nullable(row.deployer_fee_scale),
+    growthMode: (row.growth_mode as string | null) ?? null,
+    hlCrossRate: nullable(row.hl_cross_rate),
+    hlReferralDiscount: nullable(row.hl_referral_discount),
+    hlStakingDiscount: nullable(row.hl_staking_discount),
+    hypePriceUsd: nullable(row.hype_price_usd),
+    recordedAt: row.recorded_at as number,
+  });
   const transaction = <T>(work: () => T): T => {
     db.exec('BEGIN IMMEDIATE');
     try { const result = work(); db.exec('COMMIT'); return result; } catch (error) { if (db.isTransaction) db.exec('ROLLBACK'); throw error; }
@@ -304,6 +383,59 @@ export function openVarLighterStore(file: string) {
     },
     state<T>(key: string): T | null { const row = readState.get(key) as { json: string } | undefined; return row ? JSON.parse(row.json) as T : null; },
     setState(key: string, value: unknown, at: number): void { writeState.run(key, JSON.stringify(value), at); },
+    saveEntropyOrderLink(link: StoredEntropyOrderLink): void {
+      const cloid = link.cloid.startsWith('0x') || link.cloid.startsWith('0X') ? link.cloid.toLowerCase() : link.cloid;
+      upsertEntropyLink.run(cloid, link.accountHash, link.positionId, link.purpose, link.coin, link.assumedFeeBps, link.catalogFeeBps, link.deployerFeeScale, link.growthMode, link.at);
+    },
+    entropyOrderLink(cloid: string): StoredEntropyOrderLink | null {
+      const key = cloid.startsWith('0x') || cloid.startsWith('0X') ? cloid.toLowerCase() : cloid;
+      const row = selectEntropyLink.get(key) as Record<string, unknown> | undefined;
+      if (!row) return null;
+      return {
+        cloid: row.cloid as string, accountHash: row.account_hash as string, positionId: row.position_id as string, purpose: row.purpose as string,
+        coin: row.coin as string, assumedFeeBps: nullable(row.assumed_fee_bps), catalogFeeBps: nullable(row.catalog_fee_bps),
+        deployerFeeScale: nullable(row.deployer_fee_scale), growthMode: (row.growth_mode as string | null) ?? null, at: row.at as number,
+      };
+    },
+    upsertEntropyFills(fills: readonly StoredEntropyFill[]): number {
+      if (!fills.length) return 0;
+      return transaction(() => {
+        let added = 0;
+        for (const fill of fills) {
+          const changed = Number(insertEntropyFill.run(
+            fill.accountHash, fill.tid, fill.oid, fill.cloid, fill.time, fill.coin, fill.side, fill.dir, fill.crossed ? 1 : 0,
+            fill.px, fill.sz, fill.notionalUsd, fill.feeUsd, fill.feeToken, fill.builderFeeUsd, fill.closedPnl,
+            fill.livePositionId, fill.livePurpose, fill.assumedFeeBps, fill.catalogFeeBps, fill.deployerFeeScale, fill.growthMode,
+            fill.hlCrossRate, fill.hlReferralDiscount, fill.hlStakingDiscount, fill.hypePriceUsd, fill.recordedAt,
+          ).changes);
+          added += changed;
+          if (!changed && fill.hypePriceUsd !== null) backfillEntropyFillHype.run(fill.hypePriceUsd, fill.accountHash, fill.tid);
+        }
+        return added;
+      });
+    },
+    entropyFills(accountHash: string, from: number, to: number, limit: number): StoredEntropyFill[] {
+      return (selectEntropyFills.all(accountHash, from, to, limit) as Record<string, unknown>[]).map(mapEntropyFill);
+    },
+    entropyFillsAll(accountHash: string, from: number, to: number): StoredEntropyFill[] {
+      return (selectEntropyFillsAll.all(accountHash, from, to) as Record<string, unknown>[]).map(mapEntropyFill);
+    },
+    addEntropyFeeSnapshot(snapshot: Omit<StoredEntropyFeeSnapshot, 'id'>): void {
+      insertEntropySnapshot.run(snapshot.accountHash, snapshot.at, snapshot.userCrossRate, snapshot.userAddRate, snapshot.referralDiscount, snapshot.stakingDiscount, snapshot.hypePriceUsd, snapshot.assumedFeeBps);
+    },
+    latestEntropyFeeSnapshot(accountHash: string): StoredEntropyFeeSnapshot | null {
+      const row = selectLatestEntropySnapshot.get(accountHash) as Record<string, unknown> | undefined;
+      if (!row) return null;
+      return {
+        id: row.id as number, accountHash: row.account_hash as string, at: row.at as number,
+        userCrossRate: nullable(row.user_cross_rate), userAddRate: nullable(row.user_add_rate),
+        referralDiscount: nullable(row.referral_discount), stakingDiscount: nullable(row.staking_discount),
+        hypePriceUsd: nullable(row.hype_price_usd), assumedFeeBps: nullable(row.assumed_fee_bps),
+      };
+    },
+    pruneEntropyOrderLinks(now: number): number {
+      return Number(pruneEntropyLinks.run(now - 90 * 86_400_000).changes);
+    },
     /**
      * 首次启动的一次性迁移（已有完成标记时什么都不做，返回 false）：旧持仓与成交换成两腿口径复制到新表，旧参数（settings）
      * 与冷却（cooldown）换成新键（settings2、cooldown2）。全部在一个事务里，失败整体回滚、下次启动重试。旧表与旧键原样保留。

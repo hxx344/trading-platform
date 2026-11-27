@@ -22,6 +22,7 @@ import { LiveKeysError, type LighterKey, type LiveKeys, type LiveKeysStore } fro
 import { createLighterSigner, lighterSignerProblem, type LighterSigner } from './lighter-signer.ts';
 import { createEntropyTrader, createLighterTrader, scrub, type VenueTrader } from './orders.ts';
 import { BaselineTracker, LIVE_BASELINE_GAP_MS, suggestedEntryBps, symbolStats, type Baseline, type RegimeStats } from './stats.ts';
+import { ENTROPY_COST_AFTER_FILL_MS, ENTROPY_COST_POLL_MS, accountHashOf as entropyAccountHashOf, createEntropyCostCollector } from './entropy-cost.ts';
 import { DEFAULT_GLOBAL, DEFAULT_SYMBOL, DIRECTIONS, ParamsError, closePosition, closeSpread, confirmOpen, decide, openEconomics, slippageBudgetBps, fundingEstimate, legFeeBps,
   markToMarket, openBlocker, openPosition, readGlobalParams, readSymbolParams, recommendParams, upgradeDirection, upgradeGlobal,
   CLOSE_REASON_NAMES, DIRECTION_NAMES, type CloseReason, type ClosedTrade, type GlobalParams, type LegFees, type Position, type SymbolParams } from './strategy.ts';
@@ -95,6 +96,8 @@ const DEFAULT_SETTINGS: Settings = { revision: 0, global: DEFAULT_GLOBAL, symbol
 export { COOLDOWN_KEY, SETTINGS_KEY };
 /** 自动配置下开的仓，开仓时的出场、止损与最长持有（按配对键，带持仓编号）。存在 state 表里，旧版本不读。 */
 export const EXITS_KEY = 'autoExits';
+/** v0.107.0 把保存为 null 的默认 Entropy 手续费一次性升级为 0.2 基点（不覆盖已有自定义值或用户之后主动清空的选择）。 */
+export const ENTROPY_FEE_DEFAULT_MIGRATED_KEY = 'entropy_fee_default_02';
 type ExitRules = { id: string; exitBps: number; stopBps: number; maxHoldMinutes: number };
 
 export interface EngineOptions { store: VarLighterStore; fetchImpl?: FetchLike; connect?: Connect; now?: () => number; log?: (line: string) => void; /** Var token 询价；不给就只用公开报价。 */ quoter?: VarQuoter; /** 实盘场所账户（docs/dexspread.md 第 12 节）；不给就是没有配置。 */ accounts?: DexAccountsSource;
@@ -290,7 +293,18 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
   const open = connect ?? (url => new WebSocket(url) as unknown as ReturnType<Connect>);
   const migrated = store.migrateLegacy(now(), LEGACY_UPGRADE);
   if (migrated && migrated.positions + migrated.trades + migrated.skipped > 0) log(`varlighter: 已升级为两腿口径（持仓 ${migrated.positions}、成交 ${migrated.trades}${migrated.skipped ? `、无法识别 ${migrated.skipped}` : ''}）`);
-  let settings: Settings = normalizeSettings(store.state<Settings>(SETTINGS_KEY));
+  const savedSettings = store.state<Settings>(SETTINGS_KEY);
+  let settings: Settings = normalizeSettings(savedSettings);
+  if (!store.state(ENTROPY_FEE_DEFAULT_MIGRATED_KEY)) {
+    const tMigrate = now();
+    let applied = false;
+    if (savedSettings !== null && settings.global.entropyFeeBps === null && DEFAULT_GLOBAL.entropyFeeBps !== null) {
+      settings = { ...settings, revision: settings.revision + 1, global: { ...settings.global, entropyFeeBps: DEFAULT_GLOBAL.entropyFeeBps } };
+      store.saveSettings(settings, tMigrate, `Entropy 默认手续费已更新为 ${DEFAULT_GLOBAL.entropyFeeBps} 基点（往返 ${2 * DEFAULT_GLOBAL.entropyFeeBps} 基点），留空可切回目录费率`);
+      applied = true;
+    }
+    store.setState(ENTROPY_FEE_DEFAULT_MIGRATED_KEY, { at: tMigrate, applied }, tMigrate);
+  }
   let autoKeys = new Set(settings.auto);
   /** 自动配置用的统计（各时段与全天），按配对缓存；名义金额档或类别变了就重算。 */
   const autoStats = new Map<string, { at: number; bucket: SizeBucket; kind: AssetKind; stats: RegimeStats[] }>();
@@ -342,6 +356,19 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     historyScheduleEpoch++;
   };
   let lastSeenLiveClosedId: string | null = store.liveClosed(1)[0]?.id ?? null;
+  let nextEntropyCost = now() + 20_000;
+  const entropyAddress = (): string | null => {
+    const source = accountSource();
+    return source.problem ? null : source.accounts.entropy?.address ?? null;
+  };
+  const entropyCost = createEntropyCostCollector({
+    store, fetchImpl, now, log,
+    signalFor: () => anySignal([liveStop.signal], REQUEST_TIMEOUT_MS),
+    stopSignal: liveStop.signal,
+    entropyAccount: entropyAddress,
+    assumedFeeBps: () => settings.global.entropyFeeBps,
+    markets: () => live.get('entropy')!.markets,
+  });
   const traderCache = new Map<KeyVenue, { id: string; trader: VenueTrader }>();
   const lighterSignerCache = new Map<'lighter' | 'rh', { id: string; signer: Promise<LighterSigner> }>();
   const lighterTokenCache = new Map<'lighter' | 'rh', { id: string; token: string; at: number }>();
@@ -409,6 +436,17 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     hasPaper: (key, paperId) => positions.get(key)?.id === paperId && fills.get(key)?.kind !== 'close',
     signalFor: () => anySignal([liveStop.signal], REQUEST_TIMEOUT_MS),
     stopped: () => liveStop.signal.aborted,
+    onOrderSent: ({ cloid, positionId, purpose, leg, assumedFeeBps, at }) => {
+      const address = entropyAddress();
+      if (!address) return;
+      store.saveEntropyOrderLink({
+        cloid, accountHash: entropyAccountHashOf(address), positionId, purpose,
+        coin: leg.market.coin ?? `io:${leg.symbol}`, assumedFeeBps,
+        catalogFeeBps: leg.market.takerFeeBps, deployerFeeScale: leg.market.deployerFeeScale ?? null,
+        growthMode: leg.market.growthMode ?? null, at,
+      });
+    },
+    onEntropyFill: () => { nextEntropyCost = Math.min(nextEntropyCost, now() + ENTROPY_COST_AFTER_FILL_MS); },
   }) : null;
   const liveOf = (): LiveTrader => liveTrader ?? reject('unavailable', '这个服务没有开启实盘', 503);
   const liveFailure = (error: unknown): never => {
@@ -440,6 +478,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     try { liveKeys!.set(venue, fields); } catch (error) { return liveFailure(error); }
     dropVenueCaches(venue);
     scheduleImmediateAccountsRefresh();
+    if (venue === 'entropy') nextEntropyCost = now();
     store.event(now(), 'live', null, `已录入 ${VENUE_NAMES[venue]} 的实盘凭据`);
     return { keys: liveKeys!.view() };
   }
@@ -965,6 +1004,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     historyCache.clear();
     store.pruneEvents(time);
     store.pruneAccountSnapshots(time);
+    store.pruneEntropyOrderLinks(time);
     firsts.clear(); firstSample = undefined;
   }
   function firstOf(key: string): number | null {
@@ -993,11 +1033,16 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       const spread = sample ? spreadOf(sample, bucketOf(params.notionalUsd)) : null;
       const mid = sample ? midBasis(sample) : null;
       const position = positions.get(pair.key) ?? null;
+      const aFeeBps = legFeeBps(settings.global, pair.a.venue, pair.a.market.takerFeeBps);
+      const bFeeBps = legFeeBps(settings.global, pair.b.venue, pair.b.market.takerFeeBps);
+      const cost = spread ? spread.buyA - spread.sellA : null;
+      const feeCost = aFeeBps !== null && bFeeBps !== null ? 2 * (aFeeBps + bFeeBps) : null;
+      const totalCost = cost !== null && feeCost !== null ? cost + feeCost : null;
       return {
         key: pair.key, a: legRef(pair.a), b: legRef(pair.b), ratio: pair.ratio, custom: pair.custom, note: pair.note, venue: pair.b.venue, venueName: VENUE_NAMES[pair.b.venue],
         symbol: pair.symbol, name: pair.name, kind: pair.kind, kindName: KIND_NAMES[pair.kind], identity: pair.identity, eligible: eligible(pair), gapBps: pair.gapBps,
         regime: regimeOf(pair.kind, time), sampleAt: sample?.t ?? null, mid, sellA: spread?.sellA ?? null, buyA: spread?.buyA ?? null, estimated: spread?.estimated ?? null,
-        cost: spread ? spread.buyA - spread.sellA : null,
+        cost, feeCost, totalCost,
         baseline: baseline ? { median: baseline.median, sigma: baseline.sigma, samples: baseline.samples, regime: baseline.regime, fallback: baseline.fallback } : null,
         z: baseline && mid !== null ? (mid - baseline.median) / baseline.sigma : null,
         rich: baseline && spread ? spread.sellA - baseline.median : null, cheap: baseline && spread ? baseline.median - spread.buyA : null,
@@ -1005,7 +1050,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
         enabled: params.enabled, entryBps: params.entryBps, exitBps: params.exitBps, auto: autoKeys.has(pair.key), autoPending: autoPending(pair.key),
         position: positionSummary(position, sample),
         aFunding: sample?.aFunding ?? pair.a.market.fundingHourly, bFunding: sample?.bFunding ?? pair.b.market.fundingHourly,
-        aFeeBps: legFeeBps(settings.global, pair.a.venue, pair.a.market.takerFeeBps), bFeeBps: legFeeBps(settings.global, pair.b.venue, pair.b.market.takerFeeBps),
+        aFeeBps, bFeeBps,
       };
     });
     refreshDepth();
@@ -1678,9 +1723,12 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     /** 测试用：不跑后台循环时按参数启停各场所的行情流。 */
     startStreams(): void { running = true; syncStreams(); },
     pollVar, refreshCatalog, refreshDepth, sampleLive, refreshAccounts, refreshAccountHistory,
+    syncEntropyCost: () => entropyCost.sync(true),
     views: { state, symbol: symbolView, samples: samplesPage, backtest, paper, settings: updateSettings, close: closeManual, reset: resetPaper, readiness,
       accounts: accountsView, accountsRefresh: refreshAccountsNow,
-      live: liveView, liveKeys: setLiveKeys, liveKeysRemove: removeLiveKeys, liveSettings, liveClose, liveDismiss, liveResume },
+      live: liveView, liveKeys: setLiveKeys, liveKeysRemove: removeLiveKeys, liveSettings, liveClose, liveDismiss, liveResume,
+      entropyCost: (from?: unknown, to?: unknown, limit?: unknown) => entropyCost.view(from, to, limit),
+      entropyCostSync: () => entropyCost.sync(true) },
     /**
      * 后台循环：连上用到的行情流（一档、标记价、资金费与启用配对的盘口都走行情流）并在后台每 10 分钟取各场所目录，然后每分钟拉 Var 报价（连同询价），
      * 每秒检查两腿都是行情流的配对是否到期采样，每小时清理过期样本。
@@ -1737,6 +1785,10 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
           }
           // 先结算到点的延迟成交，实盘这一轮推进看到的模拟持仓才是最新的。
           try { settleFills(); } catch (error) { log(`varlighter: 延迟成交失败：${message(error)}`); }
+          if (time >= nextEntropyCost && !busy.has('entropy-cost')) {
+            nextEntropyCost = time + ENTROPY_COST_POLL_MS;
+            background('entropy-cost', () => entropyCost.sync(false).then(() => undefined));
+          }
           liveTrader?.tick();
           const latestLiveClosed = liveTrader?.view().trades[0]?.id ?? null;
           if (latestLiveClosed !== lastSeenLiveClosedId) {
@@ -1754,7 +1806,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
         // 停止时掐断在途的下单请求（结果按「不明」落库，重启后先查询再决定，不重发），等这一轮推进收尾后才关库。
         liveStop.abort();
         await liveTrader?.idle();
-        await watcher; await Promise.allSettled([...jobs, ...(activeRefresh ? [activeRefresh] : [])]);
+        await watcher; await Promise.allSettled([...jobs, ...(activeRefresh ? [activeRefresh] : []), entropyCost.idle()]);
       }
     },
     /** 实盘告警（经执行服务发飞书）。 */

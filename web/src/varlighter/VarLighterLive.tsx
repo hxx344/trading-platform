@@ -1,15 +1,15 @@
 // 实盘（docs/dexspread.md 第 13 节）：按场所录入下单凭据、实盘总开关与配对、限额、实盘持仓与成交。
 // 凭据只往服务器写、不回读：页面只知道每个场所「已录入」与否，输入框提交后立即清空。
-import { useEffect, useRef, useState } from 'react';
-import { KeyRound, LoaderCircle, Play, Save, Trash2, X } from 'lucide-react';
-import { api } from '../api.ts';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { Download, KeyRound, LoaderCircle, Play, RefreshCw, Save, Trash2, X } from 'lucide-react';
+import { ApiError, api } from '../api.ts';
 import { useDialogGuard } from '../AppDialog.tsx';
 import { Callout, StatePanel, TableEmpty } from '../StateViews.tsx';
 import { useLiveResource } from '../use-live-resource.ts';
 import type { LiveLimits, LivePosition, LiveState } from '../../../src/varlighter/live.ts';
-import type { LiveView } from '../../../src/varlighter/views.ts';
+import type { EntropyCostView, LiveView } from '../../../src/varlighter/views.ts';
 import { Badge, Metric, stampText, useWrite } from './parts.tsx';
-import { VARLIGHTER_BASE, directionLabel, duration, pairLabel, percent, price, signedUsd, tone, usd, varLighterHref, venueShort } from './varlighter-form.ts';
+import { VARLIGHTER_BASE, age, directionLabel, duration, pairLabel, percent, plain, price, rebateAudit, signedUsd, tone, usd, varLighterHref, venueShort } from './varlighter-form.ts';
 
 const LIVE_PATH = `${VARLIGHTER_BASE}/live`;
 type KeyVenue = 'lighter' | 'rh' | 'entropy';
@@ -47,6 +47,7 @@ export function VarLighterLive({ onExpired }: { onExpired: () => void }) {
     <KeysPanel view={data} onChanged={refresh} />
     <PositionsPanel view={data} onChanged={refresh} />
     <TradesPanel view={data} />
+    <EntropyCostPanel onExpired={onExpired} />
   </>;
 }
 
@@ -261,4 +262,138 @@ function TradesPanel({ view }: { view: LiveView }) {
       {view.events.length ? <ul className="vl-events">{view.events.map(event => <li key={event.id}><time>{stampText(event.at)}</time><span><b>{event.symbol ? `${pairLabel(event.symbol).symbol} ${pairLabel(event.symbol).short}` : '全局'}</b>{event.message}</span></li>)}</ul> : <TableEmpty>暂无事件</TableEmpty>}
     </section>
   </div>;
+}
+
+const ENTROPY_COST_PATH = `${VARLIGHTER_BASE}/entropy-cost`;
+type CostRange = '14d' | '30d' | 'all';
+const COST_RANGES: readonly { id: CostRange; label: string }[] = [
+  { id: '14d', label: '14 天' }, { id: '30d', label: '30 天' }, { id: 'all', label: '全部' },
+];
+const PURPOSE_TEXT: Record<string, string> = { open: '开仓', hedge: '对冲', flatten: '回补', close: '平仓' };
+
+function EntropyCostPanel({ onExpired }: { onExpired: () => void }) {
+  const [range, setRange] = useState<CostRange>('14d');
+  const [mountNow] = useState(() => Math.floor(Date.now() / 60_000) * 60_000);
+  const path = useMemo(() => {
+    if (range === '14d') return `${ENTROPY_COST_PATH}?limit=100`;
+    if (range === '30d') return `${ENTROPY_COST_PATH}?from=${Math.max(0, mountNow - 30 * 86_400_000)}&limit=200`;
+    return `${ENTROPY_COST_PATH}?from=0&limit=500`;
+  }, [range, mountNow]);
+  const resource = useLiveResource<EntropyCostView>(path, { intervalMs: 30_000, timeoutMs: 15_000, onExpired });
+  const data = resource.data;
+  const write = useWrite();
+  const [payoutHype, setPayoutHype] = useState('');
+  const [payoutPrice, setPayoutPrice] = useState('');
+  const priceTouched = useRef(false);
+  const latestHype = data?.snapshot?.hypePriceUsd ?? data?.summary.weightedHypePriceUsd ?? null;
+  useEffect(() => {
+    if (!priceTouched.current && !payoutPrice && latestHype !== null) setPayoutPrice(plain(latestHype, 3));
+  }, [payoutPrice, latestHype]);
+
+  const syncNow = () => {
+    void write.run('sync', async () => {
+      const result = await api<{ added: number; incomplete: boolean; pending?: boolean; error: string | null }>(`${ENTROPY_COST_PATH}/sync`, { body: {} });
+      void resource.refresh();
+      if (result.error) throw new ApiError(`同步提示：${result.error}`, 502);
+      return result;
+    }, result => result.pending
+      ? '同步仍在进行中（接口较慢），后台完成后将自动更新，可几秒后再点一次或等待自动刷新'
+      : `已同步：新增 ${result.added} 条 io 成交${result.incomplete ? '（未拉全，可再点一次继续）' : ''}`);
+  };
+  const exportJson = () => {
+    if (!data) return;
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `entropy-cost-${range}-${new Date(data.now).toISOString().slice(0, 10)}.json`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const parsedHype = payoutHype.trim() === '' ? null : Number(payoutHype);
+  const parsedPrice = payoutPrice.trim() === '' ? null : Number(payoutPrice);
+  const audit = data ? rebateAudit({
+    notionalUsd: data.summary.usdcNotionalUsd, usdcFeeUsd: data.summary.usdcFeeUsd,
+    assumedFeeBps: data.assumedFeeBps, weightedHypePriceUsd: data.summary.weightedHypePriceUsd,
+    payoutHype: parsedHype !== null && Number.isFinite(parsedHype) ? parsedHype : null,
+    payoutHypePrice: parsedPrice !== null && Number.isFinite(parsedPrice) ? parsedPrice : null,
+  }) : null;
+
+  return <section className="panel" aria-label="Entropy 实际成本与返佣核对">
+    <div className="panel-heading">
+      <h2>Entropy 实际成本与返佣核对</h2>
+      <span className="muted">{data?.configured ? `后台每 5 分钟同步；上次 ${age(data.sync.lastOkAt ?? data.sync.lastSyncAt, data.now)}` : '自动采集实扣手续费与交易时刻 HYPE 价格，供下次双周返佣核对'}</span>
+    </div>
+    <div className="vl-toolbar">
+      <div className="vl-seg" role="group" aria-label="统计区间">
+        {COST_RANGES.map(item => <button type="button" key={item.id} aria-pressed={range === item.id} onClick={() => setRange(item.id)}>{item.label}</button>)}
+      </div>
+      <span className="grow" />
+      <button type="button" className="button secondary" disabled={!data?.configured || write.busy !== null} onClick={syncNow}>
+        {write.busy === 'sync' ? <LoaderCircle size={14} className="spin" aria-hidden="true" /> : <RefreshCw size={14} aria-hidden="true" />}立即同步
+      </button>
+      <button type="button" className="button secondary" disabled={!data?.configured} onClick={exportJson}>
+        <Download size={14} aria-hidden="true" />导出 JSON
+      </button>
+    </div>
+    {write.message ? <div className="vl-actions vl-pause"><Callout tone={write.message.tone}>{write.message.text}</Callout></div> : null}
+    {data?.sync.error ? <div className="vl-actions"><Callout tone="warning">最近采集异常：{data.sync.error}</Callout></div> : null}
+    {data?.sync.incomplete ? <div className="vl-actions"><Callout tone="warning">本次同步达到请求上限或窗口未拉全，可点「立即同步」继续补齐。</Callout></div> : null}
+    {!data
+      ? resource.error ? <StatePanel kind="error" title="读取 Entropy 成本记录失败" detail={resource.error.message} /> : <StatePanel kind="loading" title="加载中…" />
+      : !data.configured
+        ? <TableEmpty>尚未配置 Entropy 主账户地址。在上面「下单凭据」录入或用命令行配置只读账户后，自动采集 io 市场实扣手续费与 HYPE 价格。</TableEmpty>
+        : <>
+          <section className="vl-metrics inset" aria-label="Entropy 成本汇总">
+            <Metric label="策略假设费率（单边 / 往返）"
+              value={`${data.assumedFeeBps === null ? '按目录' : `${plain(data.assumedFeeBps, 2)} bps`} / ${data.assumedRoundTripBps === null ? '—' : `${plain(data.assumedRoundTripBps, 2)} bps`}`}
+              foot={`目录原始 ${data.catalogFeeBps === null ? '—' : `${plain(data.catalogFeeBps, 2)} bps`} · 链上实扣预估 ${data.estimatedExchangeFeeBps === null ? '—' : `${plain(data.estimatedExchangeFeeBps, 3)} bps`}`} />
+            <Metric label="区间成交额（io:*）" value={usd(data.summary.notionalUsd, 2)}
+              foot={`${data.summary.fills} 笔（吃单 ${data.summary.takerFills} / 挂单 ${data.summary.makerFills} · 本平台 ${data.summary.platformFills} / 外部 ${data.summary.externalFills}）`} />
+            <Metric label="交易所当下实扣"
+              value={`${usd(data.summary.usdcFeeUsd, 4)}（${data.summary.actualFeeBps === null ? '—' : `${plain(data.summary.actualFeeBps, 3)} bps`}）`}
+              foot={`往返约 ${data.summary.actualRoundTripBps === null ? '—' : `${plain(data.summary.actualRoundTripBps, 3)} bps`} · 前端费 ${usd(data.summary.builderFeeUsd, 4)}${data.summary.nonUsdcFeeCount ? ` · 另有 ${data.summary.nonUsdcFeeCount} 笔非 USDC 计费` : ''}`} />
+            <Metric label="待返佣缺口（相对假设）"
+              value={signedUsd(data.summary.rebateGapUsd, 4)}
+              foot={`按当时假设合计 ${usd(data.summary.assumedFeeUsd, 4)} · 成交加权 HYPE ${data.summary.weightedHypePriceUsd === null ? '—' : usd(data.summary.weightedHypePriceUsd, 2)}${data.summary.hypeCoveredNotionalRatio !== null ? `（覆盖 ${percent(data.summary.hypeCoveredNotionalRatio, 0)}）` : ''}`} />
+          </section>
+          <div className="vl-fields">
+            <label className="vl-field">下次返佣核对 · 实领 HYPE 数量
+              <input inputMode="decimal" value={payoutHype} placeholder="例：0.0037" onChange={event => setPayoutHype(event.target.value)} />
+              <small>输入下一期双周发放领到的 HYPE，立即反算真实成本</small>
+            </label>
+            <label className="vl-field">领币时 HYPE 单价（美元）
+              <input inputMode="decimal" value={payoutPrice} placeholder="例：66.1" onChange={event => { priceTouched.current = true; setPayoutPrice(event.target.value); }} />
+              <small>{latestHype === null ? '暂无最新 HYPE 价格' : `当前快照 HYPE ${usd(latestHype, 2)}`}</small>
+            </label>
+            <div className="vl-field">核对结论（当前区间）
+              <div className="vl-metric">
+                <strong>{audit ? `${audit.realOneWayBps === null ? '—' : `${plain(audit.realOneWayBps, 3)} bps`} / 往返 ${audit.realRoundTripBps === null ? '—' : `${plain(audit.realRoundTripBps, 3)} bps`}` : '—'}</strong>
+                <small>{audit
+                  ? `按领币价折合 ${usd(audit.rebateUsdAtPayout, 4)}${audit.rebateUsdAtTrade === null ? '' : `（按交易时 HYPE ${usd(audit.rebateUsdAtTrade, 4)}）`}；占实扣总费 ${audit.rebatePctOfTotalFee === null ? '—' : `${plain(audit.rebatePctOfTotalFee, 1)}%`}（Entropy 50% 分成的 ${audit.rebatePctOfEntropyHalf === null ? '—' : `${plain(audit.rebatePctOfEntropyHalf, 1)}%`}）${audit.deltaOneWayBps === null ? '' : `；相对假设 ${audit.deltaOneWayBps >= 0 ? '+' : ''}${plain(audit.deltaOneWayBps, 3)} bps`}`
+                  : '填实领 HYPE 数量与领币币价即可核对'}</small>
+              </div>
+            </div>
+          </div>
+          {data.snapshot ? <p className="vl-note">最近账户费率快照（{stampText(data.snapshot.at)}）：Hyperliquid Taker {data.snapshot.userCrossRate === null ? '—' : `${plain(data.snapshot.userCrossRate * 10_000, 2)} bps`} · Maker {data.snapshot.userAddRate === null ? '—' : `${plain(data.snapshot.userAddRate * 10_000, 2)} bps`} · HL 推荐折扣 {data.snapshot.referralDiscount === null ? '—' : percent(data.snapshot.referralDiscount, 1)} · HYPE 质押折扣 {data.snapshot.stakingDiscount === null ? '—' : percent(data.snapshot.stakingDiscount, 1)}</p> : null}
+          {data.fills.length ? <div className="vl-table"><table>
+            <thead><tr><th>成交时刻</th><th>合约</th><th>方向 · 角色</th><th className="num">成交额</th><th className="num">实扣手续费</th><th className="num">前端费</th><th className="num">当时假设 / 目录</th><th className="num">当时 HYPE</th><th>来源</th></tr></thead>
+            <tbody>{data.fills.map(fill => {
+              const feeBps = fill.notionalUsd > 0 && fill.feeToken === 'USDC' ? (fill.feeUsd / fill.notionalUsd) * 10_000 : null;
+              return <tr key={fill.tid}>
+                <td>{stampText(fill.time)}</td>
+                <td>{fill.coin}<small>{fill.growthMode === 'enabled' ? 'Growth' : fill.growthMode === 'disabled' ? '标准' : '未知'}{fill.deployerFeeScale !== null ? ` ×${fill.deployerFeeScale}` : ''}</small></td>
+                <td>{fill.dir ?? (fill.side === 'B' ? '买' : '卖')}<small>{fill.crossed ? '吃单 Taker' : '挂单 Maker'}</small></td>
+                <td className="num">{usd(fill.notionalUsd, 2)}<small>{price(fill.sz)} @ {price(fill.px)}</small></td>
+                <td className="num">{fill.feeToken === 'USDC' ? usd(fill.feeUsd, 5) : `${fill.feeUsd} ${fill.feeToken}`}<small>{feeBps === null ? '非 USDC' : `${plain(feeBps, 3)} bps`}</small></td>
+                <td className="num">{usd(fill.builderFeeUsd, 5)}</td>
+                <td className="num">{fill.assumedFeeBps === null ? '—' : `${plain(fill.assumedFeeBps, 2)}`} / {fill.catalogFeeBps === null ? '—' : plain(fill.catalogFeeBps, 2)} bps</td>
+                <td className="num">{fill.hypePriceUsd === null ? '—' : usd(fill.hypePriceUsd, 2)}</td>
+                <td>{fill.livePositionId ? <><Badge tone="info">本平台实盘</Badge><small>{PURPOSE_TEXT[fill.livePurpose ?? ''] ?? fill.livePurpose}</small></> : <span className="vl-dim">外部下单</span>}</td>
+              </tr>;
+            })}</tbody>
+          </table></div> : <TableEmpty>这个时间窗里还没有 io 市场的成交记录</TableEmpty>}
+        </>}
+  </section>;
 }

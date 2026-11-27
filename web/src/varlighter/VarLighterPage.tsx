@@ -134,9 +134,9 @@ function Overview({ view, onChanged }: { view: StateView; onChanged: () => Promi
       {rows.length ? <div className="vl-table vl-overview"><table>
         {simple
           ? <thead><tr>{header('symbol', '标的', false)}<th title="勾选即启用，参数按推荐值自动配置">模拟盘</th>{header('mid', '当前价差', true, '两个场所同一资产的价格差')}{header('gap', '距开仓', false, '当前偏离对比开仓线，条满即达到开仓条件')}<th>操作方向</th>
-            {header('cost', '交易成本', true, '开仓加平仓、两条腿合计的盘口成本')}</tr></thead>
+            {header('cost', '交易成本', true, '开仓加平仓、两条腿合计的盘口成本加往返手续费（不含滑点）')}</tr></thead>
           : <thead><tr>{header('symbol', '标的', false)}<th title="勾选即启用，参数按推荐值自动配置">模拟盘</th>{header('kind', '类别 · 时段', false)}{header('mid', '中间价基差')}<th className="num">基线</th>{header('z', '偏离 σ')}
-            <th className="num">卖 A / 买 A</th>{header('cost', '往返成本')}{header('gap', '信号')}<th className="num">资金费（年化）</th>{header('samples', '24h 样本')}</tr></thead>}
+            <th className="num">卖 A / 买 A</th>{header('cost', '往返成本', true, '开仓加平仓、两条腿合计的盘口成本加往返手续费（不含滑点）')}{header('gap', '信号')}<th className="num">资金费（年化）</th>{header('samples', '24h 样本')}</tr></thead>}
         <tbody>{rows.map(row => simple ? <SimpleRow key={row.key} row={row} {...paperProps} /> : <Row key={row.key} row={row} {...paperProps} />)}</tbody>
       </table></div> : <TableEmpty>{view.rows.length ? '没有符合筛选的配对' : view.sources.venues.some(item => item.catalog.ok) ? '开着的组合里还没有配对的报价；可在实盘准备页开启组合或添加手动配对' : '正在读取各场所的目录…'}</TableEmpty>}
       <details className="vl-help">
@@ -146,9 +146,9 @@ function Overview({ view, onChanged }: { view: StateView; onChanged: () => Promi
           <dt>模拟盘</dt><dd>勾选就把这个配对交给模拟盘自动开平仓，不用先设参数：入场线、出场、止损和最长持有由系统按这个配对近期的波动和交易成本推荐，约每 10 分钟更新一次（标「自动」）；刚开始采集、样本还不够时先不开仓。取消勾选即停用，已有的持仓照常平仓。想自己定参数，点标的代码进详情页关掉「自动配置」。</dd>
           <dt>距开仓</dt><dd>现在的价差比平时偏了多少，对比这个标的的开仓线。进度条满了就到了开仓线，这一行会高亮；模拟盘真正开仓前还要过风控，也只做该配对参数里允许的方向。数据超过 5 分钟没更新的行不高亮。</dd>
           <dt>操作方向</dt><dd>价差回到平时水平时能赚钱的做法：贵的一边卖出，便宜的一边买入。现在还没有偏离的配对不显示方向。</dd>
-          <dt>交易成本</dt><dd>开仓加平仓、两条腿合计要付的盘口成本。偏离要明显大于它才有利润；写「估算」的是按一档价估算。</dd>
+          <dt>交易成本</dt><dd>开仓加平仓、两条腿合计要付的盘口成本加往返手续费（不含滑点）。偏离要明显大于它才有利润；写「估算」的是按一档价估算。</dd>
           <dt>还想看更多</dt><dd>右上角切到「完整」，可以看基线、偏离 σ、两个方向的可成交价差、资金费和样本数。</dd>
-        </dl> : <p>有 Var 腿的每分钟一个 Var 报价、对齐对手腿当时的一档；两腿都是行情流的每 5 秒（未启用每 20 秒），已启用或有持仓的一档一有变化就判断开平仓。模拟盘一列勾选即启用并用自动配置（入场、出场、止损、最长持有取推荐值，约 10 分钟更新），信号列的入场阈值是当前生效的值。A 是配对键里的第一条腿（有 Var 时为 Var）。卖 A 价差 = A 买价 ÷（乘数 × B 卖价）− 1，买 A 价差 = A 卖价 ÷（乘数 × B 买价）− 1，按各配对名义金额取档（≤ 1000 美元用 1k 档）；
+        </dl> : <p>有 Var 腿的每分钟一个 Var 报价、对齐对手腿当时的一档；两腿都是行情流的每 5 秒（未启用每 20 秒），已启用或有持仓的一档一有变化就判断开平仓。模拟盘一列勾选即启用并用自动配置（入场、出场、止损、最长持有取推荐值，约 10 分钟更新），信号列的入场阈值是当前生效的值。A 是配对键里的第一条腿（有 Var 时为 Var）。卖 A 价差 = A 买价 ÷（乘数 × B 卖价）− 1，买 A 价差 = A 卖价 ÷（乘数 × B 买价）− 1，按各配对名义金额取档（≤ 1000 美元用 1k 档）；往返成本列已计入两腿开平手续费（不含滑点）；
           已启用或有持仓的配对订阅行情流腿的完整盘口（WebSocket）算冲击，其余用一档价估算（标「估」）。信号列是离入场最近的一侧：偏离 − 入场阈值，≥ 0 即达到开仓条件。资金费只作参考，两腿都折成年化。</p>}
       </details>
     </section>
@@ -225,6 +225,12 @@ function PaperCell({ row, now, busy, onToggle }: PaperProps) {
   </td>;
 }
 
+const costNote = (row: StateRow): string => {
+  if (row.cost === null) return row.feeCost === null ? '缺盘口与手续费' : row.feeCost !== undefined && row.feeCost > 0 ? `缺盘口（含费 ${plain(row.feeCost)}）` : '缺盘口';
+  if (row.feeCost === null) return '手续费未知';
+  return [row.feeCost !== undefined && row.feeCost > 0 ? `含费 ${plain(row.feeCost)}` : '', row.estimated ? '估算' : ''].filter(Boolean).join(' · ');
+};
+
 function SimpleRow(props: PaperProps) {
   const { row, now, multi } = props;
   const progress = entryProgress(row);
@@ -232,6 +238,7 @@ function SimpleRow(props: PaperProps) {
   const reached = !!progress?.reached && !stale;
   // 偏离不为正时按这个方向做，回到平时水平也赚不到，不给买卖提示。
   const sides = progress && progress.deviation > 0 ? directionSides(progress.direction, row.a.venue, row.b.venue) : null;
+  const note = costNote(row);
   return <tr className={reached ? 'vl-hit' : undefined}>
     <SymbolCell row={row} multi={multi} simple />
     <PaperCell {...props} />
@@ -245,7 +252,7 @@ function SimpleRow(props: PaperProps) {
       <small>偏离 {plain(progress.deviation)} / 开仓线 {plain(progress.entry)}</small>
     </div> : <span className="vl-dim">数据不足</span>}</td>
     <td>{sides ? <span className="vl-sides"><span className="vl-side sell">卖 {venueShort(sides.sell)}</span><span className="vl-side buy">买 {venueShort(sides.buy)}</span></span> : <span className="vl-dim">—</span>}</td>
-    <td className="num">{plain(row.cost)}{row.estimated ? <small>估算</small> : null}</td>
+    <td className="num">{plain(row.totalCost ?? row.cost)}{note ? <small className={row.feeCost === null ? 'vl-warn' : undefined}>{note}</small> : null}</td>
   </tr>;
 }
 
@@ -254,6 +261,7 @@ function Row(props: PaperProps) {
   const hit = signal(row);
   const funding = fundingAnnual(row.aFunding, row.bFunding);
   const stale = isStale(row, now);
+  const note = costNote(row);
   return <tr className={hit && hit.gap >= 0 && !stale ? 'vl-hit' : undefined}>
     <SymbolCell row={row} multi={multi} simple={false} />
     <PaperCell {...props} />
@@ -262,7 +270,7 @@ function Row(props: PaperProps) {
     <td className="num">{row.baseline ? <>{bps(row.baseline.median)} <span className="vl-dim">± {plain(row.baseline.sigma)}</span><small>{row.baseline.fallback ? '全天基线 · ' : `${REGIME_LABELS[row.baseline.regime]} · `}{row.baseline.samples} 个</small></> : <span className="vl-dim">样本不足</span>}</td>
     <td className={`num ${row.z !== null && Math.abs(row.z) >= 2 ? 'vl-warn' : ''}`}>{row.z === null ? '—' : row.z.toFixed(1)}</td>
     <td className="num">{bps(row.sellA)} / {bps(row.buyA)}{row.estimated ? <Badge>估</Badge> : null}</td>
-    <td className="num">{plain(row.cost)}</td>
+    <td className="num">{plain(row.totalCost ?? row.cost)}{note ? <small className={row.feeCost === null ? 'vl-warn' : undefined}>{note}</small> : null}</td>
     <td className="num">{hit ? <><span className={hit.gap >= 0 ? 'vl-up' : undefined}>{bps(hit.gap)}</span><small title={directionLabel(hit.direction, row.a.venue, row.b.venue)}>{directionShort(hit.direction, row.a.venue)} {plain(hit.deviation)} / {plain(row.entryBps)}</small></> : '—'}</td>
     <td className="num">{funding.a} / {funding.b}<small>{venueShort(row.a.venue)} / {venueShort(row.b.venue)}</small></td>
     <td className="num">{row.samples24h}</td>

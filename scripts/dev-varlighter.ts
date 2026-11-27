@@ -15,6 +15,7 @@ import { loadWebApp } from '../src/web-assets.ts';
 import { startDex } from '../src/dex/main.ts';
 import { createDexClient } from '../src/dex/ipc.ts';
 import { openVarLighterStore, VARLIGHTER_FILE } from '../src/varlighter/store.ts';
+import { ENTROPY_COST_SYNC_KEY, accountHashOf } from '../src/varlighter/entropy-cost.ts';
 import { runBacktest } from '../src/varlighter/backtest.ts';
 import { KNOWN_KINDS, REVIEW_KINDS, pairKey, regimeOf, varHourly, type Leg, type LiveVenue, type Sample } from '../src/varlighter/model.ts';
 import { DEFAULT_GLOBAL, DEFAULT_SYMBOL } from '../src/varlighter/strategy.ts';
@@ -153,6 +154,14 @@ const now = Date.now();
     store.addAccountSnapshot({ venue: 'rh', accountHash: previewHashes.rh, at: t, equity: 60 + wave * 0.2, collateral: 60, available: 60, unrealizedPnl: 0, positions: 0 });
     store.addAccountSnapshot({ venue: 'entropy', accountHash: previewHashes.entropy, at: t, equity: 510 + (48 - i) * 0.05 - wave * 0.6, collateral: 512.4, available: 480.1, unrealizedPnl: 0.3, positions: 1 });
   }
+  const previewHash = accountHashOf('0x' + 'ab'.repeat(20));
+  store.addEntropyFeeSnapshot({ accountHash: previewHash, at: now - 300_000, userCrossRate: 0.00045, userAddRate: 0.00015, referralDiscount: 0.04, stakingDiscount: 0, hypePriceUsd: 66.12, assumedFeeBps: 0.2 });
+  store.upsertEntropyFills([
+    { accountHash: previewHash, tid: 90001, oid: 80001, cloid: '0x00000000000000000000000000000001', time: now - 7_200_000, coin: 'io:NVDA', side: 'B', dir: 'Open Long', crossed: true, px: 182.05, sz: 0.5, notionalUsd: 91.025, feeUsd: 0.007865, feeToken: 'USDC', builderFeeUsd: 0, closedPnl: 0, livePositionId: 'preview-live-1', livePurpose: 'open', assumedFeeBps: 0.2, catalogFeeBps: 0.9, deployerFeeScale: 1, growthMode: 'enabled', hlCrossRate: 0.00045, hlReferralDiscount: 0.04, hlStakingDiscount: 0, hypePriceUsd: 65.8, recordedAt: now - 7_190_000 },
+    { accountHash: previewHash, tid: 90002, oid: 80002, cloid: '0x00000000000000000000000000000002', time: now - 6_300_000, coin: 'io:NVDA', side: 'A', dir: 'Close Long', crossed: true, px: 182.0, sz: 0.5, notionalUsd: 91.0, feeUsd: 0.007862, feeToken: 'USDC', builderFeeUsd: 0, closedPnl: -0.025, livePositionId: 'preview-live-1', livePurpose: 'close', assumedFeeBps: 0.2, catalogFeeBps: 0.9, deployerFeeScale: 1, growthMode: 'enabled', hlCrossRate: 0.00045, hlReferralDiscount: 0.04, hlStakingDiscount: 0, hypePriceUsd: 65.9, recordedAt: now - 6_290_000 },
+    { accountHash: previewHash, tid: 90003, oid: 80003, cloid: null, time: now - 1_800_000, coin: 'io:SNDK', side: 'B', dir: 'Open Long', crossed: true, px: 61.0, sz: 2, notionalUsd: 122.0, feeUsd: 0.010541, feeToken: 'USDC', builderFeeUsd: 0, closedPnl: 0, livePositionId: null, livePurpose: null, assumedFeeBps: 0.2, catalogFeeBps: 0.9, deployerFeeScale: 1, growthMode: 'enabled', hlCrossRate: 0.00045, hlReferralDiscount: 0.04, hlStakingDiscount: 0, hypePriceUsd: 66.1, recordedAt: now - 1_790_000 },
+  ]);
+  store.setState(ENTROPY_COST_SYNC_KEY, { [previewHash]: { cursorMs: now - 1_800_000, lastSyncAt: now - 60_000, lastOkAt: now - 60_000, incomplete: false, error: null } }, now);
   store.close();
 }
 
@@ -288,9 +297,9 @@ const fetchImpl = async (input: string | URL | Request, init?: RequestInit): Pro
     }
     if (req.type === 'userFillsByTime') {
       return Response.json([
-        { tid: 101, coin: 'io:NVDA', px: '183.50', sz: '0.2', side: 'A', dir: 'Open Short', crossed: true, fee: '0.016', feeToken: 'USDC', closedPnl: '0.0', time: tNow - 7_200_000 },
-        { tid: 102, coin: 'io:AAPL', px: '228.40', sz: '0.5', side: 'B', dir: 'Close Short', crossed: true, fee: '0.05', feeToken: 'USDC', closedPnl: '1.45', time: tNow - 14_400_000 },
-        { tid: 999, coin: 'BTC', px: '98500', sz: '0.1', side: 'B', dir: 'Open Long', crossed: true, fee: '2.5', feeToken: 'USDC', closedPnl: '0.0', time: tNow - 10_000_000 },
+        { tid: 101, oid: 700101, coin: 'io:NVDA', px: '183.50', sz: '0.2', side: 'A', dir: 'Open Short', crossed: true, fee: '0.016', feeToken: 'USDC', builderFee: '0', closedPnl: '0.0', time: tNow - 7_200_000 },
+        { tid: 102, oid: 700102, coin: 'io:AAPL', px: '228.40', sz: '0.5', side: 'B', dir: 'Close Short', crossed: true, fee: '0.05', feeToken: 'USDC', builderFee: '0', closedPnl: '1.45', time: tNow - 14_400_000 },
+        { tid: 999, oid: 700999, coin: 'BTC', px: '98500', sz: '0.1', side: 'B', dir: 'Open Long', crossed: true, fee: '2.5', feeToken: 'USDC', builderFee: '0', closedPnl: '0.0', time: tNow - 10_000_000 },
       ]);
     }
     if (req.type === 'userFunding') {
@@ -299,11 +308,14 @@ const fetchImpl = async (input: string | URL | Request, init?: RequestInit): Pro
         { time: tNow - 7_200_000, hash: '0x02', delta: { type: 'funding', coin: 'BTC', usdc: '-0.95', szi: '0.1', fundingRate: '0.0001' } },
       ]);
     }
+    if (req.type === 'userFees') return Response.json({ userCrossRate: '0.00045', userAddRate: '0.00015', activeReferralDiscount: '0.04', activeStakingDiscount: { discount: '0' } });
+    if (req.type === 'allMids') return Response.json({ HYPE: '66.12' });
+    if (req.type === 'candleSnapshot') return Response.json([]);
   }
   if (url.includes('hyperliquid.xyz/info')) {
     const listed = onVenue('entropy');
     return Response.json([
-      { universe: listed.map(({ market }) => ({ name: `io:${market.symbol}`, szDecimals: market.price > 100 ? 2 : 1, maxLeverage: 10, deployerFeeScale: '1.0', growthMode: 'disabled' })), collateralToken: 0 },
+      { universe: listed.map(({ market }) => ({ name: `io:${market.symbol}`, szDecimals: market.price > 100 ? 2 : 1, maxLeverage: 10, deployerFeeScale: '1.0', growthMode: 'enabled' })), collateralToken: 0 },
       listed.map(({ market }) => { const mid = liveMid(market, 'entropy', state.get(market.symbol)!.price, Date.now()); return { markPx: mid.toFixed(3), oraclePx: (mid * 0.9998).toFixed(3), funding: '0.0000125', openInterest: '1000' }; }),
     ]);
   }

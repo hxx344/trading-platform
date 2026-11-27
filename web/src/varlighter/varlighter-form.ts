@@ -134,7 +134,7 @@ export function sortRows(rows: readonly StateRow[], key: SortKey, descending: bo
       case 'mid': return row.mid;
       case 'z': return finite(row.z) ? Math.abs(row.z) : null;
       case 'gap': return signal(row)?.gap ?? null;
-      case 'cost': return row.cost;
+      case 'cost': return row.totalCost ?? row.cost;
       case 'samples': return row.samples24h;
     }
   };
@@ -174,7 +174,7 @@ export const GLOBAL_FIELDS: readonly NumberField<Exclude<keyof GlobalParams, 'pa
   { key: 'varFeeBps', label: 'Var 手续费', min: 0, max: 100, unit: '基点', optional: true, hint: '留空按目录费率（Var 目录为 0）' },
   { key: 'rhFeeBps', label: 'Lighter RH 手续费', min: 0, max: 100, unit: '基点', optional: true, hint: '留空按目录费率' },
   { key: 'lighterFeeBps', label: 'Lighter 主网手续费', min: 0, max: 100, unit: '基点', optional: true, hint: '留空按目录费率' },
-  { key: 'entropyFeeBps', label: 'Entropy 手续费', min: 0, max: 100, unit: '基点', optional: true, hint: '留空按目录费率（按部署方费率与增长模式折算）；两者都取不到不开仓' },
+  { key: 'entropyFeeBps', label: 'Entropy 手续费', min: 0, max: 100, unit: '基点', optional: true, hint: '单边每次成交；默认 0.2（往返 0.4，含返佣估算）；留空按目录原始费率' },
   { key: 'maxQuoteAgeSec', label: '报价时效上限', min: 5, max: 600, integer: true, unit: '秒', hint: '收到时较慢一腿的报价已过去的时间，超过不开仓' },
   { key: 'minNetBps', label: '最低预期净利', min: 0, max: 500, unit: '基点', hint: '偏离 − 出场 − 半个往返成本 − 滑点与手续费，低于这个数不开仓' },
   { key: 'maxOpenPositions', label: '最多持仓数', min: 1, max: 100, integer: true, unit: '笔' },
@@ -443,4 +443,41 @@ export function accountActivityFoot(
     ? `已实现 ${signedCurrencyAmount(data.totals.realizedPnlUsd30d, 'USD')}${data.totals.realizedVenues.length < configured.length ? `（${data.totals.realizedVenues.map(venueShort).join('、')}）` : ''}`
     : '';
   return [tradePart, fundingPartial, realizedPart, `策略实盘累计 ${signedUsd(data.totals.liveNetUsd)}`].filter(Boolean).join(' · ');
+}
+
+// ---- Entropy 返佣核对 ----
+export interface RebateAuditInput {
+  notionalUsd: number;
+  usdcFeeUsd: number;
+  assumedFeeBps: number | null;
+  weightedHypePriceUsd: number | null;
+  payoutHype?: number | null;
+  payoutHypePrice?: number | null;
+  payoutUsd?: number | null;
+}
+export interface RebateAuditResult {
+  rebateUsdAtPayout: number;
+  rebateUsdAtTrade: number | null;
+  rebatePctOfTotalFee: number | null;
+  rebatePctOfEntropyHalf: number | null;
+  realOneWayBps: number | null;
+  realRoundTripBps: number | null;
+  deltaOneWayBps: number | null;
+}
+export function rebateAudit(input: RebateAuditInput): RebateAuditResult | null {
+  let rebateUsdAtPayout: number | null = null;
+  let rebateUsdAtTrade: number | null = null;
+  if (finite(input.payoutHype) && input.payoutHype >= 0 && finite(input.payoutHypePrice) && input.payoutHypePrice > 0) {
+    rebateUsdAtPayout = input.payoutHype * input.payoutHypePrice;
+    if (finite(input.weightedHypePriceUsd) && input.weightedHypePriceUsd > 0) rebateUsdAtTrade = input.payoutHype * input.weightedHypePriceUsd;
+  } else if (finite(input.payoutUsd) && input.payoutUsd >= 0) {
+    rebateUsdAtPayout = input.payoutUsd;
+  }
+  if (rebateUsdAtPayout === null) return null;
+  const rebatePctOfTotalFee = finite(input.usdcFeeUsd) && input.usdcFeeUsd > 0 ? (rebateUsdAtPayout / input.usdcFeeUsd) * 100 : null;
+  const rebatePctOfEntropyHalf = rebatePctOfTotalFee !== null ? rebatePctOfTotalFee * 2 : null;
+  const realOneWayBps = finite(input.notionalUsd) && input.notionalUsd > 0 ? ((input.usdcFeeUsd - rebateUsdAtPayout) / input.notionalUsd) * 10_000 : null;
+  const realRoundTripBps = realOneWayBps !== null ? realOneWayBps * 2 : null;
+  const deltaOneWayBps = realOneWayBps !== null && finite(input.assumedFeeBps) ? realOneWayBps - input.assumedFeeBps : null;
+  return { rebateUsdAtPayout, rebateUsdAtTrade, rebatePctOfTotalFee, rebatePctOfEntropyHalf, realOneWayBps, realRoundTripBps, deltaOneWayBps };
 }

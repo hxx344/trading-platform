@@ -28,7 +28,8 @@ export interface GlobalParams {
   /** 基线窗口（小时）。 */ windowHours: number;
   /** 基线最少样本数（按每分钟一个计；两腿都是行情流的配对每分钟只计一个）。 */ minSamples: number;
   /** 每次成交的滑点（基点，每条腿每次各计一次）。 */ slippageBps: number;
-  varFeeBps: number | null; rhFeeBps: number | null; lighterFeeBps: number | null; entropyFeeBps: number | null;
+  varFeeBps: number | null; rhFeeBps: number | null; lighterFeeBps: number | null;
+  /** Entropy 单边手续费（基点）：默认 0.2（往返 0.4，含返佣估算）；留空（null）按目录原始费率。 */ entropyFeeBps: number | null;
   /** 在决策时逐腿核对实际成交报价的最大年龄（秒）。 */ maxQuoteAgeSec: number;
   /** 预期净利（偏离 − 出场 − 半个往返成本 − 四次成交的滑点与手续费，基点）低于这个数不开仓。 */ minNetBps: number;
   maxOpenPositions: number;
@@ -38,7 +39,7 @@ export interface GlobalParams {
 }
 
 export const DEFAULT_SYMBOL: SymbolParams = { enabled: false, notionalUsd: 1000, entryBps: 15, exitBps: 0, stopBps: 60, maxHoldMinutes: 720, cooldownMinutes: 10, regimes: [...REGIMES], directions: [...DIRECTIONS] };
-export const DEFAULT_GLOBAL: GlobalParams = { windowHours: 24, minSamples: 120, slippageBps: 1, varFeeBps: null, rhFeeBps: null, lighterFeeBps: null, entropyFeeBps: null, maxQuoteAgeSec: 30, minNetBps: 3, maxOpenPositions: 5, maxTotalNotionalUsd: 10_000, dailyLossLimitUsd: 100, paused: false };
+export const DEFAULT_GLOBAL: GlobalParams = { windowHours: 24, minSamples: 120, slippageBps: 1, varFeeBps: null, rhFeeBps: null, lighterFeeBps: null, entropyFeeBps: 0.2, maxQuoteAgeSec: 30, minNetBps: 3, maxOpenPositions: 5, maxTotalNotionalUsd: 10_000, dailyLossLimitUsd: 100, paused: false };
 /** 一条腿的手续费：手动值优先，其次目录费率；都没有为 null（不开仓）。 */
 export const legFeeBps = (global: GlobalParams, venue: VenueId, catalogBps: number | null): number | null => global[FEE_FIELDS[venue]] ?? catalogBps;
 

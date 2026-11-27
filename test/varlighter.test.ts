@@ -20,7 +20,7 @@ import { backtestRequest, chartEquity, runBacktest } from '../src/varlighter/bac
 import { BOOK_KEEP_LEVELS, CONNECT_TIMEOUT_MS, DEPTH_MAX_GAP_MS, HyperliquidStream, LighterStream, depthAt, depthSnapshot, vwap, type SocketLike } from '../src/varlighter/feeds.ts';
 import { orderPlan } from '../src/varlighter/plan.ts';
 import { MIGRATED_KEY, openVarLighterStore } from '../src/varlighter/store.ts';
-import { COOLDOWN_KEY, EXITS_KEY, LEGACY_UPGRADE, LIGHTER_TAKER_DELAY_MS, SETTINGS_KEY, createVarLighterEngine, customKey, downsample, readCustomPair, upgradeSettings } from '../src/varlighter/engine.ts';
+import { COOLDOWN_KEY, ENTROPY_FEE_DEFAULT_MIGRATED_KEY, EXITS_KEY, LEGACY_UPGRADE, LIGHTER_TAKER_DELAY_MS, SETTINGS_KEY, createVarLighterEngine, customKey, downsample, readCustomPair, upgradeSettings } from '../src/varlighter/engine.ts';
 import { READ_TOKEN_MAX_BYTES } from '../src/read-token.ts';
 import { localDexForward, openVarLighter, varLighterLoop, varLighterViews } from '../src/dex/host.ts';
 import { createLiveKeysStore } from '../src/varlighter/livekeys.ts';
@@ -114,6 +114,7 @@ test('Entropy 目录：只收 io: 永续、跳过下架与精度越界，费率�
   assert.equal(markets[0].takerFeeBps, 6.75);
   assert.ok(Math.abs(markets[1].takerFeeBps! - 0.9) < 1e-9);
   assert.equal(markets[2].takerFeeBps, null, '没有费率字段时未知');
+  assert.deepEqual([markets[0].deployerFeeScale, markets[0].growthMode, markets[1].growthMode, markets[2].growthMode], [0.5, 'disabled', 'enabled', null]);
   assert.deepEqual([markets[0].coin, markets[0].priceDecimals, markets[0].index, markets[0].mark, markets[0].fundingHourly, markets[0].minQuote], ['io:SNDK', 4, 100.4, 100.3, 0.0000125, 10]);
   assert.throws(() => parseEntropyMarkets({}), /Entropy 目录格式无效/);
   assert.throws(() => parseEntropyMarkets([{ universe, collateralToken: 1 }, contexts]), /抵押资产发生变化/);
@@ -407,7 +408,8 @@ test('旧参数换算：键与方向换新写法、手续费 0 改为按目录�
     confirmed: ['rh:X', 'lighter:X', 'rh:X', 'bad'], venues: ['lighter'], globalExtra: { minNetBps: 7 },
   });
   assert.equal(upgraded.revision, 7);
-  assert.deepEqual([upgraded.global.varFeeBps, upgraded.global.rhFeeBps, upgraded.global.lighterFeeBps, upgraded.global.entropyFeeBps, upgraded.global.minNetBps], [null, 0.5, 0.5, null, 7]);
+  assert.deepEqual([upgraded.global.varFeeBps, upgraded.global.rhFeeBps, upgraded.global.lighterFeeBps, upgraded.global.entropyFeeBps, upgraded.global.minNetBps], [null, 0.5, 0.5, 0.2, 7]);
+  assert.equal(upgradeSettings({ global: { ...LEGACY_GLOBAL, entropyFeeBps: null } }).global.entropyFeeBps, null, '显式留空保持按目录');
   assert.deepEqual(Object.keys(upgraded.symbols), [RH_BTC]);
   assert.deepEqual(upgraded.symbols[RH_BTC].directions, ['a_cheap']);
   assert.deepEqual(upgraded.confirmed, ['var:X|lighter:X', 'var:X|rh:X']);
@@ -1393,7 +1395,8 @@ test('两腿行情流的配对：启用或有持仓的每 5 秒、其余每 20 �
   const dir = mkdtempSync(path.join(tmpdir(), 'tp-varlighter-'));
   const file = path.join(dir, 'varlighter.sqlite');
   const seed = openVarLighterStore(file);
-  seed.setState(SETTINGS_KEY, settings2({}, DEFAULT_GLOBAL, ['lighter|entropy']), T0);
+  seed.setState(SETTINGS_KEY, settings2({}, { ...DEFAULT_GLOBAL, entropyFeeBps: null }, ['lighter|entropy']), T0);
+  seed.setState(ENTROPY_FEE_DEFAULT_MIGRATED_KEY, { at: T0, applied: false }, T0);
   seed.savePosition(position(LE_SNDK, { aEntry: 100, bEntry: 100.1, bFeeBps: 6.75 }));
   seed.close();
   const store = openVarLighterStore(file);
@@ -2625,4 +2628,61 @@ test('回测只读线程：失败清理后不残留锁，恢复后后续回测�
     db.close();
     fixture.dispose();
   }
+});
+
+test('Entropy 默认单边 0.2 基点（往返 0.4）与总览成本列；老库 null 一次性升级且不覆盖清空或自定义值', async () => {
+  assert.equal(DEFAULT_GLOBAL.entropyFeeBps, 0.2);
+  const dir = mkdtempSync(path.join(tmpdir(), 'tp-entropy-fee-'));
+  const file = path.join(dir, 'varlighter.sqlite');
+  const fetchImpl = async (url: string) => {
+    if (url.includes('orderBookDetails')) return Response.json({ code: 200, order_book_details: [{ symbol: 'SNDK', market_id: 9, market_type: 'perp', status: 'active', size_decimals: 2, price_decimals: 2, min_base_amount: '0.01', min_quote_amount: '10', taker_fee: '0', maker_fee: '0', mark_price: '100' }] });
+    if (url.includes('hyperliquid')) return Response.json([{ universe: [{ name: 'io:SNDK', szDecimals: 2, deployerFeeScale: '1.0', growthMode: 'enabled' }], collateralToken: 0 }, [{ markPx: '100', oraclePx: '100', funding: '0' }]]);
+    return Response.json({ listings: [] });
+  };
+  try {
+    // 老库保存了 entropyFeeBps: null：首次升级为 0.2（revision + 1），记一条事件；用户再手动清空为 null 重启后保持 null。
+    const seed = openVarLighterStore(file);
+    seed.setState(SETTINGS_KEY, settings2({}, { ...DEFAULT_GLOBAL, entropyFeeBps: null }, ['lighter|entropy']), T0);
+    seed.close();
+    const sockets = new Map<string, FakeSocket>();
+    const first = createVarLighterEngine({ store: openVarLighterStore(file), fetchImpl, connect: url => { const s = new FakeSocket(); sockets.set(venueOf(url), s); return s; }, now: () => T0 });
+    try {
+      first.startStreams();
+      sockets.get('lighter')!.open(); sockets.get('entropy')!.open();
+      await first.refreshCatalog(AbortSignal.timeout(1000), 'lighter');
+      await first.refreshCatalog(AbortSignal.timeout(1000), 'entropy');
+      sockets.get('lighter')!.push({ type: 'subscribed/market_stats', channel: 'market_stats:all', market_stats: { 9: { market_id: 9, best_bid_price: '99.99', best_ask_price: '100.01', mark_price: '100' } } });
+      sockets.get('entropy')!.push({ channel: 'bbo', data: { coin: 'io:SNDK', bbo: [{ px: '99.98', sz: '10', n: 1 }, { px: '100.02', sz: '10', n: 1 }] } });
+      first.sampleLive();
+      const view = first.views.state();
+      assert.deepEqual([view.settings.revision, view.settings.global.entropyFeeBps], [4, 0.2]);
+      const row = view.rows[0]!;
+      assert.deepEqual([row.aFeeBps, row.bFeeBps], [0, 0.2]);
+      assert.ok(Math.abs(row.cost! - 6) < 1e-6);
+      assert.ok(Math.abs(row.feeCost! - 0.4) < 1e-6);
+      assert.ok(Math.abs(row.totalCost! - 6.4) < 1e-6);
+      const cleared = first.views.settings({ revision: 4, global: { entropyFeeBps: null } });
+      assert.equal(cleared.global.entropyFeeBps, null);
+    } finally { first.close(); }
+
+    const second = createVarLighterEngine({ store: openVarLighterStore(file), fetchImpl, connect: () => new FakeSocket(), now: () => T0 + 1000 });
+    try {
+      const view = second.views.state();
+      assert.equal(view.settings.global.entropyFeeBps, null, '用户主动清空后重启不再覆写回 0.2');
+      assert.equal(view.settings.revision, 5);
+    } finally { second.close(); }
+
+    // 已有自定义值（0.5）的老库升级时保持 0.5 不覆盖。
+    const customDir = mkdtempSync(path.join(tmpdir(), 'tp-entropy-custom-'));
+    try {
+      const cFile = path.join(customDir, 'varlighter.sqlite');
+      const cSeed = openVarLighterStore(cFile);
+      cSeed.setState(SETTINGS_KEY, settings2({}, { ...DEFAULT_GLOBAL, entropyFeeBps: 0.5 }, ['lighter|entropy']), T0);
+      cSeed.close();
+      const cEngine = createVarLighterEngine({ store: openVarLighterStore(cFile), fetchImpl, connect: () => new FakeSocket(), now: () => T0 });
+      try {
+        assert.deepEqual([cEngine.views.state().settings.revision, cEngine.views.state().settings.global.entropyFeeBps], [3, 0.5]);
+      } finally { cEngine.close(); }
+    } finally { rmSync(customDir, { recursive: true, force: true }); }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

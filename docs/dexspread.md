@@ -744,3 +744,29 @@ DEX 这一步在 `activate` 里的位置是：**执行面健康之后、控制�
 ## 16 场所账户只读并入资产账本（v0.110.0，回滚版本 v0.109.0）
 
 DEX 服务的 `GET /dex/v1/accounts` 端点直接复用引擎的 `accountSource()`（页面 `live-keys.json` 优先于 `--set-dex-keys` 的 `keys.env`），向执行面的资产账本提供 `{ accounts: { lighter?, rh?, entropy? }, problem }` 只读概览（`src/dex/server.ts`、`src/dex/main.ts`、`src/dex/ipc.ts`），绝不导出私钥或 `apiKeyIndex`。资产侧通过该接口同步 Lighter 主网、Lighter RH 与 Entropy 账户并完成跨场所去重，具体聚合口径、零明文指纹持久化与原子防双算见 [asset.md](asset.md)《DEX 价差账号去重并入资产总计》。
+
+## 17 Entropy 交易成本口径（默认 0.2 基点 / 往返 0.4 基点）与实盘返佣对账采集（R3，v0.111.0，回滚版本 v0.110.1）
+
+### 17.1 改变的行为
+
+- **Entropy 默认手续费改为单边 0.2 基点（往返 0.4 基点）**：`DEFAULT_GLOBAL.entropyFeeBps` 从 `null` 改为 `0.2`（基于主账户 Hyperliquid Tier 0 + 4% 推荐折扣 + Growth Mode 实扣 `0.864` 基点叠加 Entropy Tier 3 自返佣后的净成本预估；留空 `null` 仍退回目录无折扣费率）。已有老库首次启动若尚未记录 `entropy_fee_default_02` 且当前保存的 `entropyFeeBps` 为 `null`，一次性升为 `0.2` 并写事件说明；用户已自定义的值或升级后主动清空为 `null` 的选择不再覆盖。
+- **总览「交易成本 / 往返成本」纳入两腿往返手续费**：`StateRow` 保留纯盘口往返成本 `cost`（`buyA - sellA`），新增 `feeCost = 2 * (aFeeBps + bFeeBps)` 与 `totalCost = cost + feeCost`；总览表格成本列、按成本排序展示 `totalCost`（并注明含手续费金额或手续费未知）。策略开仓门槛（`expectedNetBps`、`recommendParams`、`closePosition`、`slippageBudgetBps`）与分时段统计的纯盘口 `costMedian` 口径不变，避免重复扣费。
+- **Entropy 真实成交与返佣对账采集**：配置了 Entropy 账户（实盘录入或 `keys.env`）后，DEX 服务后台每 5 分钟（并在本平台 Entropy 实盘成交后 8 秒）自动同步 `userFillsByTime` 里的 `io:*` 真实成交（遇到 2000 条满页自动二分并在 state 中持久化二分队列 `pendingQueue` 与前缀边界，跨轮次单调推进游标）、`userFees` 账户费率快照与 `allMids` / `candleSnapshot`（仅 1 小时 `HYPE` K 线）交易时刻 HYPE 价格，连同本平台发单时的 `cloid` 关联记录（`entropy_order_links`）一起落库到 `varlighter.sqlite`。
+- **实盘页对账面板与下次返佣核对**：实盘页底部新增「Entropy 实际成本与返佣核对」，展示交易所当下实扣 USDC / 基点、与当前 0.2 基点假设之间的待返佣缺口、交易时刻加权 HYPE 均价、成交明细（区分本平台实盘与外部下单），并提供输入框按「实领 HYPE 数量 + 领币时 HYPE 价」实时反算真实返佣比例与真实单边/往返净成本（严格使用同口径 `usdcNotionalUsd` 作分母，`rebateAudit` 辅助函数亦支持直接传入美元总额），同时支持一键立即同步（超过 7 秒未返回时先响应 `pending` 进行中提示并转后台完成，停服等待 `entropyCost.idle()` 收尾，避免触及 10 秒 IPC 超时断链）和导出 JSON。
+
+### 17.2 影响面
+
+- 仅涉及 DEX 价差服务（`src/varlighter/`、`src/dex/host.ts`）、DEX 前端页面（`web/src/varlighter/`）与本地预览脚本（`scripts/dev-varlighter.ts`）；不改动执行服务路由鉴权与组件边界（`src/http.ts`、`src/read-token.ts`、`src/service/` 零改动），保证执行服务组件指纹不变。
+- `varlighter.sqlite` 新增三张表（`entropy_fills`、`entropy_fee_snapshots`、`entropy_order_links`）和状态键 `entropy_fee_default_02`、`entropy_cost_sync`，不修改已有表结构。
+- 主账户地址只保存在服务端已有的账户来源里，落库按 `account_hash`（地址小写 SHA-256 前 16 位十六进制）隔离，**不进入**数据库明文、日志、接口应答、错误信息与页面产物。
+
+### 17.3 失败与回滚
+
+- 采集接口失败、超时或限流时只记录在同步状态，不影响行情流采集、模拟盘或实盘下单；实盘 `send` / `apply` 中的关联写入失败只记日志，不阻止或中断下单状态机。
+- 回滚到 **v0.110.1**：旧版本不读写新增的三张表与新 `state` 键，直接回退即可；若回退后希望回到纯目录费率，在页面「全局参数与风控」清空「Entropy 手续费」保存即可。
+
+### 17.4 本次不做
+
+- 不自动扫描 HyperEVM 链上返佣发放合约（由用户在界面录入本次实领 HYPE 数量与领币币价即可即时核对）。
+- 不根据未来到账的返佣自动回写或重算已平仓实盘/模拟盘的历史净盈亏。
+- 不把资金费纳入净盈亏（仍只作参考）。

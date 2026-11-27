@@ -38,6 +38,8 @@ export interface VarLighterViews {
   liveClose(body: unknown): unknown;
   liveDismiss(body: unknown): unknown;
   liveResume(): unknown;
+  entropyCost(from: string | null, to: string | null, limit: string | null): unknown;
+  entropyCostSync(): unknown;
   failure(error: unknown): { status: number; body: { code: string; message: string }; internal: boolean };
 }
 
@@ -80,6 +82,8 @@ export function varLighterViews(holder: VarLighterHolder): VarLighterViews {
     liveClose: body => engine().views.liveClose(body),
     liveDismiss: body => engine().views.liveDismiss(body),
     liveResume: () => engine().views.liveResume(),
+    entropyCost: (from, to, limit) => engine().views.entropyCost(from, to, limit),
+    entropyCostSync: () => engine().views.entropyCostSync(),
     failure(error) {
       if (error instanceof VarLighterError) return { status: error.status, body: { code: error.code, message: error.message }, internal: false };
       if (error instanceof ParamsError) return { status: 400, body: { code: 'invalid_params', message: error.message }, internal: false };
@@ -121,6 +125,8 @@ export async function routePage(views: VarLighterViews, request: DexPageRequest,
     if (method === 'POST' && path === 'live/close') return { status: 200, body: views.liveClose(body) };
     if (method === 'POST' && path === 'live/dismiss') return { status: 200, body: views.liveDismiss(body) };
     if (method === 'POST' && path === 'live/resume') return { status: 200, body: views.liveResume() };
+    if (method === 'GET' && path === 'entropy-cost') return { status: 200, body: views.entropyCost(query.get('from'), query.get('to'), query.get('limit')) };
+    if (method === 'POST' && path === 'entropy-cost/sync') return { status: 200, body: await views.entropyCostSync() };
   } catch (error) {
     const failure = views.failure(error);
     if (failure.internal) log(`DEX 价差接口 ${path} 出错：${error instanceof Error ? error.message.slice(0, 200) : '未知错误'}`);

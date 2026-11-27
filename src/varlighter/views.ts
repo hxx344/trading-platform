@@ -56,7 +56,9 @@ export interface StateRow {
   key: string; a: LegRef; b: LegRef; ratio: number; custom: boolean; note: string; venue: VenueId; venueName: string;
   symbol: string; name: string; kind: AssetKind; kindName: string; identity: Identity; eligible: boolean; gapBps: number | null;
   regime: Regime; sampleAt: number | null;
-  /** 中间价基差、卖 A / 买 A 的可成交价差与往返成本（基点）。 */ mid: number | null; sellA: number | null; buyA: number | null; estimated: boolean | null; cost: number | null;
+  /** 中间价基差、卖 A / 买 A 的可成交价差与往返盘口成本（基点）。 */ mid: number | null; sellA: number | null; buyA: number | null; estimated: boolean | null; cost: number | null;
+  /** 两腿往返手续费（基点，`2 * (aFeeBps + bFeeBps)`）与总往返成本（盘口成本 + 往返手续费，不含滑点）；任一腿手续费未知时为 null。 */
+  feeCost?: number | null; totalCost?: number | null;
   baseline: BaselineView | null;
   /** 中间价偏离基线的 σ 倍数；rich / cheap 是两个方向可成交价差相对基线的偏离（基点）。 */ z: number | null; rich: number | null; cheap: number | null;
   samples24h: number; firstAt: number | null;
@@ -233,4 +235,34 @@ export interface AccountsRefreshResult {
   triggered: boolean;
   cooldownMs: number;
   refreshing: boolean;
+}
+
+/** Entropy 真实成交对账明细（不含主账户地址明文）。 */
+export interface EntropyFillView {
+  tid: number; oid: number; cloid: string | null; time: number; coin: string; side: 'B' | 'A'; dir: string | null; crossed: boolean;
+  px: number; sz: number; notionalUsd: number; feeUsd: number; feeToken: string; builderFeeUsd: number; closedPnl: number | null;
+  livePositionId: string | null; livePurpose: string | null;
+  assumedFeeBps: number | null; catalogFeeBps: number | null; deployerFeeScale: number | null; growthMode: string | null;
+  hypePriceUsd: number | null;
+}
+/** Entropy 主账户 Hyperliquid 费率快照与当前估算假设。 */
+export interface EntropyFeeSnapshotView {
+  at: number; userCrossRate: number | null; userAddRate: number | null; referralDiscount: number | null; stakingDiscount: number | null;
+  hypePriceUsd: number | null; assumedFeeBps: number | null;
+}
+/** 指定时间窗内的 Entropy 实扣费用与假设成本汇总。 */
+export interface EntropyCostSummary {
+  fills: number; takerFills: number; makerFills: number; platformFills: number; externalFills: number;
+  notionalUsd: number; usdcNotionalUsd: number; usdcFeeUsd: number; builderFeeUsd: number; nonUsdcFeeCount: number;
+  actualFeeBps: number | null; actualRoundTripBps: number | null;
+  assumedFeeUsd: number; rebateGapUsd: number;
+  weightedHypePriceUsd: number | null; hypeCoveredNotionalRatio: number | null;
+}
+export interface EntropyCostView {
+  now: number; configured: boolean; from: number; to: number;
+  assumedFeeBps: number | null; assumedRoundTripBps: number | null; catalogFeeBps: number | null; estimatedExchangeFeeBps: number | null;
+  snapshot: EntropyFeeSnapshotView | null;
+  sync: { lastSyncAt: number | null; lastOkAt: number | null; incomplete: boolean; error: string | null };
+  summary: EntropyCostSummary;
+  fills: EntropyFillView[];
 }

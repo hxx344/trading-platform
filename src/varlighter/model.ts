@@ -159,6 +159,8 @@ export interface MarketSpec {
   venue: VenueId; symbol: string; name: string; id: number; coin?: string;
   mark: number | null; index: number | null; fundingHourly: number | null;
   sizeDecimals: number | null; priceDecimals: number | null; minBase: number; minQuote: number; takerFeeBps: number | null;
+  /** Entropy HIP-3 目录里的部署方系数与增长模式（供实盘返佣对账留档）。 */
+  deployerFeeScale?: number | null; growthMode?: 'enabled' | 'disabled' | null;
 }
 export interface LegInfo extends Leg { market: MarketSpec }
 /**
@@ -262,14 +264,16 @@ export function parseEntropyMarkets(input: unknown): MarketSpec[] {
     const sizeDecimals = item.szDecimals;
     if (!Number.isInteger(sizeDecimals) || (sizeDecimals as number) < 0 || (sizeDecimals as number) > 12) return;
     const scale = decimal(item.deployerFeeScale), growth = item.growthMode;
-    const known = scale !== null && scale >= 0 && scale <= 3 && (growth === 'enabled' || growth === 'disabled');
-    const takerFeeBps = known ? 4.5 * (scale < 1 ? 1 + scale : 2 * scale) * (growth === 'enabled' ? 0.1 : 1) : null;
+    const growthMode = growth === 'enabled' || growth === 'disabled' ? growth : null;
+    const known = scale !== null && scale >= 0 && scale <= 3 && growthMode !== null;
+    const takerFeeBps = known ? 4.5 * (scale < 1 ? 1 + scale : 2 * scale) * (growthMode === 'enabled' ? 0.1 : 1) : null;
     const funding = decimal(context?.funding);
     result.push({
       venue: 'entropy', symbol: item.name.slice(3), name: '', id: index, coin: item.name, mark: positive(context?.markPx), index: positive(context?.oraclePx),
       fundingHourly: funding !== null && Math.abs(funding) < 1 ? funding : null,
       // Hyperliquid 永续价格最多 5 位有效数字、小数位不超过 6 − szDecimals。
       sizeDecimals: sizeDecimals as number, priceDecimals: Math.max(0, 6 - (sizeDecimals as number)), minBase: 0, minQuote: 10, takerFeeBps,
+      deployerFeeScale: scale, growthMode,
     });
   });
   return result;

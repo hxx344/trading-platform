@@ -55,7 +55,7 @@ function Detail({ data, view, onChanged }: { data: SymbolView; view: StateView; 
       <Metric label={`卖 ${aName} / 买 ${aName} 偏离`} value={`${bps(row?.rich ?? null)} / ${bps(row?.cheap ?? null)}`} foot={`入场 ${plain(data.effective.entryBps)} · 出场 ${plain(data.effective.exitBps)}${data.auto.on && data.auto.params ? '（自动配置）' : ''} · ${data.bucket} 档${row?.estimated ? ' · 一档估算' : ''}`} />
       <Metric label="资金费（年化）" value={`${funding.a} / ${funding.b}`} foot={`${aName} / ${bName}，只作参考`} />
       <Metric label="两腿合约" value={`${data.a.symbol} ↔ ${data.b.symbol}${data.ratio !== 1 ? ` ×${data.ratio}` : ''}`}
-        foot={`手续费 ${fee(data.fees.a)} / ${fee(data.fees.b)} 基点 · ${[data.a, data.b].filter(leg => leg.venue !== 'var').map(leg => `${venueShort(leg.venue)} #${leg.market.id} 最小 ${leg.market.minQuote} USDC`).join(' · ')} · 规格${IDENTITY_LABELS[data.identity]}`} />
+        foot={`手续费 ${fee(data.fees.a)} / ${fee(data.fees.b)} 基点${data.fees.a !== null && data.fees.b !== null && data.fees.a + data.fees.b > 0 ? `（往返 ${plain(2 * (data.fees.a + data.fees.b))}）` : ''} · ${[data.a, data.b].filter(leg => leg.venue !== 'var').map(leg => `${venueShort(leg.venue)} #${leg.market.id} 最小 ${leg.market.minQuote} USDC`).join(' · ')} · 规格${IDENTITY_LABELS[data.identity]}`} />
     </section>
     <section className="panel" aria-label="价差走势">
       <div className="panel-heading"><h2>{data.symbol} · {pairName} 价差走势</h2><span className="muted">{data.kindName} · 单位基点 · 基线按样本当时之前的窗口计算，不含未来</span></div>
@@ -73,7 +73,7 @@ function Detail({ data, view, onChanged }: { data: SymbolView; view: StateView; 
 
 function StatsPanel({ data }: { data: SymbolView }) {
   return <section className="panel" aria-label="分时段统计">
-    <div className="panel-heading"><h2>分时段统计</h2><span className="muted">所选范围内的样本 · 建议入场 = 偏离 95 分位 − 半个往返成本（不低于 5）</span></div>
+    <div className="panel-heading"><h2>分时段统计</h2><span className="muted">所选范围内的样本 · 往返成本列为盘口成本（不含手续费） · 建议入场 = 偏离 95 分位 − 半个往返成本（不低于 5）</span></div>
     {data.stats.length ? <div className="vl-table"><table>
       <thead><tr><th>时段</th><th className="num">样本</th><th className="num">中位数</th><th className="num">σ（MAD）</th><th className="num">5% – 95%</th><th className="num">往返成本</th>
         <th className="num">半衰期</th><th className="num">穿越 / 天</th><th className="num">机会占比</th><th className="num">偏离 95%</th><th className="num">建议入场</th></tr></thead>

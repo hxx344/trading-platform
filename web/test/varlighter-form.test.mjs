@@ -7,7 +7,7 @@ import { pairKey, parsePairKey } from '../../src/varlighter/model.ts';
 import { readCustomPair } from '../../src/varlighter/engine.ts';
 import {
   EMPTY_PAIR_FORM, backtestBody, bps, bytesPerDay, chartRange, chartRows, comboLabel, comboShort, customPairKey, customPairRequest, directionLabel, directionShort, fundingAnnual, globalForm, globalRequest,
-  SIMPLE_SORT_KEYS, directionSides, entryProgress, matchesCombo, pairLabel, readOverviewMode, settingsBody, signal, sortRows, symbolForm, symbolRequest, toggleConfirmed, usd, varLighterHref, AUTO_FIELDS, autoBody, autoFormPatch, quickEnableBody,
+  SIMPLE_SORT_KEYS, directionSides, entryProgress, matchesCombo, pairLabel, readOverviewMode, rebateAudit, settingsBody, signal, sortRows, symbolForm, symbolRequest, toggleConfirmed, usd, varLighterHref, AUTO_FIELDS, autoBody, autoFormPatch, quickEnableBody,
   VARLIGHTER_TABS, ACCOUNT_VENUE_FILTERS, accountActivityFoot, filterAccountPositions, filterAccountTrades, filterAccountFunding, selectedEquitySeries, selectedVenuePnlCurve, formatCurrencyAmount, signedCurrencyAmount, formatRatePct, marginModeLabel, tradeDirLabel, accountHealthBadge,
 } from '../src/varlighter/varlighter-form.ts';
 import { parseRoute } from '../src/route-parse.ts';
@@ -265,4 +265,30 @@ test('accounts tab helpers: route, filters, series selection and formatting', ()
   assert.equal(accountActivityFoot(sampleView, 'entropy'), '成交 2 笔 · 成交额 $200 · 已实现 +1.45 USDC');
   assert.equal(accountActivityFoot(sampleView, 'all'), '已读成交 4 笔（主网、Entropy） · 资金费含 主网、Entropy · 已实现 +1.45 USD（Entropy） · 策略实盘累计 +$0.03');
   assert.equal(accountActivityFoot({ totals: { configured: 0, tradeCount30d: 0, fundingUsd30d: null, fundingVenues: [], realizedPnlUsd30d: null, realizedVenues: [], liveNetUsd: 0 }, venues: [] }, 'all'), '还没有配置实盘场所账户');
+});
+
+test('cost sorting prefers totalCost and rebateAudit calculates real fee rates', () => {
+  const items = [
+    row('A', { cost: 8, totalCost: 8.4 }),
+    row('B', { cost: 5, totalCost: 9.0 }),
+    row('C', { cost: 7, totalCost: undefined }),
+    row('D', { cost: null, totalCost: null }),
+  ];
+  assert.deepEqual(sortRows(items, 'cost', false).map(item => item.symbol), ['C', 'A', 'B', 'D']);
+
+  const res = rebateAudit({
+    notionalUsd: 10_000, usdcFeeUsd: 0.864, assumedFeeBps: 0.2, weightedHypePriceUsd: 80,
+    payoutHype: 0.00864, payoutHypePrice: 80,
+  });
+  assert.ok(res);
+  assert.ok(Math.abs(res.rebateUsdAtPayout - 0.6912) < 1e-9);
+  assert.ok(Math.abs(res.rebatePctOfTotalFee - 80) < 1e-9);
+  assert.ok(Math.abs(res.rebatePctOfEntropyHalf - 160) < 1e-9);
+  assert.ok(Math.abs(res.realOneWayBps - 0.1728) < 1e-9);
+  assert.ok(Math.abs(res.realRoundTripBps - 0.3456) < 1e-9);
+  assert.ok(Math.abs(res.deltaOneWayBps - (-0.0272)) < 1e-9);
+
+  assert.equal(rebateAudit({ notionalUsd: 100, usdcFeeUsd: 0.01, assumedFeeBps: 0.2, weightedHypePriceUsd: 60 }), null);
+  const directUsd = rebateAudit({ notionalUsd: 10_000, usdcFeeUsd: 0.864, assumedFeeBps: null, weightedHypePriceUsd: null, payoutUsd: 0.6912 });
+  assert.ok(directUsd && Math.abs(directUsd.realOneWayBps - 0.1728) < 1e-9 && directUsd.deltaOneWayBps === null);
 });

@@ -3,7 +3,7 @@ import { useCallback, useMemo, useRef, useState, type ReactNode } from 'react';
 import { ApiError } from '../api.ts';
 import { SvgPlot, type PlotLayer } from '../svg-plot.tsx';
 import { niceAxis } from '../svg-plot-geometry.ts';
-import type { ClosedTrade } from '../../../src/varlighter/strategy.ts';
+import type { LiveTradeView } from '../../../src/varlighter/views.ts';
 import { bps, chartRange, clamp, formatCurrencyAmount, signedCurrencyAmount, signedUsd, usd, type ChartRow } from './varlighter-form.ts';
 
 export function Metric({ label, value, foot, tone = '', accent = false }: { label: ReactNode; value: ReactNode; foot?: ReactNode; tone?: string; /** 需要注意的读数：整张卡用强调色 */ accent?: boolean }) {
@@ -57,7 +57,7 @@ const SPREAD_LAYERS: PlotLayer[] = [
 ];
 
 /** 价差走势：中间价基差、两个方向的可成交价差、基线中位数与入场带；开平仓画在可成交价差上。 */
-export function SpreadChart({ rows, trades, from, to, label, aName = 'A' }: { rows: readonly ChartRow[]; trades: readonly ClosedTrade[]; from: number; to: number; label: string; /** A 腿场所的简称 */ aName?: string }) {
+export function SpreadChart({ rows, trades, from, to, label, aName = 'A' }: { rows: readonly ChartRow[]; trades: readonly LiveTradeView[]; from: number; to: number; label: string; /** A 腿场所的简称 */ aName?: string }) {
   const range = useMemo(() => chartRange(rows), [rows]);
   const samples = useMemo(() => rows.filter(row => row.mid !== null), [rows]);
   const axis = useMemo(() => range ? niceAxis(range[0], range[1]) : null, [range]);

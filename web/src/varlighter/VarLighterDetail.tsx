@@ -1,14 +1,14 @@
-// 标的详情页签：价差走势与基线、分时段统计与建议阈值、参数（回测与保存）、下单预演、该标的的模拟成交。
+// 标的详情页签：价差走势与基线、分时段统计与建议阈值、参数（回测与保存）、下单预演、该标的的实盘成交（v0.112.0 起没有模拟盘）。
 import { useEffect, useMemo, useState } from 'react';
 import { CircleCheck, CircleAlert, LoaderCircle, Play, Save } from 'lucide-react';
 import { api } from '../api.ts';
 import { Callout, StatePanel, TableEmpty } from '../StateViews.tsx';
 import { useLiveResource } from '../use-live-resource.ts';
-import type { ClosedTrade } from '../../../src/varlighter/strategy.ts';
+import type { LiveTradeView } from '../../../src/varlighter/views.ts';
 import type { BacktestView, StateView, SymbolView } from '../../../src/varlighter/views.ts';
 import { Badge, EquityChart, Metric, SpreadChart, SpreadLegend, stampText, useWrite } from './parts.tsx';
 import {
-  ALL_DIRECTIONS, AUTO_FIELDS, BACKTEST_HOURS, IDENTITY_LABELS, REASON_LABELS, REGIME_LABELS, SYMBOL_FIELDS, VARLIGHTER_BASE, VAR_QUOTE_LABELS, age, autoBody, autoFormPatch, backtestBody, bps,
+  ALL_DIRECTIONS, AUTO_FIELDS, BACKTEST_HOURS, IDENTITY_LABELS, REASON_LABELS, REGIME_LABELS, reasonLabel, SYMBOL_FIELDS, VARLIGHTER_BASE, VAR_QUOTE_LABELS, age, autoBody, autoFormPatch, backtestBody, bps,
   chartRows, directionLabel, duration, fundingAnnual, percent, plain, price, settingsBody, signal, signedUsd, symbolForm, symbolRequest, tone, usd, varLighterHref, venueLabel, venueShort, pairLabel, type SymbolForm,
 } from './varlighter-form.ts';
 
@@ -48,7 +48,7 @@ function Detail({ data, view, onChanged }: { data: SymbolView; view: StateView; 
   return <>
     {data.custom ? <Callout tone="info">手动配对：{data.a.name} {data.a.symbol} 对 {data.b.name} {data.b.symbol}{data.ratio !== 1 ? `，B 腿价格按 ×${data.ratio} 折算` : ''}{data.note ? `。${data.note}` : ''}</Callout> : null}
     {data.identity === 'mismatch' ? <Callout tone="error">两边价格相差 {plain(data.gapBps, 0)} 基点，合约规格不同（可能是不同的标的或不同的报价单位），不能交易。</Callout>
-      : !data.eligible ? <Callout tone="warning">该标的的两边规格还没有人工确认（价格相差 {plain(data.gapBps, 0)} 基点）。确认前只采集、可回测，模拟盘不开仓。<a href={varLighterHref('ready')}>去实盘准备页确认</a></Callout> : null}
+      : !data.eligible ? <Callout tone="warning">该标的的两边规格还没有人工确认（价格相差 {plain(data.gapBps, 0)} 基点）。确认前只采集、可回测，不开仓。<a href={varLighterHref('ready')}>去实盘准备页确认</a></Callout> : null}
     <section className="vl-metrics" aria-label={`${data.symbol} 读数`}>
       <Metric label="中间价基差" value={`${bps(row?.mid ?? null)} 基点`} foot={latest ? `样本 ${stampText(latest.t)} · ${REGIME_LABELS[latest.regime]}` : '无样本'} />
       <Metric label="基线中位数 ± σ" value={row?.baseline ? `${bps(row.baseline.median)} ± ${plain(row.baseline.sigma)}` : '样本不足'} foot={row?.baseline ? `${row.baseline.fallback ? '全天' : REGIME_LABELS[row.baseline.regime]}基线 · ${row.baseline.samples} 个样本 · 窗口 ${data.global.windowHours} 小时` : `至少 ${data.global.minSamples} 个样本`} />
@@ -67,7 +67,7 @@ function Detail({ data, view, onChanged }: { data: SymbolView; view: StateView; 
       <ParamsPanel data={data} view={view} onChanged={onChanged} />
       <PlanPanel data={data} />
     </div>
-    <TradesPanel title={`${data.symbol} · ${pairName} 模拟成交`} trades={data.trades} empty="这个范围内没有模拟成交" />
+    <TradesPanel title={`${data.symbol} · ${pairName} 实盘成交`} trades={data.trades} empty="这个范围内没有两腿都成交并平掉的实盘持仓（没开成、单腿的在实盘准备页）" />
   </>;
 }
 
@@ -109,7 +109,7 @@ function ParamsPanel({ data, view, onChanged }: { data: SymbolView; view: StateV
   const save = () => {
     if (!parsed.ok) return;
     void write.run('save', async () => { await api(`${VARLIGHTER_BASE}/settings`, { body: settingsBody(view.settings, { symbol: { symbol: data.key, params: parsed.value } }) }); await onChanged().catch(() => {}); },
-      () => { return auto.on ? '参数已保存；自动配置开着，入场、出场、止损与最长持有仍用推荐值' : '参数已保存，模拟盘从下一个样本起按新参数运行'; });
+      () => { return auto.on ? '参数已保存；自动配置开着，入场、出场、止损与最长持有仍用推荐值' : '参数已保存，策略从下一个样本起按新参数运行'; });
   };
   const setAuto = (on: boolean) => {
     void write.run('auto', async () => { await api(`${VARLIGHTER_BASE}/settings`, { body: autoBody(view.settings, data.key, on) }); await onChanged().catch(() => {}); },
@@ -121,9 +121,9 @@ function ParamsPanel({ data, view, onChanged }: { data: SymbolView; view: StateV
       <label><input type="checkbox" checked={auto.on} disabled={write.busy !== null} onChange={event => setAuto(event.target.checked)} />自动配置<Badge tone={auto.on ? recommended && data.params.enabled ? 'info' : 'warn' : ''}>{auto.on ? !recommended ? '等待样本' : data.params.enabled ? '使用中' : '已选用 · 配对未启用' : '未使用'}</Badge></label>
       {recommended ? <>
         <dl>{SYMBOL_FIELDS.filter(field => AUTO_FIELDS.includes(field.key as (typeof AUTO_FIELDS)[number])).map(field => <div key={field.key}><dt>{field.label}</dt><dd>{recommended[field.key as (typeof AUTO_FIELDS)[number]]} {field.unit}</dd></div>)}</dl>
-        <p>{auto.on ? '模拟盘按这组推荐值运行' : '当前的推荐值'}：按{auto.regime ? REGIME_LABELS[auto.regime] : ''}最近 {auto.samples.toLocaleString()} 个样本的偏离、往返成本与回归快慢，加上当前的滑点、手续费和最低预期净利算出，{age(auto.at, view.now)}更新，约每 10 分钟重算。名义金额、冷却、时段与方向仍用下面保存的值。
+        <p>{auto.on ? '策略按这组推荐值运行' : '当前的推荐值'}：按{auto.regime ? REGIME_LABELS[auto.regime] : ''}最近 {auto.samples.toLocaleString()} 个样本的偏离、往返成本与回归快慢，加上当前的滑点、手续费和最低预期净利算出，{age(auto.at, view.now)}更新，约每 10 分钟重算。名义金额、冷却、时段与方向仍用下面保存的值。
           <button type="button" className="button secondary" onClick={() => set(autoFormPatch(recommended))}>填入表单</button></p>
-      </> : <p className={auto.on ? 'vl-warn' : undefined}>{auto.reason ?? '暂时没有推荐值'}{auto.on ? '。有推荐值之前模拟盘不开仓，已有持仓按保存的参数平仓。' : '。'}</p>}
+      </> : <p className={auto.on ? 'vl-warn' : undefined}>{auto.reason ?? '暂时没有推荐值'}{auto.on ? '。有推荐值之前不开仓，已有持仓按开仓时的参数平仓。' : '。'}</p>}
     </div>
     <div className="vl-fields">
       {SYMBOL_FIELDS.map(field => { const taken = auto.on && recommended ? recommended[field.key as (typeof AUTO_FIELDS)[number]] : undefined; return <label className="vl-field" key={field.key}>{field.label}（{field.unit}）
@@ -134,16 +134,16 @@ function ParamsPanel({ data, view, onChanged }: { data: SymbolView; view: StateV
       onChange={event => set({ regimes: event.target.checked ? [...form.regimes, regime] : form.regimes.filter(item => item !== regime) })} />{REGIME_LABELS[regime]}</label>)}</div>
     <div className="vl-options"><b>方向</b>{ALL_DIRECTIONS.map(direction => <label key={direction}><input type="checkbox" checked={form.directions.includes(direction)}
       onChange={event => set({ directions: event.target.checked ? [...form.directions, direction] : form.directions.filter(item => item !== direction) })} />{directionLabel(direction, data.a.venue, data.b.venue)}</label>)}</div>
-    <div className="vl-options"><label><input type="checkbox" checked={form.enabled} disabled={!data.eligible && !form.enabled} onChange={event => set({ enabled: event.target.checked })} />模拟盘启用该标的</label>
+    <div className="vl-options"><label><input type="checkbox" checked={form.enabled} disabled={!data.eligible && !form.enabled} onChange={event => set({ enabled: event.target.checked })} />启用该标的的策略（实盘准备页勾选后才下真实订单）</label>
       {!data.eligible ? <span className="vl-warn">规格确认后才能启用</span> : null}</div>
     <div className="vl-actions">
       <label className="vl-field">回测范围<select value={btHours} onChange={event => setBtHours(Number(event.target.value))}>{BACKTEST_HOURS.map(value => <option key={value} value={value}>最近 {value / 24} 天</option>)}</select></label>
       <button type="button" className="button secondary" disabled={!parsed.ok || write.busy !== null} onClick={runBacktest}>{write.busy === 'backtest' ? <LoaderCircle size={14} className="spin" aria-hidden="true" /> : <Play size={14} aria-hidden="true" />}按表单参数回测</button>
-      <button type="button" className="button primary" disabled={!parsed.ok || saved || write.busy !== null} onClick={save}>{write.busy === 'save' ? <LoaderCircle size={14} className="spin" aria-hidden="true" /> : <Save size={14} aria-hidden="true" />}保存为模拟盘参数</button>
+      <button type="button" className="button primary" disabled={!parsed.ok || saved || write.busy !== null} onClick={save}>{write.busy === 'save' ? <LoaderCircle size={14} className="spin" aria-hidden="true" /> : <Save size={14} aria-hidden="true" />}保存为策略参数</button>
       {!parsed.ok ? <Callout tone="warning" role="status">{parsed.error}</Callout> : null}
       {write.message ? <Callout tone={write.message.tone}>{write.message.text}</Callout> : null}
     </div>
-    {result ? <BacktestResultView result={result} /> : <p className="vl-note">回测按时间重放已采集的盘口和询价，采用当前表单参数及模拟盘的风控与成本规则。</p>}
+    {result ? <BacktestResultView result={result} /> : <p className="vl-note">回测按时间重放已采集的盘口和询价，采用当前表单参数及策略的风控与成本规则。</p>}
   </section>;
 }
 
@@ -187,7 +187,7 @@ function PlanPanel({ data }: { data: SymbolView }) {
   </section>;
 }
 
-export function TradesPanel({ title, trades, empty }: { title: string; trades: readonly ClosedTrade[]; empty: string }) {
+export function TradesPanel({ title, trades, empty }: { title: string; trades: readonly LiveTradeView[]; empty: string }) {
   const shown = [...trades].reverse().slice(0, 100);
   return <section className="panel" aria-label={title}>
     <div className="panel-heading"><h2>{title}</h2><span className="muted">{trades.length > shown.length ? `最近 ${shown.length} / ${trades.length} 笔` : `${trades.length} 笔`}</span></div>
@@ -195,7 +195,7 @@ export function TradesPanel({ title, trades, empty }: { title: string; trades: r
   </section>;
 }
 
-export function TradeTable({ trades }: { trades: readonly ClosedTrade[] }) {
+export function TradeTable({ trades }: { trades: readonly LiveTradeView[] }) {
   return <div className="vl-table"><table>
     <thead><tr><th>平仓时间</th><th>标的 · 方向</th><th className="num">名义</th><th className="num">入场 / 出场价差</th><th className="num">入场基线</th><th className="num">持有</th><th>原因</th><th className="num">毛 / 成本</th><th className="num">净</th></tr></thead>
     <tbody>{trades.map(trade => <tr key={trade.id}>
@@ -206,7 +206,7 @@ export function TradeTable({ trades }: { trades: readonly ClosedTrade[] }) {
         {trade.entryVarSource || trade.exitVarSource ? <small>Var {trade.entryVarSource ? VAR_QUOTE_LABELS[trade.entryVarSource] : '未记录'} / {trade.exitVarSource ? VAR_QUOTE_LABELS[trade.exitVarSource] : '未记录'}</small> : null}</td>
       <td className="num">{bps(trade.entryBaseline)}<small>{REGIME_LABELS[trade.entryRegime]}</small></td>
       <td className="num">{duration(trade.closedAt - trade.openedAt)}</td>
-      <td>{REASON_LABELS[trade.reason] ?? trade.reason}</td>
+      <td>{reasonLabel(trade.reason)}</td>
       <td className="num">{signedUsd(trade.grossUsd)}<small>{usd(trade.costUsd)}</small></td>
       <td className={`num vl-${tone(trade.netUsd) || 'dim'}`}>{signedUsd(trade.netUsd)}<small>{bps(trade.netBps)} 基点</small></td>
     </tr>)}</tbody></table></div>;

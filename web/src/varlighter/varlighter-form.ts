@@ -11,7 +11,7 @@ export const VARLIGHTER_BASE = '/api/varlighter';
 export const VAR_QUOTE_LABELS: Record<VarPriceSource, string> = { token: '按量询价', '0': '公开一档', '1k': '公开 1 千美元档', '100k': '公开 10 万美元档' };
 export type { VarLighterTab };
 export const VARLIGHTER_TABS: readonly { id: VarLighterTab; label: string }[] = [
-  { id: 'overview', label: '价差总览' }, { id: 'detail', label: '标的详情' }, { id: 'paper', label: '模拟盘' }, { id: 'accounts', label: '账户资产' }, { id: 'ready', label: '实盘准备' },
+  { id: 'overview', label: '价差总览' }, { id: 'detail', label: '标的详情' }, { id: 'accounts', label: '账户资产' }, { id: 'ready', label: '实盘准备' },
 ];
 /** 详情页地址里的是配对键「场所:代码|场所:代码[@乘数]」：冒号、竖线与 @ 在地址片段里合法，保留原样便于阅读。 */
 export const varLighterHref = (tab: VarLighterTab, key?: string | null): string =>
@@ -53,7 +53,15 @@ export const directionLabel = (direction: Direction, a: VenueId | null, b: Venue
   a && b ? direction === 'a_rich' ? `卖 ${venueShort(a)} · 买 ${venueShort(b)}` : `买 ${venueShort(a)} · 卖 ${venueShort(b)}` : DIRECTION_LABELS[direction];
 /** 表格里的简写：B 腿总是反向，只写 A 一侧。 */
 export const directionShort = (direction: Direction, a: VenueId | null): string => `${direction === 'a_rich' ? '卖' : '买'} ${a ? venueShort(a) : 'A'}`;
-export const REASON_LABELS: Record<string, string> = { revert: '回归平仓', stop: '止损', timeout: '超时平仓', manual: '手动平仓' };
+export const REASON_LABELS: Record<string, string> = {
+  revert: '回归平仓', stop: '止损', timeout: '超时平仓', manual: '手动平仓', signal: '策略平仓', not_filled: '未开成', single_leg: '单腿', dismissed: '已人工处理',
+  // v0.112.0 以前的实盘持仓跟随的模拟持仓不在了时的平仓原因，只出现在旧记录里。
+  paper_gone: '模拟持仓不在了',
+};
+/** 平仓原因的中文名，不认识的照原样显示。 */
+export const reasonLabel = (reason: string | null | undefined): string => reason ? REASON_LABELS[reason] ?? reason : '—';
+/** 实盘持仓的阶段（总览与失联列表用）。 */
+export const LIVE_STATE_LABELS: Record<string, string> = { opening: '开仓中', open: '持有', closing: '平仓中', stuck: '待处理', closed: '已结束' };
 export const IDENTITY_LABELS: Record<string, string> = { verified: '已核对', review: '待确认', mismatch: '规格不同' };
 
 // ---- 读数 ----
@@ -177,9 +185,9 @@ export const GLOBAL_FIELDS: readonly NumberField<Exclude<keyof GlobalParams, 'pa
   { key: 'entropyFeeBps', label: 'Entropy 手续费', min: 0, max: 100, unit: '基点', optional: true, hint: '单边每次成交；默认 0.2（往返 0.4，含返佣估算）；留空按目录原始费率' },
   { key: 'maxQuoteAgeSec', label: '报价时效上限', min: 5, max: 600, integer: true, unit: '秒', hint: '收到时较慢一腿的报价已过去的时间，超过不开仓' },
   { key: 'minNetBps', label: '最低预期净利', min: 0, max: 500, unit: '基点', hint: '偏离 − 出场 − 半个往返成本 − 滑点与手续费，低于这个数不开仓' },
-  { key: 'maxOpenPositions', label: '最多持仓数', min: 1, max: 100, integer: true, unit: '笔' },
+  { key: 'maxOpenPositions', label: '最多持仓数', min: 1, max: 100, integer: true, unit: '笔', hint: '实盘持仓（含开仓中、平仓中）合计' },
   { key: 'maxTotalNotionalUsd', label: '名义合计上限', min: 10, max: 10_000_000, unit: '美元' },
-  { key: 'dailyLossLimitUsd', label: '当日亏损上限', min: 1, max: 10_000_000, unit: '美元', hint: '按 UTC 日计' },
+  { key: 'dailyLossLimitUsd', label: '当日亏损上限', min: 1, max: 10_000_000, unit: '美元', hint: '按 UTC 日计实盘已平仓净盈亏' },
 ];
 
 export type SymbolForm = { enabled: boolean; regimes: Regime[]; directions: Direction[] } & Record<(typeof SYMBOL_FIELDS)[number]['key'], string>;

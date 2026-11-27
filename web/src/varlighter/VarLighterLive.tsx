@@ -9,7 +9,7 @@ import { useLiveResource } from '../use-live-resource.ts';
 import type { LiveLimits, LivePosition, LiveState } from '../../../src/varlighter/live.ts';
 import type { EntropyCostView, LiveView } from '../../../src/varlighter/views.ts';
 import { Badge, Metric, stampText, useWrite } from './parts.tsx';
-import { VARLIGHTER_BASE, age, directionLabel, duration, pairLabel, percent, plain, price, rebateAudit, signedUsd, tone, usd, varLighterHref, venueShort } from './varlighter-form.ts';
+import { VARLIGHTER_BASE, age, directionLabel, duration, pairLabel, percent, plain, price, reasonLabel, rebateAudit, signedUsd, tone, usd, varLighterHref, venueShort } from './varlighter-form.ts';
 
 const LIVE_PATH = `${VARLIGHTER_BASE}/live`;
 type KeyVenue = 'lighter' | 'rh' | 'entropy';
@@ -25,8 +25,8 @@ const KEY_VENUES = ['lighter', 'rh', 'entropy'] as const;
 const STATE_TEXT: Record<LiveState, string> = { opening: '开仓中', open: '持仓中', closing: '平仓中', stuck: '需要人工处理', closed: '已结束' };
 const STATE_TONE: Record<LiveState, 'ok' | 'warn' | 'bad' | 'info' | ''> = { opening: 'info', open: 'ok', closing: 'info', stuck: 'bad', closed: '' };
 const LIMIT_FIELDS: { key: keyof LiveLimits; label: string; hint: string }[] = [
-  { key: 'perTradeUsd', label: '单笔名义（美元）', hint: '实盘每笔取它与模拟盘名义中较小的一个' },
-  { key: 'maxOpen', label: '同时持仓（笔）', hint: '到上限后不再跟新的开仓' },
+  { key: 'perTradeUsd', label: '单笔名义（美元）', hint: '每笔取它与配对参数里名义金额中较小的一个' },
+  { key: 'maxOpen', label: '同时持仓（笔）', hint: '到上限后不再开新仓' },
   { key: 'dailyLossUsd', label: '当日亏损上限（美元）', hint: 'UTC 日内已实现亏损到这个数就不再开仓' },
   { key: 'slippageBps', label: '限价保护（基点）', hint: '两腿开仓 IOC 限价离预期价最多这么远' },
 ];
@@ -103,35 +103,35 @@ function SwitchPanel({ view, onChanged }: { view: LiveView; onChanged: () => Pro
     const confirmedLimits = parsed.value;
     const samePairs = (a: readonly string[], b: readonly string[]) => JSON.stringify([...a].sort()) === JSON.stringify([...b].sort());
     const lines = confirmedPairs.map(key => `${pairLabel(key).symbol}（${pairLabel(key).short}）`).join('、');
-    if (!await dialog.confirm(`打开实盘？打开后，下列配对的模拟盘每次开仓，都会在两个交易所下真实订单：${lines}。单笔不超过 ${limits.perTradeUsd} 美元，同时不超过 ${limits.maxOpen} 笔。`, { title: '确认打开实盘', confirmLabel: '确认打开', tone: 'danger' })) return;
+    if (!await dialog.confirm(`打开实盘？打开后，下列配对的策略每次发出开仓信号，都会在两个交易所下真实订单（配对还要在总览启用）：${lines}。单笔不超过 ${limits.perTradeUsd} 美元，同时不超过 ${limits.maxOpen} 笔。`, { title: '确认打开实盘', confirmLabel: '确认打开', tone: 'danger' })) return;
     if (!dialog.isAlive() || writeBusyRef.current !== null || savedOnRef.current) return;
     const latestPairs = pairsRef.current, latestParsed = parsedRef.current;
     if (!latestParsed.ok || !samePairs(latestPairs, confirmedPairs) || JSON.stringify(latestParsed.value) !== JSON.stringify(confirmedLimits)) {
       void dialog.alert('实盘配对或限额在确认期间已更新，已取消打开，请核对后再试', { title: '配置已变更', tone: 'warning' });
       return;
     }
-    send({ on: true, pairs: confirmedPairs, limits: confirmedLimits }, '实盘已打开：跟随模拟盘信号下真实订单');
+    send({ on: true, pairs: confirmedPairs, limits: confirmedLimits }, '实盘已打开：按策略信号下真实订单');
   };
   return <section className="panel" aria-label="实盘开关">
-    <div className="panel-heading"><h2>实盘</h2><span className="muted">跟随模拟盘：模拟盘在勾选的配对上开仓、平仓时，两个交易所同步下真实订单 · <a href={varLighterHref('accounts')}>查看各场所账户资产与成交 →</a></span></div>
+    <div className="panel-heading"><h2>实盘</h2><span className="muted">按策略信号：勾选且在总览启用的配对，价差到开仓线时在两个交易所下真实订单，回归、止损或超时时平仓 · <a href={varLighterHref('accounts')}>查看各场所账户资产与成交 →</a></span></div>
     <div className="vl-actions vl-pause">
       {saved.on ? view.halt ? <Badge tone="bad">已停止</Badge> : <Badge tone="ok">实盘运行中</Badge> : <Badge tone="warn">实盘关闭</Badge>}
       {saved.on
-        ? <button type="button" className="button secondary" disabled={write.busy !== null} onClick={() => send({ on: false }, '实盘已关闭：不再开新仓，已有实盘持仓仍会跟随模拟盘平仓')}>关闭实盘</button>
+        ? <button type="button" className="button secondary" disabled={write.busy !== null} onClick={() => send({ on: false }, '实盘已关闭：不再开新仓，已有实盘持仓仍按策略平仓')}>关闭实盘</button>
         : <button type="button" className="button primary" disabled={write.busy !== null || !parsed.ok || !pairs.length} onClick={() => void turnOn()}><Play size={14} aria-hidden="true" />打开实盘</button>}
-      <span className="muted">{saved.on ? '关闭只停开新仓，已有实盘持仓照常跟随平仓' : pairs.length ? '打开前先确认两边账户有足够保证金' : '先在下面勾选实盘配对'}</span>
+      <span className="muted">{saved.on ? '关闭只停开新仓，已有实盘持仓照常按策略平仓' : pairs.length ? '打开前先确认两边账户有足够保证金' : '先在下面勾选实盘配对'}</span>
     </div>
     <section className="vl-metrics" aria-label="实盘汇总">
       <Metric label="实盘累计净盈亏" value={signedUsd(view.totals.netUsd)} tone={tone(view.totals.netUsd)} foot={`${view.totals.trades} 笔，胜率 ${view.totals.trades ? percent(view.totals.wins / view.totals.trades) : '—'}`} />
       <Metric label="今日（UTC）" value={signedUsd(view.todayNetUsd)} tone={tone(view.todayNetUsd)} foot={`亏损上限 ${usd(saved.limits.dailyLossUsd, 0)}`} />
       <Metric label="实盘持仓" value={`${view.positions.length} / ${saved.limits.maxOpen} 笔`} foot={`单笔 ≤ ${usd(saved.limits.perTradeUsd, 0)}`} />
     </section>
-    {view.lastSkip ? <p className="vl-note">最近一次没有跟单：{stampText(view.lastSkip.at)} {pairLabel(view.lastSkip.symbol).symbol}（{pairLabel(view.lastSkip.symbol).short}），{view.lastSkip.reason}</p> : null}
+    {view.lastSkip ? <p className="vl-note">最近一次没有开仓：{stampText(view.lastSkip.at)} {pairLabel(view.lastSkip.symbol).symbol}（{pairLabel(view.lastSkip.symbol).short}），{view.lastSkip.reason}</p> : null}
     <h3 className="vl-live-sub">实盘配对</h3>
     {view.candidates.length ? <ul className="vl-combos">{view.candidates.map(item => { const lack = missing(item.key), paused = view.paused[item.key]; return <li key={item.key}>
       <label><input type="checkbox" checked={pairs.includes(item.key)} disabled={write.busy !== null} onChange={event => setPairs(list => event.target.checked ? [...list, item.key] : list.filter(key => key !== item.key))} />
         <a className="vl-symbol" href={varLighterHref('detail', item.key)}>{item.symbol}</a> {venueShort(item.a.venue)}↔{venueShort(item.b.venue)}</label>
-      <span className="muted">{paused ? `已暂停：${paused}` : lack.length ? `缺凭据：${lack.map(venue => view.venueNames[venue]).join('、')}` : item.paper ? '模拟盘已启用' : '模拟盘未启用，不会有信号'}</span>
+      <span className="muted">{paused ? `已暂停：${paused}` : lack.length ? `缺凭据：${lack.map(venue => view.venueNames[venue]).join('、')}` : item.enabled ? '策略已启用' : '策略未启用（总览勾选），不会开仓'}</span>
     </li>; })}</ul> : <TableEmpty>没有两腿都能下单的配对。实盘只做 Lighter 主网、Lighter RH、Entropy 之间的配对，带 Var 腿的不上实盘；在下面「自动配对」里开启这些场所的组合。</TableEmpty>}
     {gone.length ? <p className="vl-note err">已勾选但目录里已经没有的配对：{gone.join('、')} <button type="button" className="button secondary" onClick={() => setPairs(list => list.filter(key => known.has(key)))}>去掉</button></p> : null}
     <h3 className="vl-live-sub">限额</h3>
@@ -238,7 +238,7 @@ function PositionsPanel({ view, onChanged }: { view: LiveView; onChanged: () => 
         <td className="wrap">{position.note || '—'}</td>
         <td>{position.state === 'open' ? <button type="button" className="button secondary" disabled={write.busy !== null} onClick={() => void close(position)}>{write.busy === `close:${position.id}` ? <LoaderCircle size={14} className="spin" aria-hidden="true" /> : <X size={14} aria-hidden="true" />}平仓</button>
           : position.state === 'stuck' ? <button type="button" className="button secondary" disabled={write.busy !== null} onClick={() => dismiss(position)}>已人工处理</button> : null}</td>
-      </tr>; })}</tbody></table></div> : <TableEmpty>{view.settings.on ? '没有实盘持仓，等待模拟盘在勾选的配对上开仓' : '实盘关闭，没有实盘持仓'}</TableEmpty>}
+      </tr>; })}</tbody></table></div> : <TableEmpty>{view.settings.on ? '没有实盘持仓，等待勾选的配对出现开仓信号' : '实盘关闭，没有实盘持仓'}</TableEmpty>}
   </section>;
 }
 
@@ -254,7 +254,7 @@ function TradesPanel({ view }: { view: LiveView }) {
           <td className="num">{price(avg(trade.a.entryQuote, trade.a.qty))} / {price(avg(trade.a.exitQuote, trade.a.exitQty))}<small>{price(trade.a.qty)}</small></td>
           <td className="num">{price(avg(trade.b.entryQuote, trade.b.qty))} / {price(avg(trade.b.exitQuote, trade.b.exitQty))}<small>{price(trade.b.qty)}</small></td>
           <td className={`num vl-${tone(trade.netUsd) || 'dim'}`}>{signedUsd(trade.netUsd)}{trade.a.estimated || trade.b.estimated ? <small>含估算价</small> : null}</td>
-          <td className="wrap">{trade.closeReason ?? '—'}{trade.note ? <small>{trade.note}</small> : null}</td>
+          <td className="wrap">{reasonLabel(trade.closeReason)}{trade.note ? <small>{trade.note}</small> : null}</td>
         </tr>; })}</tbody></table></div> : <TableEmpty>还没有实盘成交</TableEmpty>}
     </section>
     <section className="panel" aria-label="实盘事件">

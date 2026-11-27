@@ -194,7 +194,7 @@ test('实盘凭据：文件读不懂时不使用、说明原因，录入与移�
   assert.deepEqual(createLiveKeysStore(path.join(odd, 'x')).read(), { keys: {}, problem: null }, '数据目录不可用时读不到凭据，不抛错');
 });
 
-test('实盘接口：场所有实盘持仓时只能给同一个账户换密钥，换账户与移除都 409 且不改文件；模拟盘视图不含实盘事件', t => {
+test('实盘接口：场所有实盘持仓时只能给同一个账户换密钥，换账户与移除都 409 且不改文件；只读令牌能读的视图不含实盘事件', t => {
   const dir = mkdtempSync(path.join(tmpdir(), 'dex-livekeys-e-'));
   const keys = createLiveKeysStore(dir), store = openVarLighterStore(path.join(dir, 'varlighter.sqlite'));
   t.after(() => { store.close(); rmSync(dir, { recursive: true, force: true }); });
@@ -202,13 +202,12 @@ test('实盘接口：场所有实盘持仓时只能给同一个账户换密钥�
   keys.set('entropy', entropy());
   // 库里已有一笔 Lighter 对 Entropy 的实盘持仓。
   const leg = (venue: 'lighter' | 'entropy', side: 'buy' | 'sell') => ({ venue, symbol: venue === 'entropy' ? 'io:NVDA' : 'NVDA', side, qty: 1, entryQuote: 100, exitQty: 0, exitQuote: 0, feesUsd: 0, estimated: false });
-  const held: LivePosition = { id: 'l-1', symbol: 'lighter:NVDA|entropy:NVDA', paperId: 'p1', direction: 'a_rich', ratio: 1, state: 'open', step: 'settle', openedAt: 1, updatedAt: 1, closedAt: null,
+  const held: LivePosition = { id: 'l-1', symbol: 'lighter:NVDA|entropy:NVDA', direction: 'a_rich', ratio: 1, state: 'open', step: 'settle', openedAt: 1, updatedAt: 1, closedAt: null,
     a: leg('lighter', 'sell'), b: leg('entropy', 'buy'), plan: { qty: 1, limit: 100 }, pending: null, tries: 0, retryAt: 0, closeReason: null, singleLeg: false, netUsd: null, note: '' };
   store.saveLive(held);
   store.event(1, 'live', null, '实盘开仓：测试');
-  store.event(2, 'paper', null, '模拟开仓：测试');
   const silent = (): SocketLike => { const s: SocketLike = { readyState: 0, onopen: null, onmessage: null, onclose: null, onerror: null, send() {}, close() { s.readyState = 3; } }; return s; };
-  const engine = createVarLighterEngine({ takerDelayMs: 0, store, connect: silent, now: () => 10_000, liveKeys: keys, signerProblem: () => null,
+  const engine = createVarLighterEngine({ store, connect: silent, now: () => 10_000, liveKeys: keys, signerProblem: () => null,
     fetchImpl: async () => new Response('{}', { status: 500 }), traders: () => { throw new Error('不该下单'); } });
   const status = (work: () => unknown): number | null => { try { work(); } catch (error) { assert.ok(error instanceof VarLighterError, String(error)); noSecret(error.message, 'error'); return error.status; } return null; };
   const file = path.join(dir, LIVE_KEYS_FILE), before = readFileSync(file, 'utf8');
@@ -223,9 +222,10 @@ test('实盘接口：场所有实盘持仓时只能给同一个账户换密钥�
   // 没有持仓的场所随便换。
   assert.equal(status(() => engine.views.liveKeys({ venue: 'rh', ...lighter({ accountIndex: RH_ACCOUNT, privateKey: RH_KEY }) })), null);
   assert.equal(status(() => engine.views.liveKeys({ venue: 'rh', ...lighter({ accountIndex: RH_ACCOUNT + 1, privateKey: RH_KEY }) })), null);
-  // 只读令牌能读的模拟盘视图里没有实盘事件；实盘视图里有。
-  const paperEvents = engine.views.paper().events.map(item => item.kind);
-  assert.ok(paperEvents.includes('paper') && !paperEvents.includes('live'), JSON.stringify(paperEvents));
+  // 只读令牌能读的总览里有持仓摘要、没有实盘事件；实盘视图里有。
+  const overview = JSON.stringify(engine.views.state());
+  assert.ok(!overview.includes('实盘开仓：测试'), '总览不带实盘事件');
+  assert.equal(engine.views.state().trading.open, 1);
   assert.ok(engine.views.live().events.some(item => item.message === '实盘开仓：测试'));
   noSecret(JSON.stringify(engine.views.live()), 'live view');
 });

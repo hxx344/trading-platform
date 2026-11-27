@@ -329,11 +329,10 @@ export const READ_TOKEN_ROUTES: readonly { path: string | RegExp; scope: ReadSco
   { path: '/api/crossex/state', scope: 'portfolio', query: ['opportunities'] },
   { path: '/api/ondo/state', scope: 'portfolio', query: [] },
   { path: '/api/update', scope: 'system', query: [] },
-  // docs/mcp.md 8.3: Var/Lighter (public market data and the paper strategy, local database only), the server's own load,
+  // docs/mcp.md 8.3: Var/Lighter (public market data and the strategy state, local database only), the server's own load,
   // the monitors' quote snapshots and the EQN feed. None asks an exchange; Var/Lighter's POSTs (backtest included) stay out.
   { path: '/api/varlighter/state', scope: 'portfolio', query: [] },
   { path: '/api/varlighter/symbol', scope: 'portfolio', query: ['symbol', 'hours'] },
-  { path: '/api/varlighter/paper', scope: 'portfolio', query: [] },
   { path: '/api/varlighter/readiness', scope: 'portfolio', query: [] },
   { path: '/api/varlighter/samples', scope: 'portfolio', query: ['symbol', 'after', 'limit'] },
   { path: '/api/host', scope: 'system', query: [] },

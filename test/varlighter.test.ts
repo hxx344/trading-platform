@@ -20,7 +20,7 @@ import { backtestRequest, chartEquity, runBacktest } from '../src/varlighter/bac
 import { BOOK_KEEP_LEVELS, CONNECT_TIMEOUT_MS, DEPTH_MAX_GAP_MS, HyperliquidStream, LighterStream, depthAt, depthSnapshot, vwap, type SocketLike } from '../src/varlighter/feeds.ts';
 import { orderPlan } from '../src/varlighter/plan.ts';
 import { MIGRATED_KEY, openVarLighterStore } from '../src/varlighter/store.ts';
-import { COOLDOWN_KEY, ENTROPY_FEE_DEFAULT_MIGRATED_KEY, EXITS_KEY, LEGACY_UPGRADE, LIGHTER_TAKER_DELAY_MS, SETTINGS_KEY, createVarLighterEngine, customKey, downsample, readCustomPair, upgradeSettings } from '../src/varlighter/engine.ts';
+import { COOLDOWN_KEY, ENTROPY_FEE_DEFAULT_MIGRATED_KEY, LEGACY_UPGRADE, SETTINGS_KEY, createVarLighterEngine, customKey, downsample, readCustomPair, upgradeSettings } from '../src/varlighter/engine.ts';
 import { READ_TOKEN_MAX_BYTES } from '../src/read-token.ts';
 import { localDexForward, openVarLighter, varLighterLoop, varLighterViews } from '../src/dex/host.ts';
 import { createLiveKeysStore } from '../src/varlighter/livekeys.ts';
@@ -490,8 +490,9 @@ test('旧库迁移：持仓与成交换成两腿口径复制到新表，参数�
     const retried = openVarLighter(failDir, { connect: () => new FakeSocket() }, () => {});
     try {
       assert.equal(retried.error, null);
-      assert.deepEqual(retried.engine!.views.paper().positions.map(item => item.symbol), [RH_BTC], '下次启动重试成功');
     } finally { retried.engine?.close(); }
+    const check = openVarLighterStore(failFile);
+    try { assert.deepEqual(check.positions().map(item => item.symbol), [RH_BTC], '下次启动重试成功（旧持仓留在库里，页面不再显示）'); } finally { check.close(); }
   } finally { rmSync(failDir, { recursive: true, force: true }); }
 
   // 引擎启动时迁移：有旧持仓记一行日志；全新安装什么都不记。
@@ -501,7 +502,7 @@ test('旧库迁移：持仓与成交换成两腿口径复制到新表，参数�
     try {
       const migrated = lines.filter(line => line.includes('已升级为两腿口径'));
       assert.deepEqual(migrated, legacy ? ['varlighter: 已升级为两腿口径（持仓 1、成交 0）'] : []);
-      if (legacy) assert.deepEqual(context.engine.views.paper().positions.map(item => [item.symbol, item.direction, item.aEntry]), [[RH_BTC, 'a_rich', 100.3]]);
+      if (legacy) assert.deepEqual(context.store.positions().map(item => [item.symbol, item.direction, item.aEntry]), [[RH_BTC, 'a_rich', 100.3]]);
     } finally { context.dispose(); }
   }
 });
@@ -827,7 +828,7 @@ test('降采样：每格保留机会极值', () => {
   assert.deepEqual(segments.slice(0, 2).map(p => [p.sellA, p.gapBefore]), [[1001, false], [9, true]]);
 });
 
-test('引擎：各组合各自对齐样本写库，盘口快照，模拟盘开平仓与同腿互斥，关闭组合，参数版本冲突与清空确认', async () => {
+test('引擎：各组合各自对齐样本写库，盘口快照，Var 配对只采集不开仓，关闭组合，参数版本冲突', async () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'tp-varlighter-'));
   let clock = T0;
   const sockets = new Map<string, FakeSocket>();
@@ -848,7 +849,7 @@ test('引擎：各组合各自对齐样本写库，盘口快照，模拟盘开�
     ] });
   };
   const store = openVarLighterStore(path.join(dir, 'varlighter.sqlite'));
-  const engine = createVarLighterEngine({ takerDelayMs: 0, store, fetchImpl, connect: url => { const socket = new FakeSocket(); sockets.set(venueOf(url), socket); return socket; }, now: () => clock });
+  const engine = createVarLighterEngine({ store, fetchImpl, connect: url => { const socket = new FakeSocket(); sockets.set(venueOf(url), socket); return socket; }, now: () => clock });
   const rh = () => sockets.get('rh')!, main = () => sockets.get('lighter')!;
   const row = (key: string) => engine.views.state().rows.find(item => item.key === key);
   try {
@@ -878,7 +879,7 @@ test('引擎：各组合各自对齐样本写库，盘口快照，模拟盘开�
     main().push({ type: 'subscribed/order_book', channel: 'order_book:7', order_book: fullBook });
     // 新参数存在新键里；重开后读回。
     assert.equal(store.state<{ global: GlobalParams }>(SETTINGS_KEY)!.global.minNetBps, 5);
-    assert.equal(createVarLighterEngine({ takerDelayMs: 0, store, fetchImpl, connect: () => new FakeSocket(), now: () => clock }).views.state().settings.global.minNetBps, 5);
+    assert.equal(createVarLighterEngine({ store, fetchImpl, connect: () => new FakeSocket(), now: () => clock }).views.state().settings.global.minNetBps, 5);
     assert.throws(() => engine.views.settings({ revision: 0 }), (error: unknown) => (error as { status?: number }).status === 409);
     let tick = 0;
     /** 过一分钟：两个 Lighter 场所各推一条变化（真实行情每秒都有消息），再拉一次 Var。 */
@@ -904,53 +905,10 @@ test('引擎：各组合各自对齐样本写库，盘口快照，模拟盘开�
     assert.deepEqual(view.sources.venues.map(item => [item.venue, item.depth.map(depth => depth.key), item.pairs]), [['rh', ['rh:BTC'], 2], ['lighter', ['lighter:BTC'], 2], ['entropy', [], 0]]);
     assert.deepEqual(view.sources.venues.flatMap(item => item.depth.map(depth => [depth.key, depth.at, depth.error])), [['rh:BTC', clock, null], ['lighter:BTC', clock, null]]);
     assert.ok(!requested.some(url => url.includes('orderBookOrders')), '盘口不走 REST');
-    // 冲高：两个配对同时有信号，Var 的 BTC 腿只开一笔（RH 在前）。
+    // 冲高：Var 配对只采集与回测，不上实盘，也不留持仓或成交。
     varMid = 100.5; await minute();
-    assert.deepEqual(engine.views.paper().positions.map(item => [item.symbol, item.direction]), [[RH_BTC, 'a_rich']]);
-    assert.equal(engine.views.state().sources.var.poll?.blocked[BUSY_BLOCK], 1, '主网配对因同一腿已持仓不开');
-    assert.deepEqual(code(() => engine.views.settings({ revision: 1, combos: ['var|lighter'] })), [409, 'pair_busy']);
+    assert.deepEqual([engine.views.state().trading.open, row(RH_BTC)!.position], [0, null]);
     varMid = 100.2; await minute();
-    const paper = engine.views.paper();
-    assert.equal(paper.positions.length, 0);
-    assert.equal(paper.trades.length, 1);
-    assert.equal(paper.trades[0].reason, 'revert');
-    assert.ok(paper.trades[0].netUsd > 0);
-    assert.ok(paper.events.some(event => event.kind === 'open') && paper.events.some(event => event.kind === 'close'));
-    // Var 再次冲高，但拿到报价时两个场所的一档都已跟到 100.3：报价时刻有信号，复核后不开仓；样本记下了那一刻的一档。
-    /** lag：推完行情后再过这么久才拉 Var（超过 5 秒就取不到判断时刻的一档）。 */
-    const chase = async (mid: number, top: number, lag = 0) => {
-      clock += 60_000; tick++; varMid = mid;
-      const stats = (id: number) => ({ market_id: id, best_bid_price: (top - 0.01).toFixed(2), best_ask_price: (top + 0.01).toFixed(2), mark_price: String(100 + tick * 0.0001) });
-      rh().push({ type: 'update/market_stats', channel: 'market_stats:all', market_stats: { 1: stats(1) } });
-      main().push({ type: 'update/market_stats', channel: 'market_stats:all', market_stats: { 7: stats(7), 8: { market_id: 8, mark_price: String(10 + tick * 0.0001) } } });
-      clock += lag;
-      await engine.pollVar(signal);
-    };
-    await chase(100.5, 100.3);
-    const chased = store.latest(RH_BTC)!;
-    assert.deepEqual([chased.bBid0, chased.bAsk0, chased.bBidRx, chased.bAskRx], [99.99, 100.01, 100.29, 100.31]);
-    assert.ok(spreadOf(chased, '1k')!.sellA - 20 >= 15, '报价时刻的样本本身达到入场偏离');
-    assert.equal(engine.views.paper().positions.length, 0);
-    assert.equal(engine.views.state().sources.var.poll?.blocked[DECAYED], 2, '两个配对各记一次');
-    await chase(100.2, 100);
-    assert.equal(engine.views.paper().positions.length, 0);
-    assert.equal(engine.views.paper().trades.length, 1);
-    // 行情流 6 秒没有消息：报价时刻有信号，但取不到判断时刻的一档，不开仓。
-    await chase(100.5, 100, 6_000);
-    assert.equal(store.latest(RH_BTC)!.bBidRx, null);
-    assert.equal(engine.views.paper().positions.length, 0);
-    assert.deepEqual([engine.views.state().sources.var.poll?.noLive, engine.views.state().sources.var.poll?.blocked[NO_LIVE_TOP]], [3, 2]);
-    await chase(100.2, 100);
-    // 拿到报价时对手只涨了 4 分：信号还在，按那一刻的卖一 100.05 买入；平仓、浮盈同样按判断时刻的买一。
-    await chase(100.5, 100.04);
-    const held = engine.views.paper().positions;
-    assert.deepEqual(held.map(item => [item.symbol, item.bEntry]), [[RH_BTC, 100.05]]);
-    assert.ok(Math.abs(row(RH_BTC)!.position!.pnlBps! - (held[0].entrySpread - (100.52 - 100.03) / 100.04 * 1e4)) < 1e-6, '浮盈按判断时刻的一档');
-    await chase(100.2, 100.04);
-    assert.deepEqual(engine.views.paper().trades.map(item => [item.reason, item.bEntry, item.bExit]).slice(0, 1), [['revert', 100.05, 100.03]]);
-    await chase(100.2, 100);
-    assert.equal(engine.views.paper().positions.length, 0);
-    assert.equal(engine.views.paper().trades.length, 2);
     // 同一报价时刻不重复计入。
     const before = row(RH_BTC)!.samples24h;
     await engine.pollVar(signal);
@@ -960,7 +918,7 @@ test('引擎：各组合各自对齐样本写库，盘口快照，模拟盘开�
     assert.equal(detail.venueName, 'Lighter RH');
     assert.deepEqual(detail.stats.map(item => item.regime), ['all']);
     assert.equal(detail.plans.length, 2);
-    assert.equal(detail.trades.length, 2);
+    assert.equal(detail.trades.length, 0);
     assert.equal(engine.views.symbol('rh:BTC', '24').key, RH_BTC, '旧键照样能看');
     assert.throws(() => engine.views.symbol('BTC', '24'), /不是当前采集中的配对/);
     const bt = await engine.views.backtest({ symbol: 'rh:BTC', hours: 1 });
@@ -976,11 +934,6 @@ test('引擎：各组合各自对齐样本写库，盘口快照，模拟盘开�
     view = engine.views.state();
     assert.deepEqual(view.rows.map(item => item.key), [RH_BTC, 'var:OPENAI|rh:OPENAI']);
     assert.deepEqual(view.sources.venues.map(item => [item.venue, item.enabled, item.stream === null]), [['rh', true, false], ['lighter', false, true], ['entropy', false, true]]);
-    assert.throws(() => engine.views.reset({ confirm: 'yes' }), /RESET/);
-    engine.views.reset({ confirm: 'RESET' });
-    assert.equal(engine.views.paper().trades.length, 0);
-    view = engine.views.state();
-    assert.equal(view.paper.trades, 0);
   } finally { engine.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -1135,8 +1088,9 @@ function seededEngine(seed: (store: SeedStore) => void, options: { fetchImpl?: (
     return Response.json({ listings: [{ ticker: 'BTC', name: 'Bitcoin', mark_price: '100.2', quotes: { updated_at: new Date(now() - 2_000).toISOString(), base: { bid: '100.19', ask: '100.21' } } }] });
   });
   const sockets: FakeSocket[] = [];
-  const engine = createVarLighterEngine({ takerDelayMs: 0, store: openVarLighterStore(file), fetchImpl, connect: () => { const socket = new FakeSocket(); sockets.push(socket); return socket; }, now, log: options.log });
-  return { dir, file, engine, sockets, dispose(keep = false) { engine.close(); if (!keep) rmSync(dir, { recursive: true, force: true }); } };
+  const store = openVarLighterStore(file);
+  const engine = createVarLighterEngine({ store, fetchImpl, connect: () => { const socket = new FakeSocket(); sockets.push(socket); return socket; }, now, log: options.log });
+  return { dir, file, store, engine, sockets, dispose(keep = false) { engine.close(); if (!keep) rmSync(dir, { recursive: true, force: true }); } };
 }
 
 test('详情滑窗经过已落盘的未来报价时及时更新走势', async () => {
@@ -1155,76 +1109,37 @@ test('详情滑窗经过已落盘的未来报价时及时更新走势', async ()
 
 const RH_SNAPSHOT = { type: 'subscribed/market_stats', channel: 'market_stats:all', market_stats: { 1: { market_id: 1, best_bid_price: '99.99', best_ask_price: '100.01', mark_price: '100' } } };
 
-test('失联配对：总览列出，可停用，持仓按最后样本平仓并记明；手动平仓的错误码；冷却重启后仍在', async () => {
+test('失联配对：总览列出，可停用；保存的配对键有上限', async () => {
   const GONE = 'var:GONE|rh:GONE';
-  const { dir, file, engine, sockets, dispose } = seededEngine(store => {
+  const { engine, sockets, dispose } = seededEngine(store => {
     store.setState(SETTINGS_KEY, settings2({ [RH_BTC]: { ...DEFAULT_SYMBOL, enabled: true }, [GONE]: { ...DEFAULT_SYMBOL, enabled: true, cooldownMinutes: 120 } }), T0);
-    store.addSamples([sample(T0 - 30 * 60_000, 100.1, 100, { symbol: GONE, aBidTk: 91, aAskTk: 92, aTkQty: 1, aTkAt: T0 - 30 * 60_000 + 100, aTkReceivedAt: T0 - 30 * 60_000 + 500 }), sample(T0 - 20 * 60_000, 100.1, 100, { symbol: RH_BTC })]);
+    store.addSamples([sample(T0 - 30 * 60_000, 100.1, 100, { symbol: GONE }), sample(T0 - 20 * 60_000, 100.1, 100, { symbol: RH_BTC })]);
+    // v0.111.1 以前的模拟持仓留在库里，不再显示，也不让配对算作有持仓。
     store.savePosition(position(GONE));
-    store.savePosition(position(RH_BTC));
   });
   try {
     assert.deepEqual(engine.views.state().orphans, [], '目录与 Var 报价还没取到时不判断');
-    assert.throws(() => engine.views.close({ symbol: GONE }), (error: unknown) => (error as { status?: number }).status === 409, '启动期不按旧样本结算');
     engine.startStreams();
     sockets[0].open();
     sockets[0].push(RH_SNAPSHOT);
     await engine.refreshCatalog(AbortSignal.timeout(1000), 'rh');
     await engine.pollVar(AbortSignal.timeout(1000));
-    const [orphan] = engine.views.state().orphans;
-    assert.deepEqual({ ...orphan, position: { ...orphan.position!, pnlBps: null } }, {
+    assert.deepEqual(engine.views.state().orphans, [{
       key: GONE, a: { venue: 'var', symbol: 'GONE', name: 'Var' }, b: { venue: 'rh', symbol: 'GONE', name: 'Lighter RH' }, venue: 'rh', venueName: 'Lighter RH', symbol: 'GONE',
-      reason: '配对已不在目录里（或组合已关闭、手动配对已删除）', enabled: true, lastSampleAt: T0 - 30 * 60_000,
-      position: { direction: 'a_rich', openedAt: T0 - 3_600_000, pnlBps: null, estimated: false } });
-    assert.equal(typeof orphan.position!.pnlBps, 'number');
+      reason: '配对已不在目录里（或组合已关闭、手动配对已删除）', enabled: true, lastSampleAt: T0 - 30 * 60_000, position: null }]);
     assert.equal(engine.views.state().rows.find(row => row.key === RH_BTC)?.samples24h, 1, '近 24 小时计数含启动前的样本');
-
-    assert.deepEqual(code(() => engine.views.close({ symbol: 'rh:ETH' })), [404, 'not_found']);
-    assert.deepEqual(code(() => engine.views.close({ symbol: 'BTC' })), [400, 'invalid_symbol']);
-    assert.deepEqual(code(() => engine.views.close({ symbol: RH_BTC, extra: 1 })), [400, 'invalid_body']);
-    assert.deepEqual(code(() => engine.views.close({ symbol: 'rh:BTC' })), [409, 'no_quote'], '还在目录里的配对要 10 分钟内的报价（旧键照样认）');
-    const mark = engine.views.paper().positions.find(item => item.symbol === GONE)!.mark!;
-    const trade = engine.views.close({ symbol: GONE });
-    assert.deepEqual([mark.varSource, trade.exitVarSource, trade.aExit, trade.netUsd], ['1k', '1k', 100.1 + 0.02, mark.netUsd], '失联仓最后样本的小数量询价不能用于该仓，估值与手动结算一致；市值 1001 美元仍按名义金额的 1k 档');
-    assert.equal(trade.closedAt, T0 - 30 * 60_000, '失联配对按最后样本结算');
-    assert.match(engine.views.paper().events[0].message, /配对已不在目录里.*按最后样本/);
     const disabled = engine.views.settings({ revision: 3, symbols: { [GONE]: { ...DEFAULT_SYMBOL, enabled: false } } });
     assert.equal(disabled.symbols[GONE].enabled, false);
-    assert.deepEqual(engine.views.state().orphans, [], '停用并平仓后不再列出');
+    assert.deepEqual(engine.views.state().orphans, [], '停用后不再列出');
 
     let revision = disabled.revision;
     for (let batch = 0; batch < 2; batch++) revision = engine.views.settings({ revision, symbols: Object.fromEntries(Array.from({ length: 200 }, (_, index) => [`rh:K${batch}X${index}`, { ...DEFAULT_SYMBOL }])) }).revision;
     assert.deepEqual(code(() => engine.views.settings({ revision, symbols: Object.fromEntries(Array.from({ length: 200 }, (_, index) => [`rh:K9X${index}`, { ...DEFAULT_SYMBOL }])) })), [400, 'too_many'], '保存的配对键有上限');
     assert.deepEqual(code(() => engine.views.settings({ revision, symbols: { 'not a key': { ...DEFAULT_SYMBOL } } })), [400, 'invalid_symbol']);
-  } finally { dispose(true); }
-  const reopened = openVarLighterStore(file);
-  try { assert.equal(reopened.state<Record<string, number>>(COOLDOWN_KEY)?.[GONE], T0 - 30 * 60_000 + 120 * 60_000, '冷却写进库，重启后仍在'); } finally { reopened.close(); rmSync(dir, { recursive: true, force: true }); }
+  } finally { dispose(); }
 });
 
-test('总览与失联持仓的浮盈共用模拟盘估值，开仓估算、盘口估算和无估值各自保留', async () => {
-  const gone = 'var:GONE|rh:GONE';
-  for (const [entryEstimated, missingTop, hasSample, expected] of [[true, false, true, true], [false, true, true, true], [false, false, true, false], [true, false, false, null]] as const) {
-    const fixture = seededEngine(store => {
-      for (const symbol of [RH_BTC, gone]) {
-        store.savePosition(position(symbol, { estimated: entryEstimated }));
-        if (hasSample) store.addSamples([sample(T0 - 60_000, 100.1, 100, { symbol, ...(missingTop && { bBidRx: null, bAskRx: null }) })]);
-      }
-    });
-    try {
-      const { engine, sockets } = fixture;
-      engine.startStreams(); sockets[0].open(); sockets[0].push(RH_SNAPSHOT);
-      const signal = new AbortController().signal;
-      await engine.refreshCatalog(signal, 'rh'); await engine.pollVar(signal);
-      const view = engine.views.state(), paper = engine.views.paper();
-      for (const row of [view.rows.find(item => item.key === RH_BTC)!, view.orphans.find(item => item.key === gone)!]) {
-        const mark = paper.positions.find(item => item.symbol === row.key)!.mark;
-        assert.deepEqual([row.position!.pnlBps, row.position!.estimated, mark?.estimated ?? null], [mark?.pnlBps ?? null, expected, expected]);
-      }
-    } finally { fixture.dispose(); }
-  }
-});
-
-test('失联判定：规格改判、数据源连续正常 30 分钟仍无样本才算；Var 失败、目录未取到、行情流断开、刚重启都不算，平仓等恢复；冷却重启后照样挡开仓', async () => {
+test('失联判定：规格改判、数据源连续正常 30 分钟仍无样本才算；Var 失败、目录未取到、行情流断开、刚重启都不算', async () => {
   const COOLDOWN_MIN = 600;
   let time = T0, varMark = '100.2', varFails = false, full = false;
   const fetchImpl = async (url: string) => {
@@ -1239,7 +1154,7 @@ test('失联判定：规格改判、数据源连续正常 30 分钟仍无样本�
   /** 启动一个引擎并连上行情流；advance 拨时钟并推一条消息（行情流按消息间隔判沉默）。 */
   const start = () => {
     const sockets: FakeSocket[] = [];
-    const engine = createVarLighterEngine({ takerDelayMs: 0, store: openVarLighterStore(file), fetchImpl, connect: () => { const socket = new FakeSocket(); sockets.push(socket); return socket; }, now: () => time });
+    const engine = createVarLighterEngine({ store: openVarLighterStore(file), fetchImpl, connect: () => { const socket = new FakeSocket(); sockets.push(socket); return socket; }, now: () => time });
     engines.push(engine);
     engine.startStreams();
     sockets[0].open();
@@ -1256,21 +1171,18 @@ test('失联判定：规格改判、数据源连续正常 30 分钟仍无样本�
     return { engine, socket: sockets[0], advance, run };
   };
   const poll = (engine: ReturnType<typeof createVarLighterEngine>) => engine.pollVar(AbortSignal.timeout(1000));
-  const status = (work: () => unknown) => { try { work(); } catch (error) { return (error as { status: number }).status; } return 200; };
   const reasons = (engine: ReturnType<typeof createVarLighterEngine>) => engine.views.state().orphans.map(row => row.reason);
   const NO_SAMPLE = '超过 30 分钟没有新样本（某腿无报价或盘口缺失）';
   try {
     const seed = openVarLighterStore(file);
     seed.setState(SETTINGS_KEY, settings2({ [RH_BTC]: { ...DEFAULT_SYMBOL, enabled: true, entryBps: 1, exitBps: 0, cooldownMinutes: COOLDOWN_MIN } }, { ...DEFAULT_GLOBAL, minSamples: 10, varFeeBps: 0, rhFeeBps: 0 }), T0);
     seed.addSamples(Array.from({ length: 12 }, (_, index) => sample(T0 - (75 - index * 5) * 60_000, 100.1)));
-    seed.savePosition(position(RH_BTC));
     seed.close();
 
     // 刚启动：库里最后样本 20 分钟前；Var 已拉到但场所目录未取到，也不算。
     const first = start();
     await poll(first.engine);
     assert.deepEqual(reasons(first.engine), [], '场所目录未取到不判断');
-    assert.equal(status(() => first.engine.views.close({ symbol: RH_BTC })), 409, '启动期不按旧样本结算');
     await first.engine.refreshCatalog(AbortSignal.timeout(1000), 'rh');
     await first.run(11);
     assert.deepEqual(reasons(first.engine), [], '最后样本 31 分钟前，但数据源正常才 11 分钟');
@@ -1278,14 +1190,12 @@ test('失联判定：规格改判、数据源连续正常 30 分钟仍无样本�
     assert.deepEqual(reasons(first.engine), [NO_SAMPLE], '数据源连续正常 31 分钟仍无样本：Var 有目录没报价');
     varFails = true; first.advance(4 * 60_000); await poll(first.engine);
     assert.deepEqual(reasons(first.engine), [], 'Var 拉取失败超过 3 分钟，整体故障不算单个配对失联');
-    assert.equal(status(() => first.engine.views.close({ symbol: RH_BTC })), 409, '数据源故障时不按旧样本结算');
     varFails = false; await poll(first.engine);
     assert.deepEqual(reasons(first.engine), [], 'Var 刚恢复，从恢复时刻重新计时');
     await first.run(31);
     assert.deepEqual(reasons(first.engine), [NO_SAMPLE], '恢复后 31 分钟仍无样本');
     first.socket.onclose?.({});
     assert.deepEqual(reasons(first.engine), [], '行情流断开不算');
-    assert.equal(status(() => first.engine.views.close({ symbol: RH_BTC })), 409);
     first.engine.close();
 
     // 停机很久后重启：第一轮 Var 报价早于行情流快照，没写入新样本，旧样本不算失联。
@@ -1295,32 +1205,15 @@ test('失联判定：规格改判、数据源连续正常 30 分钟仍无样本�
     await poll(restarted.engine);
     assert.deepEqual([restarted.engine.views.state().sources.var.poll?.written, restarted.engine.views.state().sources.var.poll?.noTop], [0, 1], '第一轮没有新样本：报价时刻行情流还没有快照');
     assert.deepEqual(reasons(restarted.engine), [], '重启后第一轮');
-    assert.equal(status(() => restarted.engine.views.close({ symbol: RH_BTC })), 409);
     restarted.engine.close();
 
-    // 规格改判：按最后样本平仓并注明原因。
+    // 规格改判：列出原因。
     varMark = '120';
     const mismatch = start();
     await mismatch.engine.refreshCatalog(AbortSignal.timeout(1000), 'rh');
     await poll(mismatch.engine);
     assert.deepEqual(reasons(mismatch.engine), ['两边价格相差超过 5%，已改判为规格不同']);
-    const trade = mismatch.engine.views.close({ symbol: RH_BTC });
-    assert.equal(trade.closedAt, T0 - 20 * 60_000);
-    assert.match(mismatch.engine.views.paper().events[0].message, /规格不同，按最后样本/);
     mismatch.engine.close();
-
-    // 冷却写库，重启后照样挡开仓；清空模拟盘（连冷却一起清）后同样的行情会开仓，作为对照。
-    varMark = '100.3'; full = true;
-    const third = start();
-    await third.engine.refreshCatalog(AbortSignal.timeout(1000), 'rh');
-    await third.run(3);
-    const row = third.engine.views.state().rows[0];
-    assert.equal(row.cooldownUntil, T0 - 20 * 60_000 + COOLDOWN_MIN * 60_000, '重启后读回冷却');
-    assert.ok(third.engine.views.state().sources.var.poll!.written > 0 && row.baseline !== null && (row.rich ?? 0) > row.entryBps, '有新样本且达到入场条件');
-    assert.equal(third.engine.views.paper().positions.length, 0, '冷却中不开仓');
-    third.engine.views.reset({ confirm: 'RESET' });
-    await third.run(1);
-    assert.equal(third.engine.views.paper().positions.length, 1, '对照：没有冷却就开仓');
   } finally {
     for (const engine of engines) { try { engine.close(); } catch { /* 已关闭 */ } }
     rmSync(dir, { recursive: true, force: true });
@@ -1395,12 +1288,11 @@ test('两腿行情流的配对：启用或有持仓的每 5 秒、其余每 20 �
   const dir = mkdtempSync(path.join(tmpdir(), 'tp-varlighter-'));
   const file = path.join(dir, 'varlighter.sqlite');
   const seed = openVarLighterStore(file);
-  seed.setState(SETTINGS_KEY, settings2({}, { ...DEFAULT_GLOBAL, entropyFeeBps: null }, ['lighter|entropy']), T0);
+  seed.setState(SETTINGS_KEY, settings2({ [LE_SNDK]: { ...DEFAULT_SYMBOL, enabled: true } }, { ...DEFAULT_GLOBAL, entropyFeeBps: null }, ['lighter|entropy']), T0);
   seed.setState(ENTROPY_FEE_DEFAULT_MIGRATED_KEY, { at: T0, applied: false }, T0);
-  seed.savePosition(position(LE_SNDK, { aEntry: 100, bEntry: 100.1, bFeeBps: 6.75 }));
   seed.close();
   const store = openVarLighterStore(file);
-  const engine = createVarLighterEngine({ takerDelayMs: 0, store, fetchImpl, connect: url => { const socket = new FakeSocket(); sockets.set(venueOf(url), socket); return socket; }, now: () => clock });
+  const engine = createVarLighterEngine({ store, fetchImpl, connect: url => { const socket = new FakeSocket(); sockets.set(venueOf(url), socket); return socket; }, now: () => clock });
   try {
     engine.startStreams();
     assert.deepEqual([...sockets.keys()].sort(), ['entropy', 'lighter'], '只连组合用到的场所');
@@ -1426,16 +1318,16 @@ test('两腿行情流的配对：启用或有持仓的每 5 秒、其余每 20 �
       bbo();
       return engine.sampleLive();
     };
-    assert.equal(check(T0 + 4_499).due, 0, '有持仓：5 秒一条（留半秒余量）');
+    assert.equal(check(T0 + 4_499).due, 0, '启用：5 秒一条（留半秒余量）');
     assert.deepEqual(engine.views.state().sources.live, { at: T0, due: 1, written: 1, noTop: 0, blocked: {} }, '没有配对到期的检查不顶掉状态里的最近一轮');
     assert.deepEqual([check(T0 + 4_500).due, engine.sampleLive().due], [1, 0]);
     assert.deepEqual([store.latest(LE_SNDK)!.bMark, store.latest(LE_SNDK)!.bIndex, store.latest(LE_SNDK)!.bFunding], [100.12, 100.13, 0.00002], '标记价、预言机价与资金费取行情流');
     let last = T0 + 4_500;
-    engine.views.reset({ confirm: 'RESET' });
+    engine.views.settings({ revision: 3, symbols: { [LE_SNDK]: { enabled: false } } });
     assert.equal(check(last + 19_499).due, 0, '没有持仓也没启用：20 秒一条');
     assert.equal(check(last + 19_500).written, 1);
     last += 19_500;
-    engine.views.settings({ revision: 3, symbols: { [LE_SNDK]: { enabled: true } } });
+    engine.views.settings({ revision: 4, symbols: { [LE_SNDK]: { enabled: true } } });
     assert.equal(check(last + 4_499).due, 0);
     const stats = check(last + 4_500);
     assert.deepEqual(stats, { at: last + 4_500, due: 1, written: 1, noTop: 0, blocked: {} });
@@ -1504,16 +1396,6 @@ test('自动配置：总览勾选即启用并按推荐参数运行，保存的�
   } finally { dispose(true); }
   const reopened = openVarLighterStore(file);
   try { assert.deepEqual(reopened.state<{ auto: string[] }>(SETTINGS_KEY)!.auto, []); } finally { reopened.close(); rmSync(dir, { recursive: true, force: true }); }
-
-  // 自动配置下开的仓沿用开仓时记下的平仓规则；记录对不上持仓编号的不用。
-  for (const [id, hold] of [['p-' + RH_BTC, 1440], ['p-old', 30]] as const) {
-    const held = seededEngine(store => {
-      store.setState(SETTINGS_KEY, { ...settings2({ [RH_BTC]: { ...DEFAULT_SYMBOL, enabled: true, maxHoldMinutes: 30 } }, global), auto: [RH_BTC] }, T0);
-      store.setState(EXITS_KEY, { [RH_BTC]: { id, exitBps: 0, stopBps: 5000, maxHoldMinutes: 1440 } }, T0);
-      store.savePosition(position(RH_BTC));
-    });
-    try { assert.equal(held.engine.views.paper().positions[0].maxHoldMinutes, hold); } finally { held.dispose(); }
-  }
 
   const thin = seededEngine(store => {
     store.setState(SETTINGS_KEY, { ...settings2({ [RH_BTC]: { ...DEFAULT_SYMBOL, enabled: true } }, global), auto: [RH_BTC] }, T0);
@@ -1695,17 +1577,17 @@ test('接口：未登录 401、POST 缺页面标记 403、只读令牌不能读�
     views.varlighter = localDexForward(varLighterViews(holder));
     assert.equal((await get('/api/varlighter/state', {})).status, 401);
     assert.equal((await get('/api/varlighter/state')).status, 200);
-    assert.equal((await post('/api/varlighter/paper/reset', { confirm: 'RESET' }, { cookie, 'content-type': 'application/json' })).status, 403, '缺页面请求标记');
-    const unknown = await post('/api/varlighter/paper/close', { symbol: RH_BTC });
-    assert.equal(unknown.status, 404);
-    assert.equal((await unknown.json() as { code: string }).code, 'not_found');
+    assert.equal((await post('/api/varlighter/settings', { revision: 0 }, { cookie, 'content-type': 'application/json' })).status, 403, '缺页面请求标记');
+    // v0.112.0 去掉了模拟盘：旧的查看、平仓与清空接口都不在了。
+    for (const route of ['/api/varlighter/paper/close', '/api/varlighter/paper/reset']) assert.equal((await post(route, { symbol: RH_BTC })).status, 404, route);
+    assert.equal((await get('/api/varlighter/paper')).status, 404);
     const generated = await post('/api/read-token/generate', { name: 'test', scopes: ['public', 'system', 'portfolio'] });
     assert.equal(generated.status, 200);
     const token = (await generated.json() as { token: string }).token;
     const bearer = { authorization: `Bearer ${token}` };
     // docs/mcp.md 8.3: the token reads the module and its samples, never a POST (the backtest included).
-    for (const route of ['/api/varlighter/state', '/api/varlighter/paper', '/api/varlighter/readiness', `/api/varlighter/samples?symbol=${KEY}`, '/api/varlighter/samples?symbol=rh:BTC']) assert.equal((await get(route, bearer)).status, 200, route);
-    for (const route of ['/api/varlighter/paper/reset', '/api/varlighter/backtest', '/api/varlighter/settings', '/api/varlighter/paper/close']) {
+    for (const route of ['/api/varlighter/state', '/api/varlighter/readiness', `/api/varlighter/samples?symbol=${KEY}`, '/api/varlighter/samples?symbol=rh:BTC']) assert.equal((await get(route, bearer)).status, 200, route);
+    for (const route of ['/api/varlighter/backtest', '/api/varlighter/settings', '/api/varlighter/live/close']) {
       assert.equal((await post(route, { confirm: 'RESET' }, { ...bearer, 'content-type': 'application/json', 'x-pa-executor': '1' })).status, 403, `只读令牌不能 POST ${route}`);
     }
     assert.equal((await get(`/api/varlighter/samples?symbol=${KEY}&extra=1`, bearer)).status, 403, '多余参数');
@@ -2074,7 +1956,7 @@ test('样本库升级：v0.81 的库补上 Var 询价的三列，旧样本读成
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('引擎接 Var 询价：只给已启用的配对询价，按询价复核与开平仓，询价失败、过旧或没有 token 时退回公开报价', async t => {
+test('引擎接 Var 询价：只给已启用的配对询价，询价记进样本；询价失败、过旧或没有 token 时样本不带询价', async t => {
   const dir = mkdtempSync(path.join(tmpdir(), 'tp-varlighter-'));
   let clock = T0, varMid = 100.2, tick = 0, publicAge = 2000, tokenWait = 0;
   const sockets = new Map<string, FakeSocket>();
@@ -2110,7 +1992,7 @@ test('引擎接 Var 询价：只给已启用的配对询价，按询价复核与
     view: () => ({ status: 'ready', statusName: '正常', expiresAt: T0 + 86_400_000, error: null, okAt: clock, lagMs: 300 }),
   };
   const store = openVarLighterStore(path.join(dir, 'varlighter.sqlite'));
-  const engine = createVarLighterEngine({ takerDelayMs: 0, store, fetchImpl, connect: url => { const socket = new FakeSocket(); sockets.set(venueOf(url), socket); return socket; }, now: () => clock, quoter });
+  const engine = createVarLighterEngine({ store, fetchImpl, connect: url => { const socket = new FakeSocket(); sockets.set(venueOf(url), socket); return socket; }, now: () => clock, quoter });
   const signal = AbortSignal.timeout(5000);
   const minute = async () => {
     clock += 60_000; tick++;
@@ -2143,55 +2025,27 @@ test('引擎接 Var 询价：只给已启用的配对询价，按询价复核与
     assert.equal(store.latest(LIGHTER_BTC)!.aBidTk, null, '没启用的配对样本不带询价');
     for (let index = 0; index < 11; index++) await minute();
 
-    // 接收时 29 秒，RFQ 失败或到阶段时限时已经 37 秒。对手一档仍可用，成交被决策年龄拦住，原时间照常采样。
+    // 询价失败或到阶段时限：这一轮的样本不带询价，统计里记失败；判断时刻照常落盘。
     varMid = 100.5; publicAge = 29_000; tokenWait = 8_000; mode = 'fail';
     poll = await minute();
     latest = store.latest(RH_BTC)!;
-    assert.deepEqual([poll.tokenFailed, poll.blocked[STALE_QUOTE], latest.receivedAt - latest.t, latest.decisionAt! - latest.t, latest.bRxAt, latest.aTkQty],
-      [1, 1, 29_000, 37_000, clock, null]);
-    assert.equal(engine.views.paper().positions.length, 0);
+    assert.deepEqual([poll.tokenFailed, latest.receivedAt - latest.t, latest.decisionAt! - latest.t, latest.bRxAt, latest.aTkQty], [1, 29_000, 37_000, clock, null]);
     t.mock.timers.enable({ apis: ['setTimeout'] });
     try {
       mode = 'timeout';
       poll = await minute();
-      assert.deepEqual([poll.tokenFailed, poll.blocked[STALE_QUOTE]], [1, 1], '真实阶段定时器触发后公开价回退仍要核验决策年龄');
+      assert.equal(poll.tokenFailed, 1, '真实阶段定时器触发后照常采样');
     } finally { t.mock.timers.reset(); }
-    // 无 token 时，读完当前一档才返回的慢盘口也计时。
-    tokenWait = 0; mode = 'ok'; usable = false;
-    const rh = engine.stream('rh')!, topAt = rh.topAt.bind(rh);
-    let slow = true;
-    rh.topAt = (id, at) => { const top = topAt(id, at); if (slow && at === clock) { slow = false; clock += 8_000; } return top; };
-    poll = await minute();
-    latest = store.latest(RH_BTC)!;
-    assert.deepEqual([poll.blocked[STALE_QUOTE], latest.decisionAt! - latest.t], [1, 37_000]);
-    rh.topAt = topAt; usable = true; tokenWait = 8_000;
-    // 公开报价冲到 100.5，但询价显示 Var 仍在 100.22：报价时刻有信号，按询价复核后不开。
-    varMid = 100.5; tokenMid = 100.22;
-    poll = await minute();
-    assert.equal(engine.views.paper().positions.length, 0);
-    assert.equal(poll.blocked[DECAYED], 1);
-    // 询价也在 100.47：开仓，Var 腿按询价的买价成交，不是公开报价 1k 档的 100.48。
+    tokenWait = 0; mode = 'ok';
+    // 公开报价与询价都冲高：Var 配对只采集，不上实盘，询价记进样本供回测。
     tokenMid = 100.47;
     await minute();
-    const opened = engine.views.paper().positions;
-    assert.deepEqual(opened.map(item => [item.symbol, item.direction]), [[RH_BTC, 'a_rich']]);
-    assert.ok(Math.abs(opened[0].aEntry - 100.465) < 1e-9);
-    assert.equal(opened[0].qty, Number(asked.at(-1)![2]));
     const sampled = store.latest(RH_BTC)!;
-    assert.deepEqual([sampled.decisionAt! - sampled.aAt, sampled.aTkQty, sampled.aTkReceivedAt], [37_000, opened[0].qty, clock]);
+    assert.deepEqual([engine.views.state().trading.open, sampled.aTkQty, sampled.aTkReceivedAt], [0, Number(asked.at(-1)![2]), clock]);
     const replay = await engine.views.backtest({ symbol: RH_BTC, hours: 2 });
-    assert.deepEqual([replay.open?.qty, replay.open?.aEntry, replay.summary.blocked[STALE_QUOTE]], [opened[0].qty, opened[0].aEntry, 3]);
-    tokenWait = 0; publicAge = 2_000;
-    engine.views.settings({ revision: engine.views.state().settings.revision, symbols: { [RH_BTC]: { notionalUsd: 100_000 } } });
-    assert.match(engine.views.paper().events.find(event => event.kind === 'open')!.message, /Var 按 token 询价/);
-    // 回落：平仓的 Var 腿按询价的卖价。
-    varMid = 100.2; tokenMid = 100.21;
-    await minute();
-    const trades = engine.views.paper().trades;
-    assert.deepEqual([trades.length, trades[0].reason], [1, 'revert']);
-    assert.ok(Math.abs(trades[0].aExit - 100.215) < 1e-9);
-    assert.deepEqual([Number(asked.at(-1)![2]), trades[0].exitVarSource], [opened[0].qty, 'token'], '改配置、标记价变化后仍询原仓的实际数量');
-    engine.views.settings({ revision: engine.views.state().settings.revision, symbols: { [RH_BTC]: { notionalUsd: 1000 } } });
+    assert.ok(replay.summary.blocked[STALE_QUOTE] >= 1, '回测按落盘的判断时刻还原报价过旧');
+    publicAge = 2_000;
+    varMid = 100.2; tokenMid = null;
 
     // 询价失败：这一轮的样本不带询价，统计里记失败。
     tokenMid = null; mode = 'fail';
@@ -2202,21 +2056,14 @@ test('引擎接 Var 询价：只给已启用的配对询价，按询价复核与
     mode = 'stale';
     poll = await minute();
     assert.deepEqual([poll.tokenOk, store.latest(RH_BTC)!.aBidTk], [1, null]);
-    // 没有可用 token：一个请求也不发，按公开报价照常开仓。
+    // 没有可用 token：一个请求也不发。
     mode = 'ok'; usable = false;
     const before = asked.length;
-    varMid = 100.5;
     poll = await minute();
     assert.equal(asked.length, before);
     assert.deepEqual([poll.tokenOk, poll.tokenFailed], [0, 0]);
-    latest = store.latest(RH_BTC)!;
-    assert.equal(latest.aBidTk, null);
-    const fallback = engine.views.paper().positions;
-    assert.equal(fallback.length, 1);
-    assert.ok(Math.abs(fallback[0].aEntry - 100.48) < 1e-9, '按公开报价的 1k 档');
-    const opens = engine.views.paper().events.filter(event => event.kind === 'open');
-    assert.deepEqual([opens.length, opens.filter(event => event.message.includes('token 询价')).length], [2, 1]);
-    // 有持仓的配对在有 token 后继续询价；只有上一轮要询的都询到，就绪项才按询价的延迟算。
+    assert.equal(store.latest(RH_BTC)!.aBidTk, null);
+    // 有了 token 继续询价；只有上一轮要询的都询到，就绪项才按询价的延迟算。
     usable = true;
     await minute();
     assert.equal(asked.length, before + 1);
@@ -2240,11 +2087,11 @@ test('引擎接 Var 询价：只给已启用的配对询价，按询价复核与
   } finally { engine.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('账户风控读取后才决定开仓；已提交样本只推进一次，成交写失败后继续处理下一配对', async t => {
+test('已提交样本只推进一次：重取同一时刻不重记，重启预热后基线相同；样本写失败时游标不前进，原报价可重试', async t => {
   const dir = mkdtempSync(path.join(tmpdir(), 'tp-decision-')), file = path.join(dir, 'varlighter.sqlite');
   const eth = 'var:ETH|rh:ETH', keys = [RH_BTC, eth], signal = new AbortController().signal;
   const settings = settings2(Object.fromEntries(keys.map(key => [key, { ...DEFAULT_SYMBOL, enabled: true, cooldownMinutes: 0 }])), { ...DEFAULT_GLOBAL, minSamples: 10 });
-  let clock = T0, quoteAt = T0, ethMid = 100, riskWait = 1000, failBtc = false;
+  let clock = T0, quoteAt = T0, ethMid = 100;
   const snapshot = { type: 'subscribed/market_stats', channel: 'market_stats:all', market_stats: Object.fromEntries([1, 2].map(id =>
     [id, { market_id: id, best_bid_price: '99.99', best_ask_price: '100.01', mark_price: '100' }])) };
   const fetchImpl = async (url: string) => {
@@ -2256,7 +2103,7 @@ test('账户风控读取后才决定开仓；已提交样本只推进一次，�
     }) });
   };
   const makeEngine = (store: ReturnType<typeof openVarLighterStore>) => {
-    const socket = new FakeSocket(), engine = createVarLighterEngine({ takerDelayMs: 0, store, fetchImpl, now: () => clock, connect: () => socket });
+    const socket = new FakeSocket(), engine = createVarLighterEngine({ store, fetchImpl, now: () => clock, connect: () => socket });
     engine.startStreams(); socket.open();
     const poll = async () => {
       clock = quoteAt;
@@ -2270,32 +2117,18 @@ test('账户风控读取后才决定开仓；已提交样本只推进一次，�
   const store = openVarLighterStore(file);
   store.setState(SETTINGS_KEY, settings, T0);
   store.addSamples(keys.flatMap(symbol => Array.from({ length: 12 }, (_, i) => sample(T0 - (12 - i) * 60_000, 100, 100, { symbol }))));
-  const { engine, poll } = makeEngine(store), netSince = store.netSince, open = store.openPosition;
-  t.mock.method(store, 'netSince', (since: number) => { clock += riskWait; return netSince(since); });
-  t.mock.method(store, 'openPosition', (...args: Parameters<typeof open>) => {
-    const [position] = args;
-    assert.equal(store.latest(position.symbol)?.decisionAt, clock, '持仓写入前最终决策样本已经持久化');
-    if (failBtc && position.symbol === RH_BTC) throw new Error('BTC 模拟开仓写失败');
-    return open(...args);
-  });
+  const { engine, poll } = makeEngine(store);
   const counts = (e: typeof engine) => e.views.state().rows.map(row => [row.key, row.baseline?.samples, row.samples24h]);
   try {
     await engine.refreshCatalog(signal);
     await poll();
-    assert.deepEqual([store.positions().length, store.latest(RH_BTC)!.decisionAt! - quoteAt, engine.views.state().sources.var.poll?.blocked[STALE_QUOTE]], [0, 30_500, 1]);
-    quoteAt += 60_000; riskWait = 500;
+    quoteAt += 60_000;
     await poll();
-    assert.deepEqual([store.positions()[0].symbol, store.latest(RH_BTC)!.decisionAt! - quoteAt], [RH_BTC, 30_000]);
-    const replay = await engine.views.backtest({ symbol: RH_BTC, hours: 2 });
-    assert.deepEqual([replay.summary.blocked[STALE_QUOTE], replay.open?.openedAt], [1, quoteAt], '回测从持久化时刻还原超界和恰好达界');
-    engine.views.close({ symbol: RH_BTC });
-
-    quoteAt += 60_000; riskWait = 0; ethMid = 100.5; failBtc = true;
-    await assert.rejects(poll(), /BTC 模拟开仓写失败/);
-    assert.deepEqual(store.positions().map(item => item.symbol), [eth], '前一配对写失败时，后一配对照常开仓');
+    quoteAt += 60_000; ethMid = 100.5;
+    await poll();
     assert.deepEqual(counts(engine), [[RH_BTC, 15, 15], [eth, 15, 15]]);
+    assert.equal(store.positions().length, 0, 'Var 配对不开仓');
     const events = store.events(100);
-    failBtc = false;
     await engine.pollVar(signal);
     assert.deepEqual([counts(engine), store.events(100)], [[[RH_BTC, 15, 15], [eth, 15, 15]], events], '重取同一时刻不重记样本、不意外补开仓');
     const restored = makeEngine(openVarLighterStore(file));
@@ -2315,14 +2148,14 @@ test('账户风控读取后才决定开仓；已提交样本只推进一次，�
       return insert(samples);
     });
     await assert.rejects(poll(), /BTC 样本写失败/);
-    assert.deepEqual([store.latest(RH_BTC)?.t, store.positions().length, counts(engine)[0]], [quoteAt - 60_000, 1, [RH_BTC, 15, 15]]);
+    assert.deepEqual([store.latest(RH_BTC)?.t, counts(engine)[0]], [quoteAt - 60_000, [RH_BTC, 15, 15]]);
     denied.mock.restore();
     await engine.pollVar(signal);
-    assert.deepEqual([store.latest(RH_BTC)?.t, store.positions().length, counts(engine)[0]], [quoteAt, 2, [RH_BTC, 16, 16]]);
+    assert.deepEqual([store.latest(RH_BTC)?.t, counts(engine)[0]], [quoteAt, [RH_BTC, 16, 16]]);
   } finally { engine.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('估算开仓在盘口完整时估值，回测期末和模拟盘净盈亏仍标为估算', () => {
+test('估算开仓在盘口完整时估值，回测期末净盈亏仍标为估算', () => {
   const params = { ...DEFAULT_SYMBOL, notionalUsd: 100, entryBps: 15, exitBps: 2 }, global = { ...DEFAULT_GLOBAL, minSamples: 10 };
   const warm = Array.from({ length: 10 }, (_, i) => sample(T0 - (10 - i) * 60_000, 100));
   const entry = sample(T0, 100.5, 100, { captureKind: 'aligned', decisionAt: null, bBidRx: null, bAskRx: null, bRxAt: null });
@@ -2330,25 +2163,25 @@ test('估算开仓在盘口完整时估值，回测期末和模拟盘净盈亏�
   const replay = runBacktest(RH_BTC, 'crypto', [...warm, entry, last], entry.t, last.t, params, global, ZERO_FEES);
   const held = replay.open!;
   assert.deepEqual([held.estimated, closeSpread(last, held)?.estimated, replay.summary.openMarkEstimated], [true, false, true]);
-  const fixture = seededEngine(store => { store.savePosition(held); store.addSamples([last]); }, { clock: () => last.t });
-  try {
-    const mark = fixture.engine.views.paper().positions[0].mark!;
-    assert.deepEqual([mark.estimated, mark.netUsd], [true, replay.summary.openMarkUsd]);
-  } finally { fixture.dispose(); }
 });
 
-test('没有 Var 的双行情流也在风控读取后检查两腿年龄并落盘供回放', async t => {
+test('两腿行情流的配对在风控读取（实盘当日已实现）后检查两腿年龄并落盘供回放', async t => {
   const key = 'rh:BTC|lighter:BTC', dir = mkdtempSync(path.join(tmpdir(), 'tp-live-decision-'));
-  const store = openVarLighterStore(path.join(dir, 'varlighter.sqlite'));
+  const store = openVarLighterStore(path.join(dir, 'varlighter.sqlite')), keys = createLiveKeysStore(dir);
+  // 假值私钥，不对应任何真实账户。
+  keys.set('rh', { accountIndex: 11, apiKeyIndex: 5, privateKey: 'cd'.repeat(40) });
+  keys.set('lighter', { accountIndex: 12, apiKeyIndex: 5, privateKey: 'ab'.repeat(40) });
   const params = { ...DEFAULT_SYMBOL, enabled: true }, global = { ...DEFAULT_GLOBAL, minSamples: 10 };
   store.setState(SETTINGS_KEY, settings2({ [key]: params }, global, ['rh|lighter']), T0);
+  store.setState(LIVE_SETTINGS_KEY, { on: true, pairs: [key], limits: { perTradeUsd: 100, maxOpen: 1, dailyLossUsd: 20, slippageBps: 30 } }, T0);
   store.addSamples(Array.from({ length: 12 }, (_, i) => sample(T0 - (12 - i) * 60_000, 100, 100, { symbol: key })));
   let clock = T0, riskWait = 30_001;
-  const sockets = new Map<string, FakeSocket>(), net = store.netSince;
-  t.mock.method(store, 'netSince', (at: number) => { clock += riskWait; return net(at); });
+  const sockets = new Map<string, FakeSocket>(), net = store.liveNetSince;
+  t.mock.method(store, 'liveNetSince', (at: number) => { clock += riskWait; return net(at); });
   const market = { symbol: 'BTC', market_id: 1, market_type: 'perp', status: 'active', size_decimals: 4, price_decimals: 2, taker_fee: '0', mark_price: '100' };
-  const engine = createVarLighterEngine({ takerDelayMs: 0, store, now: () => clock, fetchImpl: async () => Response.json({ code: 200, order_book_details: [market] }),
-    connect: url => { const socket = new FakeSocket(); sockets.set(venueOf(url), socket); return socket; } });
+  const engine = createVarLighterEngine({ store, now: () => clock, fetchImpl: async () => Response.json({ code: 200, order_book_details: [market] }),
+    connect: url => { const socket = new FakeSocket(); sockets.set(venueOf(url), socket); return socket; },
+    liveKeys: keys, signerProblem: () => null, traders: () => { throw new Error('不该下单'); } });
   const snapshot = (at: number) => {
     clock = at;
     for (const [venue, socket] of sockets) {
@@ -2365,221 +2198,102 @@ test('没有 Var 的双行情流也在风控读取后检查两腿年龄并落盘
     assert.throws(() => snapshot(T0), /基线暂不可读/);
     prewarm.mock.restore();
     assert.deepEqual([store.latest(key)?.t, store.latest(key)?.decisionAt], [T0, null]);
-    const unavailable = t.mock.method(store, 'netSince', () => { throw new Error('账户风控暂不可读'); });
+    const unavailable = t.mock.method(store, 'liveNetSince', () => { throw new Error('账户风控暂不可读'); });
     assert.throws(() => snapshot(T0 + 60_000), /账户风控暂不可读/);
     unavailable.mock.restore();
-    assert.deepEqual([store.latest(key)?.t, store.latest(key)?.decisionAt, store.positions().length], [T0 + 60_000, null, 0]);
+    assert.deepEqual([store.latest(key)?.t, store.latest(key)?.decisionAt, store.liveActive().length], [T0 + 60_000, null, 0]);
     assert.equal(snapshot(T0 + 60_000).written, 0, '已经提交的行情不能补开仓');
     const lateAt = T0 + 120_000, validAt = T0 + 180_000;
     assert.deepEqual(snapshot(lateAt).blocked, { [STALE_QUOTE]: 1 });
     const first = store.latest(key)!;
-    assert.deepEqual([first.aRxAt, first.bRxAt, first.decisionAt, store.positions().length], [lateAt, lateAt, lateAt + 30_001, 0]);
+    assert.deepEqual([first.aRxAt, first.bRxAt, first.decisionAt, store.liveActive().length], [lateAt, lateAt, lateAt + 30_001, 0]);
     riskWait = 30_000;
-    assert.deepEqual(snapshot(validAt).blocked, {});
+    // 年龄恰好达界：策略放行，交给实盘；实盘没有账户读数，挡下且不留持仓记录。
+    assert.deepEqual(snapshot(validAt).blocked, { 'Lighter RH 账户读数不够新': 1 });
     const result = await engine.views.backtest({ symbol: key, hours: 2 });
-    assert.deepEqual([store.positions()[0]?.openedAt, result.open?.openedAt, result.summary.blocked[STALE_QUOTE], result.summary.blocked[NO_QUOTE_TIME]], [validAt, validAt, 1, 2]);
+    assert.deepEqual([store.liveActive().length, result.open?.openedAt, result.summary.blocked[STALE_QUOTE], result.summary.blocked[NO_QUOTE_TIME]], [0, validAt, 1, 2]);
   } finally { engine.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('两腿行情流的配对：一档推送到就按当时两腿判断并开平仓，不等定时采样；没有动作或被挡住的推送不写样本', async () => {
+test('两腿行情流的配对按策略信号驱动实盘（docs/dexspread.md 第 18 节）：止损按实际成交价与开仓时记下的平仓规则判断，平仓途中不再判断也不重复下单，结束后冷却；开仓被实盘挡下不留记录也不写样本；实盘没勾的配对不判断', async () => {
   const key = 'rh:BTC|lighter:BTC', dir = mkdtempSync(path.join(tmpdir(), 'tp-live-push-'));
-  const store = openVarLighterStore(path.join(dir, 'varlighter.sqlite'));
-  store.setState(SETTINGS_KEY, settings2({ [key]: { ...DEFAULT_SYMBOL, enabled: true } }, { ...DEFAULT_GLOBAL, minSamples: 10 }, ['rh|lighter']), T0);
+  const store = openVarLighterStore(path.join(dir, 'varlighter.sqlite')), keys = createLiveKeysStore(dir);
+  // 假值私钥，不对应任何真实账户。
+  keys.set('rh', { accountIndex: 11, apiKeyIndex: 5, privateKey: 'cd'.repeat(40) });
+  keys.set('lighter', { accountIndex: 12, apiKeyIndex: 5, privateKey: 'ab'.repeat(40) });
+  // 配对现在的止损 5000 基点；持仓开仓时记下的平仓规则是 60 基点，按记下的判断。
+  store.setState(SETTINGS_KEY, settings2({ [key]: { ...DEFAULT_SYMBOL, enabled: true, cooldownMinutes: 0, stopBps: 5000 } }, { ...DEFAULT_GLOBAL, minSamples: 10 }, ['rh|lighter']), T0);
   store.addSamples(Array.from({ length: 12 }, (_, i) => sample(T0 - (12 - i) * 60_000, 100, 100, { symbol: key })));
-  let clock = T0;
+  // 总览的浮动按最近落盘的样本估：与下面第一次推送的行情相同。
+  store.addSamples([sample(T0 - 1_000, 100.5, 100, { symbol: key })]);
+  store.setState(LIVE_SETTINGS_KEY, { on: true, pairs: [key], limits: { perTradeUsd: 100, maxOpen: 1, dailyLossUsd: 20, slippageBps: 30 } }, T0);
+  // v0.111 写下的实盘持仓：带 paperId。实际成交的入场价差 40 基点，记下的信号价差 80 基点——判断按实际成交。
+  const leg = (venue: 'rh' | 'lighter', side: 'buy' | 'sell', entry: number) => ({ venue, symbol: 'BTC', side, qty: 1, entryQuote: entry, exitQty: 0, exitQuote: 0, feesUsd: 0, estimated: false });
+  const held: LivePosition = { id: 'l-1', symbol: key, paperId: 'p-legacy', direction: 'a_rich', ratio: 1, state: 'open', step: 'settle', openedAt: T0 - 60_000, updatedAt: T0 - 60_000, closedAt: null,
+    a: leg('rh', 'sell', 100.4), b: leg('lighter', 'buy', 100), plan: { qty: 1, limit: 100.1 }, pending: null, tries: 0, retryAt: 0, closeReason: null, singleLeg: false, netUsd: null, note: '',
+    strategy: { notionalUsd: 100, entrySpread: 80, entryBaseline: 0, entryRegime: 'all', aFeeBps: 0, bFeeBps: 0, estimated: false, rules: { exitBps: 0, stopBps: 60, maxHoldMinutes: 1440 } } };
+  store.saveLive(held);
+  let clock = T0, hold = false, release: () => void = () => {};
+  const placed: string[] = [];
+  const trader = (venue: string) => ({
+    async place(order: { side: string; qty: number; limit: number; reduceOnly: boolean }) {
+      placed.push(`${venue} ${order.side} ${order.qty}${order.reduceOnly ? ' R' : ''}`);
+      if (hold) await new Promise<void>(resolve => { release = resolve; });
+      return { kind: 'done' as const, filledQty: order.qty, avgPrice: order.limit, note: '替身' };
+    },
+    async resolve() { return { kind: 'absent' as const, reason: '替身' }; },
+  });
   const sockets = new Map<string, FakeSocket>();
   const market = { symbol: 'BTC', market_id: 1, market_type: 'perp', status: 'active', size_decimals: 4, price_decimals: 2, taker_fee: '0', mark_price: '100' };
-  const engine = createVarLighterEngine({ takerDelayMs: 0, store, now: () => clock, fetchImpl: async () => Response.json({ code: 200, order_book_details: [market] }),
-    connect: url => { const socket = new FakeSocket(); sockets.set(venueOf(url), socket); return socket; } });
+  const engine = createVarLighterEngine({ store, now: () => clock, fetchImpl: async () => Response.json({ code: 200, order_book_details: [market] }),
+    connect: url => { const socket = new FakeSocket(); sockets.set(venueOf(url), socket); return socket; },
+    liveKeys: keys, signerProblem: () => null, traders: venue => trader(venue) as never });
   const push = (venue: string, at: number, mid: number, type = 'update') => {
     clock = at;
     sockets.get(venue)!.push({ type: `${type}/market_stats`, channel: 'market_stats:all', market_stats: { 1: { market_id: 1, best_bid_price: String(mid - 0.01), best_ask_price: String(mid + 0.01), mark_price: String(mid) } } });
   };
   const stats = () => engine.views.state().sources.push!;
+  const liveEvents = () => store.events(200).filter(item => item.kind === 'live').map(item => item.message);
   try {
     engine.startStreams();
     for (const socket of sockets.values()) socket.open();
     for (const venue of ['rh', 'lighter'] as const) await engine.refreshCatalog(new AbortController().signal, venue);
-    push('rh', T0, 100, 'subscribed'); push('lighter', T0, 100, 'subscribed');
-    assert.deepEqual([stats().checks, stats().trades, store.positions().length, store.latest(key)!.t], [1, 0, 0, T0 - 60_000], '另一腿还没有一档的推送不判断；没有信号的不写样本');
-    push('rh', T0 + 1_000, 100.5);
-    const opened = store.positions()[0];
-    assert.deepEqual([opened?.openedAt, store.latest(key)!.t, stats().trades, stats().lastTradeAt], [T0 + 1_000, T0 + 1_000, 1, T0 + 1_000], '推送到的那一刻开仓，并留下这一刻的样本');
-    push('rh', T0 + 1_200, 100.3);
-    assert.deepEqual([store.positions().length, store.latest(key)!.t], [1, T0 + 1_000], '没到出场线：不动，也不写样本');
-    push('lighter', T0 + 1_300, 100.3);
-    assert.deepEqual([store.positions().length, store.trades(5)[0]?.closedAt, store.latest(key)!.t, stats().trades], [0, T0 + 1_300, T0 + 1_300, 2], '另一腿的推送让价差回到基线：当刻平仓');
-    push('rh', T0 + 1_400, 100.9);
-    assert.deepEqual([store.positions().length, store.latest(key)!.t, stats().lastBlocked?.symbol, stats().lastBlocked?.at], [0, T0 + 1_300, key, T0 + 1_400], '冷却中的信号被挡住，记下原因，不写样本');
-    assert.match(stats().lastBlocked!.reason, /冷却/);
-    push('rh', T0 + 1_500, 100.9);
-    sockets.get('rh')!.push({ type: 'update/market_stats', channel: 'market_stats:all', market_stats: { 1: { market_id: 1, mark_price: '100.95' } } });
-    assert.equal(stats().checks, 5, '一档没变、只有标记价变的推送不重复判断');
-    engine.views.settings({ revision: engine.views.state().settings.revision, symbols: { [key]: { enabled: false } } });
-    push('rh', T0 + 1_600, 101);
-    assert.equal(stats().checks, 5, '停用且没有持仓的配对不按推送判断');
-  } finally { engine.close(); rmSync(dir, { recursive: true, force: true }); }
-});
-
-test('Lighter 吃单延迟：模拟盘开仓先记仓再按 300 毫秒后的一档改价，平仓等 300 毫秒后按那一刻的一档结算，等待中不再判断', async () => {
-  const key = 'rh:BTC|lighter:BTC', dir = mkdtempSync(path.join(tmpdir(), 'tp-taker-delay-'));
-  const store = openVarLighterStore(path.join(dir, 'varlighter.sqlite'));
-  store.setState(SETTINGS_KEY, settings2({ [key]: { ...DEFAULT_SYMBOL, enabled: true } }, { ...DEFAULT_GLOBAL, minSamples: 10 }, ['rh|lighter']), T0);
-  store.addSamples(Array.from({ length: 12 }, (_, i) => sample(T0 - (12 - i) * 60_000, 100, 100, { symbol: key })));
-  let clock = T0;
-  const sockets = new Map<string, FakeSocket>();
-  const market = { symbol: 'BTC', market_id: 1, market_type: 'perp', status: 'active', size_decimals: 4, price_decimals: 2, taker_fee: '0', mark_price: '100' };
-  const engine = createVarLighterEngine({ store, now: () => clock, fetchImpl: async () => Response.json({ code: 200, order_book_details: [market] }),
-    connect: url => { const socket = new FakeSocket(); sockets.set(venueOf(url), socket); return socket; } });
-  const push = (venue: string, at: number, mid: number, type = 'update') => {
-    clock = at;
-    sockets.get(venue)!.push({ type: `${type}/market_stats`, channel: 'market_stats:all', market_stats: { 1: { market_id: 1, best_bid_price: String(mid - 0.01), best_ask_price: String(mid + 0.01), mark_price: String(mid) } } });
-  };
-  const near = (actual: number | undefined, expected: number, label: string) => assert.ok(actual !== undefined && Math.abs(actual - expected) < 1e-9, `${label}：${actual} ≠ ${expected}`);
-  try {
-    assert.equal(LIGHTER_TAKER_DELAY_MS, 300);
-    engine.startStreams();
-    for (const socket of sockets.values()) socket.open();
-    for (const venue of ['rh', 'lighter'] as const) await engine.refreshCatalog(new AbortController().signal, venue);
-    push('rh', T0, 100, 'subscribed'); push('lighter', T0, 100, 'subscribed');
-    push('rh', T0 + 1_000, 100.5);
-    near(store.positions()[0]?.aEntry, 100.49, '判断时刻先按当时的买一记仓');
-    push('rh', T0 + 1_200, 100.2);
-    near(store.positions()[0]?.aEntry, 100.49, '没到 300 毫秒不改价');
-    push('lighter', T0 + 1_350, 100.1);
-    const opened = store.positions()[0];
-    near(opened?.aEntry, 100.19, 'A 腿按判断后 300 毫秒（T0+1300）RH 的买一');
-    near(opened?.bEntry, 100.01, 'B 腿按 T0+1300 主网的卖一，之后 T0+1350 的变化不算');
-    near(opened?.entrySpread, (100.19 - 100.01) / 100 * 1e4, '入场价差随成交价重算');
-    assert.equal(opened?.openedAt, T0 + 1_000);
-    assert.ok(engine.views.paper().events.some(event => /吃单延迟 300 毫秒后成交：入场价差/.test(event.message)));
-    push('rh', T0 + 2_000, 100.1);
-    assert.deepEqual([store.positions().length, store.trades(5).length], [1, 0], '价差回到基线：平仓要等 300 毫秒');
-    push('rh', T0 + 2_200, 99.5);
-    assert.deepEqual([store.positions().length, store.trades(5).length], [1, 0], '等待中不再判断');
-    push('lighter', T0 + 2_400, 100.05);
-    const [trade] = store.trades(5);
-    assert.equal(store.positions().length, 0);
-    assert.deepEqual([trade?.reason, trade?.closedAt], ['revert', T0 + 2_000]);
-    near(trade?.aExit, 99.51, 'A 腿按 T0+2300 RH 的卖一买回');
-    near(trade?.bExit, 100.09, 'B 腿按 T0+2300 主网的买一卖出');
-    assert.ok(engine.views.paper().events.some(event => /吃单延迟 300 毫秒后成交；回归平仓/.test(event.message)));
-  } finally { engine.close(); rmSync(dir, { recursive: true, force: true }); }
-});
-
-test('Lighter 吃单延迟：停服时还在等的平仓按此刻的一档提前结算并标估算，不再通知实盘', async () => {
-  const key = 'rh:BTC|lighter:BTC', dir = mkdtempSync(path.join(tmpdir(), 'tp-taker-delay-stop-')), file = path.join(dir, 'varlighter.sqlite');
-  const store = openVarLighterStore(file);
-  store.setState(SETTINGS_KEY, settings2({ [key]: { ...DEFAULT_SYMBOL, enabled: true } }, { ...DEFAULT_GLOBAL, minSamples: 10 }, ['rh|lighter']), T0);
-  store.addSamples(Array.from({ length: 12 }, (_, i) => sample(T0 - (12 - i) * 60_000, 100, 100, { symbol: key })));
-  let clock = T0;
-  const sockets = new Map<string, FakeSocket>();
-  const market = { symbol: 'BTC', market_id: 1, market_type: 'perp', status: 'active', size_decimals: 4, price_decimals: 2, taker_fee: '0', mark_price: '100' };
-  const logs: string[] = [];
-  const engine = createVarLighterEngine({ store, now: () => clock, log: line => { logs.push(line); }, fetchImpl: async () => Response.json({ code: 200, order_book_details: [market] }),
-    connect: url => { const socket = new FakeSocket(); sockets.set(venueOf(url), socket); return socket; } });
-  const push = (venue: string, at: number, mid: number, type = 'update') => {
-    clock = at;
-    sockets.get(venue)!.push({ type: `${type}/market_stats`, channel: 'market_stats:all', market_stats: { 1: { market_id: 1, best_bid_price: String(mid - 0.01), best_ask_price: String(mid + 0.01), mark_price: String(mid) } } });
-  };
-  let closed = false;
-  try {
-    engine.startStreams();
-    for (const socket of sockets.values()) socket.open();
-    for (const venue of ['rh', 'lighter'] as const) await engine.refreshCatalog(new AbortController().signal, venue);
-    push('rh', T0, 100, 'subscribed'); push('lighter', T0, 100, 'subscribed');
-    push('rh', T0 + 1_000, 100.5);
-    push('rh', T0 + 1_200, 100.2);
-    push('lighter', T0 + 1_350, 100.1);
-    push('rh', T0 + 2_000, 100.1);
-    assert.deepEqual([store.positions().length, store.trades(5).length], [1, 0], '平仓在等 300 毫秒');
-    assert.ok(engine.views.paper().events.every(event => !/回归平仓/.test(event.message)));
-    clock = T0 + 2_100;
-    engine.close(); closed = true;
-    const reopened = openVarLighterStore(file);
-    try {
-      const [trade] = reopened.trades(5);
-      assert.equal(reopened.positions().length, 0, `停服前已结算，重启后不留模拟仓；日志：${logs.join(' | ')}`);
-      assert.deepEqual([trade?.reason, trade?.closedAt, trade?.estimated], ['revert', T0 + 2_000, true]);
-      assert.ok(reopened.events(20).some(event => /停服前提前结算/.test(event.message)));
-    } finally { reopened.close(); }
-  } finally { if (!closed) engine.close(); rmSync(dir, { recursive: true, force: true }); }
-});
-
-test('Lighter 吃单延迟：Var 对 RH 的配对按 Var 报价开仓后，Var 腿仍按判断时刻的价，RH 腿按 300 毫秒后的一档', async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), 'tp-taker-delay-var-'));
-  const store = openVarLighterStore(path.join(dir, 'varlighter.sqlite'));
-  store.setState(SETTINGS_KEY, settings2({ [RH_BTC]: { ...DEFAULT_SYMBOL, enabled: true } }, { ...DEFAULT_GLOBAL, minSamples: 10 }, ['var|rh']), T0);
-  store.addSamples(Array.from({ length: 12 }, (_, i) => sample(T0 - (12 - i) * 60_000, 100, 100, { symbol: RH_BTC })));
-  let clock = T0;
-  const sockets = new Map<string, FakeSocket>();
-  const market = { symbol: 'BTC', market_id: 1, market_type: 'perp', status: 'active', size_decimals: 4, price_decimals: 2, taker_fee: '0', mark_price: '100' };
-  const fetchImpl = async (url: string) => {
-    if (url.includes('orderBookDetails')) return Response.json({ code: 200, order_book_details: [market] });
-    const price = { bid: '100.19', ask: '100.21' };
-    return Response.json({ listings: [{ ticker: 'BTC', name: 'Bitcoin', mark_price: '100.2', quotes: { updated_at: new Date(clock - 2_000).toISOString(), base: price, size_1k: price } }] });
-  };
-  const engine = createVarLighterEngine({ store, now: () => clock, fetchImpl, connect: url => { const socket = new FakeSocket(); sockets.set(venueOf(url), socket); return socket; } });
-  const push = (at: number, mid: number, type = 'update') => {
-    clock = at;
-    sockets.get('rh')!.push({ type: `${type}/market_stats`, channel: 'market_stats:all', market_stats: { 1: { market_id: 1, best_bid_price: String(mid - 0.01), best_ask_price: String(mid + 0.01), mark_price: String(mid) } } });
-  };
-  const near = (actual: number | undefined, expected: number, label: string) => assert.ok(actual !== undefined && Math.abs(actual - expected) < 1e-9, `${label}：${actual} ≠ ${expected}`);
-  try {
-    engine.startStreams();
-    for (const socket of sockets.values()) socket.open();
-    await engine.refreshCatalog(new AbortController().signal, 'rh');
-    push(T0 - 5_000, 100, 'subscribed');
-    clock = T0;
-    await engine.pollVar(AbortSignal.timeout(5_000));
-    near(store.positions()[0]?.aEntry, 100.19, '按 Var 报价开仓');
-    near(store.positions()[0]?.bEntry, 100.01, '判断时刻先按 RH 当时的卖一');
-    push(T0 + 200, 99.9);
-    near(store.positions()[0]?.bEntry, 100.01, '没到 300 毫秒不改价');
-    push(T0 + 400, 99.95);
-    near(store.positions()[0]?.aEntry, 100.19, 'Var 腿不受吃单延迟影响');
-    near(store.positions()[0]?.bEntry, 99.91, 'RH 腿按 T0+300 的卖一');
-  } finally { engine.close(); rmSync(dir, { recursive: true, force: true }); }
-});
-
-test('Lighter 吃单延迟：模拟平仓在等成交时，实盘还没发出的开仓意图作废，不下单', async () => {
-  const key = 'rh:BTC|lighter:BTC', dir = mkdtempSync(path.join(tmpdir(), 'tp-taker-delay-live-'));
-  const store = openVarLighterStore(path.join(dir, 'varlighter.sqlite')), keys = createLiveKeysStore(dir);
-  // 假值私钥，不对应任何真实账户。
-  keys.set('rh', { accountIndex: 11, apiKeyIndex: 5, privateKey: 'cd'.repeat(40) });
-  keys.set('lighter', { accountIndex: 12, apiKeyIndex: 5, privateKey: 'ab'.repeat(40) });
-  store.setState(SETTINGS_KEY, settings2({ [key]: { ...DEFAULT_SYMBOL, enabled: true } }, { ...DEFAULT_GLOBAL, minSamples: 10 }, ['rh|lighter']), T0);
-  store.addSamples(Array.from({ length: 12 }, (_, i) => sample(T0 - (12 - i) * 60_000, 100, 100, { symbol: key })));
-  store.setState(LIVE_SETTINGS_KEY, { on: true, pairs: [key], limits: { perTradeUsd: 100, maxOpen: 1, dailyLossUsd: 20, slippageBps: 30 } }, T0);
-  store.openPosition({ id: 'p1', symbol: key, direction: 'a_rich', openedAt: T0, qty: 10, notionalUsd: 1000, entrySpread: 40, entryBaseline: 0, entryRegime: 'all',
-    aEntry: 100.4, bEntry: 100, estimated: false, ratio: 1, aFeeBps: 0, bFeeBps: 0 }, { at: T0, kind: 'open', message: '模拟开仓：测试' });
-  const leg = (venue: 'rh' | 'lighter', side: 'buy' | 'sell') => ({ venue, symbol: 'BTC', side, qty: 0, entryQuote: 0, exitQty: 0, exitQuote: 0, feesUsd: 0, estimated: false });
-  // 跟着 p1 的实盘开仓意图已落库、第一腿还没发出（上一轮推进还在忙）。
-  const intent: LivePosition = { id: 'l-1', symbol: key, paperId: 'p1', direction: 'a_rich', ratio: 1, state: 'opening', step: 'a', openedAt: T0, updatedAt: T0, closedAt: null,
-    a: leg('rh', 'sell'), b: leg('lighter', 'buy'), plan: { qty: 1, limit: 90, bLimit: 110 }, pending: null, tries: 0, retryAt: 0, closeReason: null, singleLeg: false, netUsd: null, note: '' };
-  store.saveLive(intent);
-  let clock = T0, orders = 0;
-  const sockets = new Map<string, FakeSocket>();
-  const market = { symbol: 'BTC', market_id: 1, market_type: 'perp', status: 'active', size_decimals: 4, price_decimals: 2, taker_fee: '0', mark_price: '100' };
-  const engine = createVarLighterEngine({ store, now: () => clock, fetchImpl: async () => Response.json({ code: 200, order_book_details: [market] }),
-    connect: url => { const socket = new FakeSocket(); sockets.set(venueOf(url), socket); return socket; },
-    liveKeys: keys, signerProblem: () => null, traders: () => { orders++; throw new Error('不该下单'); } });
-  const push = (venue: string, at: number, mid: number, type = 'update') => {
-    clock = at;
-    sockets.get(venue)!.push({ type: `${type}/market_stats`, channel: 'market_stats:all', market_stats: { 1: { market_id: 1, best_bid_price: String(mid - 0.01), best_ask_price: String(mid + 0.01), mark_price: String(mid) } } });
-  };
-  try {
-    engine.startStreams();
-    for (const socket of sockets.values()) socket.open();
-    for (const venue of ['rh', 'lighter'] as const) await engine.refreshCatalog(new AbortController().signal, venue);
-    push('rh', T0 + 1_000, 100, 'subscribed');
-    push('lighter', T0 + 1_000, 100, 'subscribed');
+    push('rh', T0, 100.5, 'subscribed'); push('lighter', T0, 100, 'subscribed');
+    // 买回 A 的价差约 52 基点：按实际成交（入场 40）浮亏约 12 基点，没到止损 60；按信号价差（80）会是浮盈。
+    const row = engine.views.state().rows.find(item => item.key === key)!;
+    assert.ok(row.position && row.position.pnlBps! < -10 && row.position.pnlBps! > -15, `浮盈按实际成交价：${row.position?.pnlBps}`);
+    assert.deepEqual([row.position.id, row.position.state, engine.views.symbol(key, '1').position?.entrySpread], ['l-1', 'open', (100.4 - 100) / 100 * 1e4]);
+    assert.deepEqual([store.liveActive()[0]?.state, placed], ['open', []]);
+    // 价差扩到约 102 基点：按实际成交亏 62 基点，止损。第一腿的平仓单挂着没回来。
+    hold = true;
+    push('rh', T0 + 1_000, 101);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual([store.liveActive()[0]?.state, store.liveActive()[0]?.closeReason, placed], ['closing', 'stop', ['rh buy 1 R']]);
+    assert.ok(liveEvents().some(text => text.startsWith('平仓信号（止损）')), '平仓信号写进实盘事件');
+    assert.equal(store.latest(key)!.t, T0 + 1_000, '有动作的推送留下这一刻的样本');
+    const checks = stats().checks;
+    push('rh', T0 + 1_200, 101.3);
+    assert.deepEqual([stats().checks, placed.length], [checks, 1], '平仓途中不再判断，不重复下单');
+    hold = false; release();
     await engine.live()!.idle();
-    assert.deepEqual([store.positions().length, store.trades(5).length], [1, 0], '价差回到基线：模拟平仓在等 300 毫秒');
-    assert.equal(orders, 0, '等待期间实盘不下单');
-    assert.deepEqual([store.liveActive().length, store.liveClosed(5)[0]?.note], [0, '开仓意图已过期，没有下单'], '实盘把模拟仓当作已平，作废开仓意图');
-    push('lighter', T0 + 1_400, 100.01);
-    assert.deepEqual([store.positions().length, store.trades(5)[0]?.reason], [0, 'revert'], '到点后模拟仓结算');
+    assert.deepEqual([placed, store.liveActive().length, store.liveClosed(5)[0]?.closeReason], [['rh buy 1 R', 'lighter sell 1 R'], 0, 'stop']);
+    // 结束后冷却至少 1 分钟（配对参数冷却 0），写库。
+    assert.equal(store.state<Record<string, number>>(COOLDOWN_KEY)?.[key], T0 + 1_200 + 60_000);
+    assert.equal(engine.views.symbol(key, '1').trades.length, 1, '详情页列出这笔实盘成交');
+    push('rh', T0 + 2_000, 101.5);
+    assert.match(stats().lastBlocked!.reason, /冷却/, '冷却中的开仓信号被挡住');
+    // 冷却过后：策略风控都过了，实盘自己挡下（账户读数不够新）——不留持仓记录、不写样本、不下单，事件只记一条。
+    push('lighter', T0 + 70_000, 99.99); push('rh', T0 + 70_100, 101.5);
+    const sampled = store.latest(key)!.t;
+    push('rh', T0 + 70_200, 101.6);
+    assert.equal(stats().lastBlocked?.reason, 'Lighter RH 账户读数不够新');
+    assert.deepEqual([store.liveActive().length, store.liveClosed(5).length, placed.length, store.latest(key)!.t], [0, 1, 2, sampled]);
+    assert.equal(liveEvents().filter(text => text === '实盘没有开仓：Lighter RH 账户读数不够新').length, 1);
+    // 实盘里取消勾选：这个配对不再按推送判断（策略仍启用，只采集）。
+    engine.views.liveSettings({ pairs: [] });
+    const before = stats().checks;
+    push('rh', T0 + 71_000, 101.8);
+    assert.equal(stats().checks, before, '实盘没勾的配对不判断');
   } finally { engine.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 

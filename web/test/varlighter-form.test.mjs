@@ -8,7 +8,7 @@ import { readCustomPair } from '../../src/varlighter/engine.ts';
 import {
   EMPTY_PAIR_FORM, backtestBody, bps, bytesPerDay, chartRange, chartRows, comboLabel, comboShort, customPairKey, customPairRequest, directionLabel, directionShort, fundingAnnual, globalForm, globalRequest,
   SIMPLE_SORT_KEYS, directionSides, entryProgress, matchesCombo, pairLabel, readOverviewMode, rebateAudit, settingsBody, signal, sortRows, symbolForm, symbolRequest, toggleConfirmed, usd, varLighterHref, AUTO_FIELDS, autoBody, autoFormPatch, quickEnableBody,
-  VARLIGHTER_TABS, ACCOUNT_VENUE_FILTERS, accountActivityFoot, filterAccountPositions, filterAccountTrades, filterAccountFunding, selectedEquitySeries, selectedVenuePnlCurve, formatCurrencyAmount, signedCurrencyAmount, formatRatePct, marginModeLabel, tradeDirLabel, accountHealthBadge,
+  VARLIGHTER_TABS, reasonLabel, ACCOUNT_VENUE_FILTERS, accountActivityFoot, filterAccountPositions, filterAccountTrades, filterAccountFunding, selectedEquitySeries, selectedVenuePnlCurve, formatCurrencyAmount, signedCurrencyAmount, formatRatePct, marginModeLabel, tradeDirLabel, accountHealthBadge,
 } from '../src/varlighter/varlighter-form.ts';
 import { parseRoute } from '../src/route-parse.ts';
 
@@ -177,7 +177,9 @@ test('readouts, labels and addresses', () => {
   assert.equal(bytesPerDay(1e6, 0, 3_600_000), '24 MB/天');
   assert.equal(bytesPerDay(1e8, 0, 3_600_000), '2.40 GB/天');
   assert.equal(bytesPerDay(1e6, null, 3_600_000), '—');
-  for (const tab of ['overview', 'detail', 'paper', 'accounts', 'ready']) assert.equal(parseRoute(varLighterHref(tab)).tab, tab);
+  for (const tab of ['overview', 'detail', 'accounts', 'ready']) assert.equal(parseRoute(varLighterHref(tab)).tab, tab);
+  assert.deepEqual(parseRoute('#/varlighter/paper'), { page: 'varlighter', tab: 'overview', symbol: null }, 'v0.112.0 去掉模拟盘页签，旧地址回到总览');
+  assert.deepEqual([reasonLabel('stop'), reasonLabel('not_filled'), reasonLabel('nope'), reasonLabel(null)], ['止损', '未开成', 'nope', '—']);
   for (const key of ['var:AAPL|rh:AAPL', 'lighter:NVDA|entropy:NVDA', 'lighter:SOL|rh:ETH@0.05']) assert.deepEqual(parseRoute(varLighterHref('detail', key)), { page: 'varlighter', tab: 'detail', symbol: key }, key);
   assert.deepEqual(parseRoute('#/varlighter/detail/rh:AAPL'), { page: 'varlighter', tab: 'detail', symbol: 'var:AAPL|rh:AAPL' }, 'v0.88.0 以前的链接升级为 Var 对该场所');
   assert.deepEqual(parseRoute('#/varlighter/detail/lighter%3ABTC'), { page: 'varlighter', tab: 'detail', symbol: 'var:BTC|lighter:BTC' }, '转义过的冒号也认');
@@ -202,7 +204,7 @@ test('overview simple view: entry progress, sell and buy venues, stored mode', (
 });
 
 test('accounts tab helpers: route, filters, series selection and formatting', () => {
-  assert.deepEqual(VARLIGHTER_TABS.map(item => item.id), ['overview', 'detail', 'paper', 'accounts', 'ready']);
+  assert.deepEqual(VARLIGHTER_TABS.map(item => item.id), ['overview', 'detail', 'accounts', 'ready']);
   assert.deepEqual(ACCOUNT_VENUE_FILTERS.map(item => item.id), ['all', 'lighter', 'rh', 'entropy']);
   assert.equal(varLighterHref('accounts'), '#/varlighter/accounts');
   assert.deepEqual(parseRoute('#/varlighter/accounts'), { page: 'varlighter', tab: 'accounts', symbol: null });

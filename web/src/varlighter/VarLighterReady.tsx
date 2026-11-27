@@ -70,7 +70,7 @@ function GlobalPanel({ view, onChanged }: { view: StateView; onChanged: () => Pr
     <div className="panel-heading"><h2>全局参数与风控</h2><span className="muted">版本 {view.settings.revision}</span></div>
     <div className="vl-actions vl-pause">
       {current.paused ? <Badge tone="warn">已暂停</Badge> : <Badge tone="ok">运行中</Badge>}
-      <button type="button" className="button secondary" disabled={write.busy !== null} onClick={() => submit({ ...current, paused: !current.paused }, current.paused ? '模拟盘已恢复开仓' : '模拟盘已暂停开仓')}>{current.paused ? '恢复开仓' : '暂停开仓'}</button>
+      <button type="button" className="button secondary" disabled={write.busy !== null} onClick={() => submit({ ...current, paused: !current.paused }, current.paused ? '策略已恢复开仓' : '策略已暂停开仓')}>{current.paused ? '恢复开仓' : '暂停开仓'}</button>
       <span className="muted">暂停只停开新仓，已有持仓照常按规则平仓</span>
     </div>
     <div className="vl-fields">
@@ -244,7 +244,7 @@ function IdentityPanel({ view, onChanged }: { view: StateView; onChanged: () => 
     void write.run(`confirm:${row.key}`, () => api(`${VARLIGHTER_BASE}/settings`, { body: settingsBody(view.settings, { confirmed: toggleConfirmed(confirmed, row.key, on) }) }), () => { void onChanged(); return on ? `${label} 已确认两边规格相同` : `${label} 已撤销确认`; });
   };
   return <section className="panel" aria-label="规格核对">
-    <div className="panel-heading"><h2>规格核对</h2><span className="muted">已核对的配对不列出；待确认的按配对分别确认，确认后才能启用模拟盘</span></div>
+    <div className="panel-heading"><h2>规格核对</h2><span className="muted">已核对的配对不列出；待确认的按配对分别确认，确认后才能启用策略</span></div>
     {write.message ? <div className="vl-actions"><Callout tone={write.message.tone}>{write.message.text}</Callout></div> : null}
     {rows.length ? <div className="vl-table"><table>
       <thead><tr><th>标的</th><th>两腿</th><th>类别</th><th>状态</th><th className="num">两边价格差</th><th>说明</th><th /></tr></thead>

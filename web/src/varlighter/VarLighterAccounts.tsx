@@ -10,7 +10,7 @@ import type { AccountsRefreshResult, AccountsView, VenueAccountView } from '../.
 import { Badge, EquityLineChart, Metric, stampMsText, stampText, useWrite } from './parts.tsx';
 import {
   ACCOUNT_VENUE_FILTERS, VARLIGHTER_BASE, accountActivityFoot, accountHealthBadge, accountPnlTone, age, directionLabel, duration, filterAccountFunding, filterAccountPositions,
-  filterAccountTrades, formatCurrencyAmount, formatRatePct, marginModeLabel, pairLabel, percent, plain, price, selectedEquitySeries, selectedVenuePnlCurve,
+  filterAccountTrades, formatCurrencyAmount, formatRatePct, marginModeLabel, pairLabel, percent, plain, price, reasonLabel, selectedEquitySeries, selectedVenuePnlCurve,
   signedCurrencyAmount, signedUsd, tradeDirLabel, usd, varLighterHref, venueShort, type AccountVenueFilter,
 } from './varlighter-form.ts';
 
@@ -297,7 +297,7 @@ export function VarLighterAccounts({ onExpired }: { onExpired: () => void }) {
             <td className="num">{price(avg(trade.a.entryQuote, trade.a.qty))} / {price(avg(trade.a.exitQuote, trade.a.exitQty))}<small>{price(trade.a.qty)}</small></td>
             <td className="num">{price(avg(trade.b.entryQuote, trade.b.qty))} / {price(avg(trade.b.exitQuote, trade.b.exitQty))}<small>{price(trade.b.qty)}</small></td>
             <td className={`num vl-${accountPnlTone(trade.netUsd) || 'dim'}`}>{signedUsd(trade.netUsd)}{trade.a.estimated || trade.b.estimated ? <small>含估算价</small> : null}</td>
-            <td className="wrap">{trade.closeReason ?? '—'}{trade.note ? <small>{trade.note}</small> : null}</td>
+            <td className="wrap">{reasonLabel(trade.closeReason)}{trade.note ? <small>{trade.note}</small> : null}</td>
           </tr>;
         })}</tbody>
       </table></div> : <TableEmpty>还没有策略双腿实盘成交</TableEmpty>}

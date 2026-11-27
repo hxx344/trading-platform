@@ -24,13 +24,10 @@ export interface VarLighterViews {
   symbol(symbol: string | null, hours: string | null): unknown;
   samples(symbol: string | null, after: string | null, limit: string | null): unknown;
   backtest(body: unknown): unknown;
-  paper(): unknown;
   readiness(): unknown;
   accounts(): unknown;
   accountsRefresh(): unknown;
   settings(body: unknown): unknown;
-  close(body: unknown): unknown;
-  reset(body: unknown): unknown;
   live(): unknown;
   liveKeys(body: unknown): unknown;
   liveKeysRemove(body: unknown): unknown;
@@ -68,13 +65,10 @@ export function varLighterViews(holder: VarLighterHolder): VarLighterViews {
     symbol: (symbol, hours) => engine().views.symbol(symbol, hours === null ? undefined : hours),
     samples: (symbol, after, limit) => engine().views.samples(symbol, after, limit),
     backtest: body => engine().views.backtest(body),
-    paper: () => engine().views.paper(),
     readiness: () => engine().views.readiness(),
     accounts: () => engine().views.accounts(),
     accountsRefresh: () => engine().views.accountsRefresh(),
     settings: body => engine().views.settings(body),
-    close: body => engine().views.close(body),
-    reset: body => engine().views.reset(body),
     live: () => engine().views.live(),
     liveKeys: body => engine().views.liveKeys(body),
     liveKeysRemove: body => engine().views.liveKeysRemove(body),
@@ -109,14 +103,11 @@ export async function routePage(views: VarLighterViews, request: DexPageRequest,
     if (method === 'GET' && path === 'state') return { status: 200, body: views.state() };
     if (method === 'GET' && path === 'symbol') return { status: 200, body: views.symbol(query.get('symbol'), query.get('hours')) };
     if (method === 'GET' && path === 'samples') return { status: 200, body: views.samples(query.get('symbol'), query.get('after'), query.get('limit')) };
-    if (method === 'GET' && path === 'paper') return { status: 200, body: views.paper() };
     if (method === 'GET' && path === 'readiness') return { status: 200, body: views.readiness() };
     if (method === 'GET' && path === 'accounts') return { status: 200, body: views.accounts() };
     if (method === 'POST' && path === 'accounts/refresh') return { status: 200, body: views.accountsRefresh() };
     if (method === 'POST' && path === 'backtest') return { status: 200, body: await views.backtest(body) };
     if (method === 'POST' && path === 'settings') return { status: 200, body: views.settings(body) };
-    if (method === 'POST' && path === 'paper/close') return { status: 200, body: views.close(body) };
-    if (method === 'POST' && path === 'paper/reset') return { status: 200, body: views.reset(body) };
     if (method === 'GET' && path === 'live') return { status: 200, body: views.live() };
     // 凭据的请求体带私钥：这里不记、不回显，出错时也只给固定文案。
     if (method === 'POST' && path === 'live/keys') return { status: 200, body: views.liveKeys(body) };

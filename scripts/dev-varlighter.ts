@@ -120,26 +120,39 @@ const now = Date.now();
     'var:AAPL|rh:AAPL': { ...DEFAULT_SYMBOL, enabled: true, entryBps: 9, exitBps: 1 }, 'var:BTC|rh:BTC': { ...DEFAULT_SYMBOL, enabled: true, entryBps: 5, exitBps: 0.5 },
     'var:ETH|lighter:ETH': { ...DEFAULT_SYMBOL, enabled: true, entryBps: 7, exitBps: 1 }, 'lighter:NVDA|entropy:NVDA': { ...DEFAULT_SYMBOL, enabled: true, entryBps: 6, exitBps: 1 },
   };
-  // 一个已下架的配对（不在目录里）：已启用、有持仓，演示总览的「不在当前配对里的标的」。
+  // 一个已下架的配对（不在目录里）：已启用，演示总览的「失联的标的」。不预置实盘持仓（v0.112.0 起没有模拟持仓），预览里不会发任何订单。
   const gone = { ...history.get('var:AAPL|rh:AAPL')!.at(-120)!, symbol: 'var:DELISTED|rh:DELISTED' };
   store.addSamples([gone]);
-  store.savePosition({ id: 'preview-delisted', symbol: gone.symbol, direction: 'a_rich', openedAt: gone.t - 600_000, qty: 5, notionalUsd: 1000, entrySpread: 12, entryBaseline: 2,
-    entryRegime: gone.regime, aEntry: gone.aBid1k!, bEntry: gone.bAsk0, estimated: false, ratio: 1, aFeeBps: 0, bFeeBps: 0 });
   const settings: Settings = {
     revision: 1, global, symbols: { ...symbols, [gone.symbol]: { ...DEFAULT_SYMBOL, enabled: true } }, confirmed: [],
     combos: ['var|rh', 'var|lighter', 'var|entropy', 'lighter|entropy'], pairs: [{ a: { venue: 'rh', symbol: 'ETH' }, b: { venue: 'lighter', symbol: 'ETH' }, ratio: 1, kind: 'crypto', note: '预览：两条行情流' }],
     auto: ['lighter:NVDA|entropy:NVDA'],
   };
   store.setState(SETTINGS_KEY, settings, now);
+  // 详情页的实盘成交（第 18 节）：没有 Var 腿的配对按回测结果写成已结束的实盘持仓，带策略读数。
   for (const [key, params] of Object.entries(symbols)) {
+    if (key.includes('var:')) continue;
     const list = history.get(key)!;
     const result = runBacktest(key, kindOf(key.split('|')[0]!.split(':')[1]!), list, now - 3 * 86_400_000, now, params, global, { aFeeBps: 0, bFeeBps: 0 });
-    for (const trade of result.trades.map(item => ({ ...item, id: `preview-${key}-${item.id}` }))) store.closePosition(trade, { at: trade.closedAt, kind: 'close', message: `（预览）${trade.reason} 净 ${trade.netUsd.toFixed(2)} 美元` }, {});
+    const [aKey, bKey] = key.split('|') as [string, string];
+    const legOf = (leg: string, side: LiveLeg['side'], qty: number, entry: number, exit: number, fees: number): LiveLeg => {
+      const [venue, symbol] = leg.split(':') as [LiveLeg['venue'], string];
+      return { venue, symbol: venue === 'entropy' ? `io:${symbol}` : symbol, side, qty, entryQuote: qty * entry, exitQty: qty, exitQuote: qty * exit, feesUsd: fees, estimated: false };
+    };
+    for (const trade of result.trades) {
+      const aSide = trade.direction === 'a_rich' ? 'sell' : 'buy', bSide = aSide === 'sell' ? 'buy' : 'sell';
+      store.saveLive({
+        id: `preview-${key}-${trade.id}`, symbol: key, direction: trade.direction, ratio: 1, state: 'closed', step: 'settle', openedAt: trade.openedAt, updatedAt: trade.closedAt, closedAt: trade.closedAt,
+        a: legOf(aKey, aSide, trade.qty, trade.aEntry, trade.aExit, trade.costUsd / 2), b: legOf(bKey, bSide, trade.qty, trade.bEntry, trade.bExit, trade.costUsd / 2),
+        plan: { qty: trade.qty, limit: trade.aEntry }, pending: null, tries: 1, retryAt: 0, closeReason: trade.reason, singleLeg: false, netUsd: trade.netUsd, note: '（预览）',
+        strategy: { notionalUsd: trade.notionalUsd, entrySpread: trade.entrySpread, entryBaseline: trade.entryBaseline, entryRegime: trade.entryRegime, aFeeBps: 0, bFeeBps: 0, estimated: trade.estimated },
+      });
+    }
   }
   // 实盘页的预览（docs/dexspread.md 第 13 节）：两笔已结束的实盘成交，其中一笔是单腿。不预置凭据、不预置在途持仓，预览里不会发任何订单。
   const liveLeg = (venue: LiveLeg['venue'], symbol: string, side: LiveLeg['side'], qty: number, entry: number, exit: number): LiveLeg => ({ venue, symbol, side, qty, entryQuote: qty * entry, exitQty: qty, exitQuote: qty * exit, feesUsd: 0.02, estimated: false });
   const liveTrade = (id: string, ago: number, a: LiveLeg, b: LiveLeg, netUsd: number, singleLeg: boolean, closeReason: string, note: string): LivePosition => ({
-    id, symbol: 'lighter:NVDA|entropy:NVDA', paperId: `paper-${id}`, direction: 'a_rich', ratio: 1, state: 'closed', step: 'settle', openedAt: now - ago, updatedAt: now - ago + 900_000, closedAt: now - ago + 900_000,
+    id, symbol: 'lighter:NVDA|entropy:NVDA', direction: 'a_rich', ratio: 1, state: 'closed', step: 'settle', openedAt: now - ago, updatedAt: now - ago + 900_000, closedAt: now - ago + 900_000,
     a, b, plan: { qty: a.qty, limit: 181.8 }, pending: null, tries: 1, retryAt: 0, closeReason, singleLeg, netUsd, note });
   store.saveLive(liveTrade('preview-live-1', 7_200_000, liveLeg('lighter', 'NVDA', 'sell', 0.5, 182.31, 182.02), liveLeg('entropy', 'io:NVDA', 'buy', 0.5, 182.05, 182.0), 0.08, false, 'revert', ''));
   store.saveLive(liveTrade('preview-live-2', 3_600_000, liveLeg('lighter', 'NVDA', 'sell', 0.5, 182.4, 182.46), { ...liveLeg('entropy', 'io:NVDA', 'buy', 0, 0, 0), exitQty: 0, feesUsd: 0 }, -0.05, true, 'single_leg', 'Entropy 没有成交，Lighter 已反向平掉'));

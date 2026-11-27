@@ -5,7 +5,7 @@ import type { AccountAsset, AccountFunding, AccountHistorySummary, AccountPnlPoi
 import type { BacktestResult } from './backtest.ts';
 import type { AssetKind, Combo, CustomPair, Identity, LegInfo, LiveVenue, Regime, Sample, SizeBucket, VarPriceSource, VenueId } from './model.ts';
 import type { OrderPlan } from './plan.ts';
-import type { LivePosition, LiveSettings } from './live.ts';
+import type { LivePosition, LiveSettings, LiveState } from './live.ts';
 import type { LiveKeysView } from './livekeys.ts';
 import type { RegimeStats } from './stats.ts';
 import type { AutoParams, ClosedTrade, Direction, GlobalParams, Position, SymbolParams } from './strategy.ts';
@@ -40,13 +40,13 @@ export interface DepthStatus { key: string; marketId: number; at: number | null;
 /** 一个行情流场所的采集状态；没有组合或手动配对用到时 enabled 为假、stream 为 null。 */
 export interface VenueStatus { venue: LiveVenue; name: string; enabled: boolean; catalog: SourceState; stream: LighterStatus | null; depth: DepthStatus[]; pairs: number }
 export interface BaselineView { median: number; sigma: number; samples: number; regime: Regime; fallback: boolean }
-export interface PaperTotals { trades: number; netUsd: number; wins: number; first: number | null }
 /** 页面上的一条腿：场所、代码与场所名。 */
 export interface LegRef { venue: VenueId; symbol: string; name: string }
 /** 自动配对的一个组合：是否开启、两个场所与当前配对数。 */
 export interface ComboView { combo: Combo; name: string; enabled: boolean; pairs: number }
 
 export interface PositionSummary {
+  /** 实盘持仓编号与状态（v0.112.0 起；失联配对的平仓按编号发给实盘）。 */ id?: string; state?: LiveState;
   direction: Direction; openedAt: number; pnlBps: number | null;
   /** 开仓或估值使用估算价时为 true；缺估值返回 null，旧服务未提供该字段。 */
   estimated?: boolean | null;
@@ -85,7 +85,8 @@ export interface StateView {
   /** 已启用或有持仓、但不在当前配对里的键。 */
   orphans: OrphanRow[];
   settings: Settings;
-  paper: PaperTotals & { open: number; openNotionalUsd: number; todayNetUsd: number };
+  /** v0.112.0 起取代模拟盘汇总：实盘开关、在途与持有中的实盘持仓（含开仓中、平仓中）、今天已平的实盘净盈亏。 */
+  trading: { on: boolean; /** 实盘准备页勾选的配对。 */ pairs: string[]; open: number; openNotionalUsd: number; todayNetUsd: number };
   regimeNames: Record<Regime, string>;
   venueNames: Record<VenueId, string>;
 }
@@ -101,29 +102,22 @@ export interface SymbolView {
   /** params 是保存的参数，effective 是生效的（自动配置时入场、出场、止损、最长持有换成推荐值）；统计、走势的入场带与下单预演按 effective。 */
   params: SymbolParams; effective: SymbolParams; auto: AutoView; global: GlobalParams; latest: Sample | null; plans: OrderPlan[];
   /** 两腿手续费（基点）；取不到为 null。 */ fees: { a: number | null; b: number | null };
-  position: (Position & { mark: PositionMark | null }) | null;
-  trades: ClosedTrade[];
+  /** 这个配对未结束的实盘持仓，按策略口径（入场为两腿实际成交均价）；mark 只在持有中时估。 */
+  position: (Position & { state: LiveState; mark: PositionMark | null }) | null;
+  /** 这个时段内这个配对已结束的实盘成交（两腿都开过、都平掉过的），按平仓时刻升序。 */
+  trades: LiveTradeView[];
 }
+/** 详情页的一笔实盘成交：字段同回测成交，平仓原因可能是实盘自己的（not_filled 等不会出现，single_leg、dismissed 可能）。 */
+export type LiveTradeView = Omit<ClosedTrade, 'reason'> & { reason: string };
 
 export type BacktestView = BacktestResult & { truncated: boolean };
 
 export interface StoredEventView { id: number; at: number; kind: string; symbol: string | null; message: string }
-export interface PaperView {
-  now: number;
-  positions: (Position & { mark: PositionMark | null; sampleAt: number | null; maxHoldMinutes: number })[];
-  trades: ClosedTrade[];
-  equity: { t: number; net: number }[];
-  daily: { day: number; netUsd: number; trades: number }[];
-  totals: PaperTotals; todayNetUsd: number;
-  limits: { maxOpenPositions: number; maxTotalNotionalUsd: number; dailyLossLimitUsd: number; paused: boolean };
-  openNotionalUsd: number;
-  events: StoredEventView[];
-}
 
 /** 原始样本的一页（docs/mcp.md 第 8.3 节）：rows 每行按 columns 的顺序；next 为本页最后一条的时刻，读完为 null。format 是样本格式版本（v0.88.0 起为 2）。 */
 export interface SamplesView { symbol: string; format: number; columns: (keyof Sample)[]; rows: unknown[][]; next: number | null; firstAt: number | null; retentionDays: number }
 /** 实盘页（docs/dexspread.md 第 13 节）：设置、凭据是否已录入（不含任何凭据内容）、持仓、成交与事件。 */
-export interface LiveCandidate { key: string; symbol: string; a: LegRef; b: LegRef; /** 模拟盘是否启用了这个配对。 */ paper: boolean }
+export interface LiveCandidate { key: string; symbol: string; a: LegRef; b: LegRef; /** 总览里是否启用了这个配对（实盘还要求启用）。 */ enabled: boolean }
 export interface LiveView {
   now: number; settings: LiveSettings; halt: string | null; paused: Record<string, string>;
   lastSkip: { at: number; symbol: string; reason: string } | null;

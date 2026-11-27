@@ -2,10 +2,10 @@
 // 配对键与场所名、手动配对的表单、走势图的行数据。由 web/test/varlighter-form.test.mjs 覆盖。
 import type { KeyVenue } from '../../../src/dex/keys.ts';
 import type { AccountFunding, AccountTrade } from '../../../src/varlighter/accounts.ts';
-import type { LiveExecSettings, LivePosition } from '../../../src/varlighter/live.ts';
+import type { LiveExecSettings, LiveLimits, LiveOrderRole, LivePosition, LiveSettings } from '../../../src/varlighter/live.ts';
 import type { AssetKind, Combo, CustomPair, Regime, VarPriceSource, VenueId } from '../../../src/varlighter/model.ts';
 import type { AutoParams, Direction, GlobalParams, SymbolParams } from '../../../src/varlighter/strategy.ts';
-import type { AccountsView, Settings, StateRow, SymbolPoint, VenueAccountView, VenuePositionView } from '../../../src/varlighter/views.ts';
+import type { AccountsView, LiveBreakdownRow, LiveOutcomeCounts, LivePositionMark, LiveView, Settings, StateRow, SymbolPoint, VenueAccountView, VenuePositionView } from '../../../src/varlighter/views.ts';
 import type { VarLighterTab } from '../route-parse.ts';
 
 export const VARLIGHTER_BASE = '/api/varlighter';
@@ -134,6 +134,35 @@ export function entryProgress(row: Pick<StateRow, 'rich' | 'cheap' | 'entryBps'>
 }
 /** 方向拆成卖出与买入的场所：A 偏贵时卖 A 买 B，反之买 A 卖 B。 */
 export const directionSides = (direction: Direction, a: VenueId, b: VenueId): { sell: VenueId; buy: VenueId } => direction === 'a_rich' ? { sell: a, buy: b } : { sell: b, buy: a };
+/** 「为什么没开仓」的一行小字：tone 决定颜色（bad 是到了入场线却被挡），title 是悬停时的全文（含最近一次没开成）。 */
+export type GateNote = { tone: 'bad' | 'warn' | 'ok' | 'dim'; text: string; title: string };
+/** 已启用、无持仓的配对现在为什么没开仓；旧服务没有 gate、或有持仓与未启用的配对（gate 为 null）时为 null。 */
+export function gateNote(row: Pick<StateRow, 'gate'>, now: number): GateNote | null {
+  const gate = row.gate;
+  if (!gate) return null;
+  const last = gate.last ? `最近一次没开成：${age(gate.last.at, now)}，${gate.last.reason}` : null;
+  let main: { tone: GateNote['tone']; text: string; title: string } | null = null;
+  if (gate.blocker) {
+    const text = `未开仓：${gate.blocker}`;
+    // 不用处理的拦截（策略本来就会等，或用户自己的设置）不用警示色；没有这个标记时按要处理的显示。
+    main = gate.attention === false ? { tone: 'dim', text, title: gate.reached ? `已到入场线，${text}` : text }
+      : gate.reached ? { tone: 'bad', text, title: `已到入场线，${text}` } : { tone: 'warn', text, title: text };
+  } else if (gate.reached) {
+    const text = `已到入场线${finite(gate.expectedNetBps) ? `，预期净利 ${bps(gate.expectedNetBps)} 基点` : ''}，等待确认或下单`;
+    main = { tone: 'ok', text, title: text };
+  }
+  if (!main) return last ? { tone: 'dim', text: last, title: last } : null;
+  return { tone: main.tone, text: main.text, title: last ? `${main.title}\n${last}` : main.title };
+}
+/** 样本超过这么久的行不算机会、不高亮，也不计入「到线被挡」：最后一个样本到过线不代表现在还在线上。 */
+export const STALE_SAMPLE_MS = 5 * 60_000;
+export const sampleStale = (row: Pick<StateRow, 'sampleAt'>, now: number): boolean => row.sampleAt === null || now - row.sampleAt > STALE_SAMPLE_MS;
+/** 到了入场线却被要处理的原因挡住的配对数（样本过期的、不用处理的拦截不计）；没有一行带 gate（旧服务）时为 null，页面不显示。 */
+export const blockedAtEntry = (rows: readonly Pick<StateRow, 'gate' | 'sampleAt'>[], now: number): number | null =>
+  rows.some(row => row.gate !== undefined) ? rows.filter(row => row.gate?.reached && row.gate.blocker && row.gate.attention !== false && !sampleStale(row, now)).length : null;
+/** 基线为 null 时的说明：后台还在预热，或同时段样本不足。 */
+export const baselineMissing = (row: Pick<StateRow, 'baselineWarming'>, simple: boolean): string =>
+  row.baselineWarming ? '基线预热中' : simple ? '平时水平统计中' : '样本不足';
 /**
  * 总览成本列：total 是显示的数（买卖价差 + 往返手续费；手续费未知或旧服务没给时只有买卖价差），
  * parts 把两项分开写。买卖价差是两腿盘口的往返成本（买 A 价差 − 卖 A 价差），按一档估算时标「估算」。
@@ -395,13 +424,49 @@ export function selectedVenuePnlCurve(
 export const accountPnlTone = (value: number | null | undefined): 'up' | 'down' | '' => tone(value);
 
 // ---- 实盘执行优化与订单遥测 ----
-export interface LiveExecForm { openLegASlippageBps: string; confirmMs: string; notFilledCooldownSec: string; maxLeverage: string; autoSizeByBalance: boolean }
-export const LIVE_EXEC_FIELDS: readonly { key: 'openLegASlippageBps' | 'confirmMs' | 'notFilledCooldownSec' | 'maxLeverage'; label: string; min: number; max: number; integer?: boolean; hint: string }[] = [
-  { key: 'openLegASlippageBps', label: '开仓 A 腿滑点（基点）', min: 0, max: 30, hint: '默认 2（0–30），收紧第一腿限价减少逆向吃单' },
-  { key: 'confirmMs', label: '信号持续确认（毫秒）', min: 0, max: 10_000, integer: true, hint: '默认 0 不延迟；设 >0 需信号连续维持该时长才开仓' },
-  { key: 'notFilledCooldownSec', label: 'A 腿未成冷却（秒）', min: 5, max: 3_600, integer: true, hint: '默认 30 秒（5–3600），与真实成交冷却分离' },
-  { key: 'maxLeverage', label: '保证金倍率上限', min: 1, max: 5, hint: '默认 1（1–5×），>1 按可用余额 × 倍率 × 95% 估算上限；须先在各交易所设好 >= 该倍率杠杆' },
+/** 与 src/varlighter/live.ts 的 LIVE_LIMIT_RANGES、LIVE_EXEC_RANGES 一致（页面不引入后端模块的值，web/test/varlighter-form.test.mjs 断言两边相同）。 */
+export const LIVE_LIMIT_RANGES = { perTradeUsd: [10, 100_000], maxOpen: [1, 20], dailyLossUsd: [1, 100_000], slippageBps: [1, 300] } as const;
+export const LIVE_EXEC_RANGES = { openLegASlippageBps: [0, 30], confirmMs: [0, 10_000], notFilledCooldownSec: [5, 3_600], maxLeverage: [1, 5] } as const;
+type RangeField<K extends string> = { key: K; label: string; min: number; max: number; integer?: boolean; hint: string };
+export type LiveLimitsForm = Record<keyof LiveLimits, string>;
+export const LIVE_LIMIT_FIELDS: readonly RangeField<keyof LiveLimits>[] = [
+  { key: 'perTradeUsd', label: '单笔名义（美元）', min: LIVE_LIMIT_RANGES.perTradeUsd[0], max: LIVE_LIMIT_RANGES.perTradeUsd[1], hint: '10–100000；每笔取它与配对参数里名义金额中较小的一个' },
+  { key: 'maxOpen', label: '同时持仓（笔）', min: LIVE_LIMIT_RANGES.maxOpen[0], max: LIVE_LIMIT_RANGES.maxOpen[1], integer: true, hint: '1–20 的整数；到上限后不再开新仓' },
+  { key: 'dailyLossUsd', label: '当日亏损上限（美元）', min: LIVE_LIMIT_RANGES.dailyLossUsd[0], max: LIVE_LIMIT_RANGES.dailyLossUsd[1], hint: '1–100000；UTC 日内已实现亏损到这个数就不再开仓' },
+  { key: 'slippageBps', label: 'B 腿与平仓限价保护（基点）', min: LIVE_LIMIT_RANGES.slippageBps[0], max: LIVE_LIMIT_RANGES.slippageBps[1], hint: '1–300；开仓对冲 B 腿与平仓 IOC 限价离预期价最多这么远' },
 ];
+export interface LiveExecForm { openLegASlippageBps: string; confirmMs: string; notFilledCooldownSec: string; maxLeverage: string; autoSizeByBalance: boolean }
+export const LIVE_EXEC_FIELDS: readonly RangeField<'openLegASlippageBps' | 'confirmMs' | 'notFilledCooldownSec' | 'maxLeverage'>[] = [
+  { key: 'openLegASlippageBps', label: '开仓 A 腿滑点（基点）', min: LIVE_EXEC_RANGES.openLegASlippageBps[0], max: LIVE_EXEC_RANGES.openLegASlippageBps[1], hint: '默认 2（0–30），收紧第一腿限价减少逆向吃单' },
+  { key: 'confirmMs', label: '信号持续确认（毫秒）', min: LIVE_EXEC_RANGES.confirmMs[0], max: LIVE_EXEC_RANGES.confirmMs[1], integer: true, hint: '默认 0 不延迟（0–10000 的整数）；设 >0 需信号连续维持该时长才开仓' },
+  { key: 'notFilledCooldownSec', label: 'A 腿未成冷却（秒）', min: LIVE_EXEC_RANGES.notFilledCooldownSec[0], max: LIVE_EXEC_RANGES.notFilledCooldownSec[1], integer: true, hint: '默认 30 秒（5–3600 的整数），与真实成交冷却分离' },
+  { key: 'maxLeverage', label: '保证金倍率上限', min: LIVE_EXEC_RANGES.maxLeverage[0], max: LIVE_EXEC_RANGES.maxLeverage[1], hint: '默认 1（1–5×），>1 按可用余额 × 倍率 × 95% 估算上限；须先在各交易所设好 >= 该倍率杠杆' },
+];
+/** 一个数字输入是否在服务端接受的范围里；不合规时返回带字段名的说明。 */
+function rangeError(field: RangeField<string>, raw: string): string | null {
+  const trimmed = raw.trim(), value = Number(trimmed);
+  if (!trimmed || !Number.isFinite(value)) return `${field.label}须填数字`;
+  if (field.integer && !Number.isInteger(value)) return `${field.label}须为整数`;
+  if (value < field.min || value > field.max) return `${field.label}须在 ${field.min} 到 ${field.max} 之间`;
+  return null;
+}
+/** 字段旁的提示：不合规的字段给出范围，合规的不出现在结果里。 */
+export function rangeFieldErrors<K extends string>(fields: readonly RangeField<K>[], form: Record<K, string>): Partial<Record<K, string>> {
+  const out: Partial<Record<K, string>> = {};
+  for (const field of fields) if (rangeError(field, form[field.key]) !== null) out[field.key] = `须为 ${field.min} 到 ${field.max}${field.integer ? ' 的整数' : ' 之间的数'}`;
+  return out;
+}
+export const liveLimitsForm = (limits: LiveLimits): LiveLimitsForm => ({ perTradeUsd: String(limits.perTradeUsd), maxOpen: String(limits.maxOpen), dailyLossUsd: String(limits.dailyLossUsd), slippageBps: String(limits.slippageBps) });
+/** 表单 → 实盘限额（与服务端 readLiveSettings 同样的范围；服务端仍会再校验）。 */
+export function parseLiveLimits(form: LiveLimitsForm): Parsed<LiveLimits> {
+  const out = {} as LiveLimits;
+  for (const field of LIVE_LIMIT_FIELDS) {
+    const error = rangeError(field, form[field.key]);
+    if (error) return { ok: false, error };
+    out[field.key] = Number(form[field.key].trim());
+  }
+  return { ok: true, value: out };
+}
 export const liveExecForm = (exec: LiveExecSettings): LiveExecForm => ({
   openLegASlippageBps: String(exec.openLegASlippageBps),
   confirmMs: String(exec.confirmMs),
@@ -412,15 +477,29 @@ export const liveExecForm = (exec: LiveExecSettings): LiveExecForm => ({
 export function parseLiveExec(form: LiveExecForm): Parsed<LiveExecSettings> {
   const out = { autoSizeByBalance: form.autoSizeByBalance } as LiveExecSettings;
   for (const field of LIVE_EXEC_FIELDS) {
-    const raw = form[field.key].trim();
-    const num = Number(raw);
-    if (!raw || !Number.isFinite(num)) return { ok: false, error: `${field.label}须填数字` };
-    if (field.integer && !Number.isInteger(num)) return { ok: false, error: `${field.label}须为整数` };
-    if (num < field.min || num > field.max) return { ok: false, error: `${field.label}须在 ${field.min} 到 ${field.max} 之间` };
-    out[field.key] = num;
+    const error = rangeError(field, form[field.key]);
+    if (error) return { ok: false, error };
+    out[field.key] = Number(form[field.key].trim());
   }
   return { ok: true, value: out };
 }
+
+/** 实盘开关面板的整份表单：实盘配对、限额与执行优化一起保存。 */
+export interface LiveSwitchForm { pairs: string[]; limits: LiveLimitsForm; exec: LiveExecForm }
+export const liveSwitchForm = (settings: Pick<LiveSettings, 'pairs' | 'limits'>, exec: LiveExecSettings): LiveSwitchForm =>
+  ({ pairs: [...settings.pairs], limits: liveLimitsForm(settings.limits), exec: liveExecForm(exec) });
+const formValue = (raw: string): number | string => { const trimmed = raw.trim(), value = Number(trimmed); return trimmed && Number.isFinite(value) ? value : trimmed; };
+const liveFormKey = (form: LiveSwitchForm): string => JSON.stringify([
+  [...new Set(form.pairs)].sort(), LIVE_LIMIT_FIELDS.map(field => formValue(form.limits[field.key])), LIVE_EXEC_FIELDS.map(field => formValue(form.exec[field.key])), form.exec.autoSizeByBalance,
+]);
+/** 两份表单代表的设置是否相同（配对不计顺序，「100」与「100.0」相同）。 */
+export const sameLiveForm = (a: LiveSwitchForm, b: LiveSwitchForm): boolean => liveFormKey(a) === liveFormKey(b);
+/**
+ * 服务端设置变了（别处保存、本次保存成功或刷新）时表单是否改用新值：表单还是上次同步的样子（用户没改过），
+ * 或已经和新值一样（保存成功）时跟随；否则保留用户没保存的编辑（LESSONS.md L089），包括保存期间接着改的。
+ */
+export const followServerForm = (current: LiveSwitchForm, base: LiveSwitchForm, next: LiveSwitchForm): boolean =>
+  sameLiveForm(current, base) || sameLiveForm(current, next);
 const CONFIRM_SOURCE_LABEL: Record<string, string> = { ws: 'WS', rest: 'REST', sync: '同步', account: '对账' };
 export function tradeTelemetrySummary(trade: Pick<LivePosition, 'orders'>): string | null {
   const orders = trade.orders;
@@ -428,8 +507,137 @@ export function tradeTelemetrySummary(trade: Pick<LivePosition, 'orders'>): stri
   const openA = orders.find(item => item.role === 'openA') ?? orders[0]!;
   const src = CONFIRM_SOURCE_LABEL[openA.confirmSource] ?? openA.confirmSource;
   const ms = Math.max(0, Math.round(openA.confirmAt - openA.sentAt));
-  const slip = openA.slippageBps === null ? '' : ` · A滑点 ${openA.slippageBps >= 0 ? '+' : ''}${openA.slippageBps.toFixed(1)} bps`;
+  const slip = openA.slippageBps === null || openA.avgPrice === null ? '' : ` · A滑点 ${openA.slippageBps >= 0 ? '+' : ''}${openA.slippageBps.toFixed(1)} bps`;
   return `${src} · ${ms} ms${slip}（共 ${orders.length} 笔单）`;
+}
+
+// ---- 实盘持仓估值 ----
+export interface MarkCells {
+  pnl: string; pnlFoot: string; pnlTone: 'up' | 'down' | '';
+  entry: string; entryFoot: string;
+  exit: string; exitFoot: string; exitTitle: string;
+  stop: string; stopFoot: string; stopWarn: boolean;
+  hold: string; holdFoot: string;
+}
+/**
+ * 持仓表的估值各列（基点）：没有 marks（旧服务）或字段为 null 时写「—」。heldMs 是已持有的毫秒数。
+ * position 给出方向与状态：入场价差比信号好还是差随方向相反（A 偏贵时卖 A，价差越大越好；A 偏便宜时相反）；不在持有中的（开仓中、平仓中、待处理）服务端不估值。
+ */
+export function positionMarkCells(mark: LivePositionMark | null | undefined, heldMs: number, position?: Pick<LivePosition, 'direction' | 'state'>): MarkCells {
+  if (!mark) return { pnl: '—', pnlFoot: '', pnlTone: '', entry: '—', entryFoot: '', exit: '—', exitFoot: '', exitTitle: '', stop: '—', stopFoot: '', stopWarn: false, hold: duration(heldMs), holdFoot: '' };
+  const pnlFoot = [finite(mark.netUsd) ? `净 ${signedUsd(mark.netUsd)}` : '', finite(mark.pnlBps) || finite(mark.netUsd) ? mark.estimated ? '估' : '' : ''].filter(Boolean).join(' · ');
+  const edge = finite(mark.signalSpread) && finite(mark.entrySpread) ? (mark.entrySpread - mark.signalSpread) * (position?.direction === 'a_cheap' ? -1 : 1) : null;
+  const edgeText = edge === null ? '' : !position ? ` · 差 ${bps(edge)}` : Math.abs(edge) < 0.05 ? ' · 与信号一致' : ` · 比信号${edge > 0 ? '好' : '差'} ${plain(Math.abs(edge))}`;
+  const entryFoot = finite(mark.signalSpread) ? `信号 ${plain(mark.signalSpread)}${edgeText}` : '';
+  const held = !position || position.state === 'open';
+  const exitFoot = !finite(mark.deviation) ? held ? '缺样本或基线' : '不在持有中，不估值' : mark.deviation <= mark.exitBps ? '已到出场线' : `还差 ${plain(mark.deviation - mark.exitBps)}`;
+  const room = finite(mark.pnlBps) ? mark.pnlBps + mark.stopBps : null;
+  const minutes = finite(heldMs) && heldMs >= 0 ? Math.floor(heldMs / 60_000) : null;
+  return {
+    pnl: finite(mark.pnlBps) ? bps(mark.pnlBps) : '—', pnlFoot, pnlTone: tone(finite(mark.pnlBps) ? mark.pnlBps : mark.netUsd),
+    entry: plain(mark.entrySpread), entryFoot,
+    exit: `${plain(mark.deviation)} / ${plain(mark.exitBps)}`, exitFoot, exitTitle: `开仓基线 ${bps(mark.entryBaseline)} · 现在基线 ${bps(mark.baseline)} 基点；到出场线后盘口过宽且浮亏时暂缓回归平仓，止损与超时不受影响`,
+    stop: room === null ? '—' : `还差 ${plain(room)}`, stopFoot: `止损线 ${bps(-mark.stopBps)}`, stopWarn: room !== null && room <= mark.stopBps * 0.25,
+    hold: minutes === null ? '—' : `${minutes} / ${mark.maxHoldMinutes} 分钟`,
+    holdFoot: minutes === null ? '' : minutes >= mark.maxHoldMinutes ? '已到最长持有' : `还剩 ${mark.maxHoldMinutes - minutes} 分钟`,
+  };
+}
+
+// ---- 实盘成交与结果计数 ----
+type ClosedPosition = Pick<LivePosition, 'id' | 'a' | 'b' | 'closedAt' | 'updatedAt' | 'closeReason' | 'singleLeg' | 'orders' | 'note'>;
+/** 至少一条腿有开仓成交。 */
+export const hasFill = (position: Pick<LivePosition, 'a' | 'b'>): boolean => position.a.qty > 0 || position.b.qty > 0;
+const closedTime = (position: Pick<LivePosition, 'closedAt' | 'updatedAt'>) => position.closedAt ?? position.updatedAt;
+/** 成交表逐行列出的：trades 里有成交的加上 tradedMore（按编号去重、新的在前、最多 limit 笔）。 */
+export function tradedPositions<T extends ClosedPosition>(view: { trades: readonly T[]; tradedMore?: readonly T[] }, limit = 50): T[] {
+  const seen = new Set<string>(), list: T[] = [];
+  for (const item of [...view.trades.filter(hasFill), ...(view.tradedMore ?? [])]) {
+    if (seen.has(item.id)) continue;
+    seen.add(item.id); list.push(item);
+  }
+  return list.sort((x, y) => closedTime(y) - closedTime(x)).slice(0, limit);
+}
+/** 没有成交就结束的（第一腿没成交等），新的在前。 */
+export const untradedPositions = <T extends ClosedPosition>(trades: readonly T[]): T[] => trades.filter(item => !hasFill(item)).sort((x, y) => closedTime(y) - closedTime(x));
+/** 按与服务端相同的口径数已结束的持仓：有成交、第一腿没成交（not_filled）、其余没成交的，以及有成交里的单腿。from 给出时只数此后结束的。 */
+export function outcomeCounts(trades: readonly ClosedPosition[], from = -Infinity): LiveOutcomeCounts {
+  const counts: LiveOutcomeCounts = { traded: 0, notFilled: 0, other: 0, singleLeg: 0, unsent: 0 };
+  for (const item of trades) {
+    if (closedTime(item) < from) continue;
+    if (item.a.qty > 0) { counts.traded++; if (item.singleLeg) counts.singleLeg++; }
+    else if (item.closeReason === 'not_filled') { counts.notFilled++; if (!firstLegSent(item)) counts.unsent = (counts.unsent ?? 0) + 1; }
+    else counts.other++;
+  }
+  return counts;
+}
+/**
+ * 第一腿没成交的记录里第一腿有没有发出去（与 src/varlighter/live-summary.ts 的 firstLegSent 相同）：
+ * 逐单记录里有开仓 A 腿，或说明写着第一腿没有成交（v0.112.x 没有逐单记录）；其余是发单前放弃的（意图过期、发单前复核没过）。
+ */
+export const firstLegSent = (position: Pick<LivePosition, 'orders' | 'note'>): boolean =>
+  position.orders?.some(order => order.role === 'openA') === true || (position.note ?? '').includes('第一腿没有成交');
+/** 今天（UTC）与累计的结果计数：旧服务没有 outcomes 时用 trades（最近 50 笔已结束）估，recent 是估算用的笔数，服务端给出时为 null。 */
+export function liveOutcomes(view: Pick<LiveView, 'trades' | 'outcomes' | 'now'>): { today: LiveOutcomeCounts; total: LiveOutcomeCounts; recent: number | null } {
+  if (view.outcomes) return { today: view.outcomes.today, total: view.outcomes.total, recent: null };
+  return { today: outcomeCounts(view.trades, Math.floor(view.now / 86_400_000) * 86_400_000), total: outcomeCounts(view.trades), recent: view.trades.length };
+}
+/** 第一腿发出去却没成交的笔数：第一腿没成交的里去掉发单前放弃的（服务端没给 unsent 时全部算发出去了）。 */
+export const firstLegMissed = (counts: LiveOutcomeCounts): number => Math.max(0, counts.notFilled - (counts.unsent ?? 0));
+export const outcomeText = (counts: LiveOutcomeCounts): string =>
+  `有成交 ${counts.traded} · 第一腿未成交 ${firstLegMissed(counts)}${counts.unsent ? ` · 发单前放弃 ${counts.unsent}` : ''} · 其他未成交 ${counts.other} · 单腿 ${counts.singleLeg}`;
+/** 第一腿未成交率：第一腿发出去却没成交的占发出去的（有成交 + 发出去没成交）的比例，发单前放弃的不算；都没有时为 null。 */
+export const firstLegMissRate = (counts: LiveOutcomeCounts): number | null => { const sent = counts.traded + firstLegMissed(counts); return sent > 0 ? firstLegMissed(counts) / sent : null; };
+
+// ---- 逐单遥测汇总 ----
+export const ORDER_ROLES: readonly { role: LiveOrderRole; label: string }[] = [
+  { role: 'openA', label: '开仓 A 腿' }, { role: 'openB', label: '开仓 B 腿' }, { role: 'closeA', label: '平仓 A 腿' }, { role: 'closeB', label: '平仓 B 腿' }, { role: 'flatten', label: '回补' },
+];
+/** 分位数（线性插值）；没有样本为 null，单个样本就是它本身。 */
+export function quantile(values: readonly number[], q: number): number | null {
+  if (!values.length) return null;
+  const sorted = [...values].sort((x, y) => x - y), at = (sorted.length - 1) * q, low = Math.floor(at), high = Math.ceil(at);
+  return sorted[low]! + (sorted[high]! - sorted[low]!) * (at - low);
+}
+export interface RoleTelemetry {
+  role: LiveOrderRole; label: string; orders: number; filled: number; fillRate: number | null;
+  /** 逆向滑点（基点，正值为劣于预期价），null 的不计；samples 是计入的笔数。 */ slipMean: number | null; slipP50: number | null; slipP90: number | null; slipSamples: number;
+  /** 发单到确认、信号到发单（毫秒）。 */ confirmP50: number | null; confirmP90: number | null; signalP50: number | null;
+  /** 确认来源占比（合计 1），多的在前。 */ sources: { source: string; label: string; share: number }[];
+}
+/** 按角色汇总有成交持仓的逐单遥测；positions 是带遥测的持仓数，orders 是单数。 */
+export function orderTelemetryStats(trades: readonly Pick<LivePosition, 'orders'>[]): { positions: number; orders: number; roles: RoleTelemetry[] } {
+  const all = trades.flatMap(trade => trade.orders ?? []);
+  const roles: RoleTelemetry[] = [];
+  for (const { role, label } of ORDER_ROLES) {
+    const orders = all.filter(item => item.role === role);
+    if (!orders.length) continue;
+    const filled = orders.filter(item => item.filledQty > 0).length;
+    // 成交均价缺失（按账户持仓核对出来的成交）时服务端用限价代替成交价，算出的滑点是上限，不是实际滑点，不计入。
+    const slips = orders.filter(item => item.avgPrice !== null).map(item => item.slippageBps).filter(finite);
+    const confirms = orders.map(item => item.confirmAt - item.sentAt).filter(finite).map(value => Math.max(0, value));
+    const signals = orders.map(item => item.signalAt === null ? null : item.sentAt - item.signalAt).filter(finite).map(value => Math.max(0, value));
+    const bySource = new Map<string, number>();
+    for (const item of orders) bySource.set(item.confirmSource, (bySource.get(item.confirmSource) ?? 0) + 1);
+    roles.push({
+      role, label, orders: orders.length, filled, fillRate: filled / orders.length,
+      slipMean: slips.length ? slips.reduce((sum, value) => sum + value, 0) / slips.length : null, slipP50: quantile(slips, 0.5), slipP90: quantile(slips, 0.9), slipSamples: slips.length,
+      confirmP50: quantile(confirms, 0.5), confirmP90: quantile(confirms, 0.9), signalP50: quantile(signals, 0.5),
+      sources: [...bySource].sort((x, y) => y[1] - x[1]).map(([source, count]) => ({ source, label: CONFIRM_SOURCE_LABEL[source] ?? source, share: count / orders.length })),
+    });
+  }
+  return { positions: trades.filter(trade => trade.orders?.length).length, orders: all.length, roles };
+}
+/** 毫秒读数：1 秒以下写毫秒，以上写秒。 */
+export const msText = (value: number | null | undefined): string => !finite(value) ? '—' : value < 1000 ? `${Math.round(value)} ms` : `${(value / 1000).toFixed(1)} s`;
+
+// ---- 盈亏分组 ----
+export type BreakdownKind = 'pair' | 'day' | 'reason';
+/** 分组汇总的一行：配对键与平仓原因换成页面上的名字，胜率没有笔数时为 null。 */
+export function breakdownRows(rows: readonly LiveBreakdownRow[] | undefined, kind: BreakdownKind): { key: string; label: string; sub: string; trades: number; winRate: number | null; netUsd: number }[] {
+  return (rows ?? []).map(row => {
+    const pair = kind === 'pair' ? pairLabel(row.key) : null;
+    return { key: row.key, label: pair ? pair.symbol : kind === 'reason' ? reasonLabel(row.key) : row.key, sub: pair?.short ?? '', trades: row.trades, winRate: row.trades > 0 ? row.wins / row.trades : null, netUsd: row.netUsd };
+  });
 }
 
 export function formatCurrencyAmount(value: number | null | undefined, currency: string, digits = 2): string {

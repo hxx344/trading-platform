@@ -20,7 +20,7 @@ import { backtestRequest, chartEquity, runBacktest } from '../src/varlighter/bac
 import { BOOK_KEEP_LEVELS, CONNECT_TIMEOUT_MS, DEPTH_MAX_GAP_MS, HyperliquidStream, LighterStream, depthAt, depthSnapshot, vwap, type SocketLike } from '../src/varlighter/feeds.ts';
 import { orderPlan } from '../src/varlighter/plan.ts';
 import { MIGRATED_KEY, openVarLighterStore } from '../src/varlighter/store.ts';
-import { COOLDOWN_KEY, ENTROPY_FEE_DEFAULT_MIGRATED_KEY, LEGACY_UPGRADE, SETTINGS_KEY, createVarLighterEngine, customKey, downsample, readCustomPair, upgradeSettings } from '../src/varlighter/engine.ts';
+import { AUTO_JITTER_MS, COOLDOWN_KEY, ENTROPY_FEE_DEFAULT_MIGRATED_KEY, LEGACY_UPGRADE, SETTINGS_KEY, createVarLighterEngine, customKey, downsample, readCustomPair, upgradeSettings } from '../src/varlighter/engine.ts';
 import { READ_TOKEN_MAX_BYTES } from '../src/read-token.ts';
 import { localDexForward, openVarLighter, varLighterLoop, varLighterViews } from '../src/dex/host.ts';
 import { createLiveKeysStore } from '../src/varlighter/livekeys.ts';
@@ -1384,8 +1384,8 @@ test('自动配置：总览勾选即启用并按推荐参数运行，保存的�
 
     clock = T0 + 10 * 60_000 - 1;
     assert.equal(engine.views.symbol(RH_BTC, 24).auto.at, T0, '10 分钟内沿用同一份统计');
-    clock = T0 + 10 * 60_000;
-    assert.equal(engine.views.symbol(RH_BTC, 24).auto.at, clock, '到点重算');
+    clock = T0 + 10 * 60_000 + AUTO_JITTER_MS;
+    assert.equal(engine.views.symbol(RH_BTC, 24).auto.at, clock, '到点重算（各配对错开，最多晚一分钟）');
     const raised = engine.views.settings({ revision: saved.revision, global: { minNetBps: 200 } });
     const lifted = recommendParams({ costMedian: 0, deviation95: 0, halfLifeMin: null }, { ...raised.global, aFeeBps: row().aFeeBps ?? 0, bFeeBps: row().bFeeBps ?? 0 })!.entryBps;
     assert.ok(row().entryBps >= lifted && row().entryBps > preview.params.entryBps, `最低净利调高，入场线马上抬高（${row().entryBps}）`);
@@ -2194,7 +2194,7 @@ test('两腿行情流的配对在风控读取（实盘当日已实现）后检�
     engine.startStreams();
     for (const socket of sockets.values()) socket.open();
     for (const venue of ['rh', 'lighter'] as const) await engine.refreshCatalog(new AbortController().signal, venue);
-    const prewarm = t.mock.method(store, 'samples', () => { throw new Error('基线暂不可读'); });
+    const prewarm = t.mock.method(store, 'baselineScan', () => { throw new Error('基线暂不可读'); });
     assert.throws(() => snapshot(T0), /基线暂不可读/);
     prewarm.mock.restore();
     assert.deepEqual([store.latest(key)?.t, store.latest(key)?.decisionAt], [T0, null]);
@@ -2443,8 +2443,8 @@ test('引擎按策略信号真正开出实盘仓：样本先落盘再写开仓�
     push('rh', T0, 100, 'subscribed'); push('lighter', T0, 100, 'subscribed');
     book('rh', 100); book('lighter', 100);
     assert.equal(store.liveActive().length, 0);
-    // RH 冲高约 100 基点：卖 RH、买主网。
-    book('rh', 101); push('rh', T0 + 1_000, 101);
+    // RH 冲高约 100 基点：卖 RH、买主网。盘口先到，一档取盘口的最优价，这一刻就判断并开仓（market_stats 随后才到）。
+    clock = T0 + 1_000; book('rh', 101); push('rh', T0 + 1_000, 101);
     assert.equal(sampledBeforeIntent, T0 + 1_000, '写开仓意图前这一刻的样本已经落盘');
     await engine.live()!.idle();
     const [opened] = store.liveActive();

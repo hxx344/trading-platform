@@ -354,6 +354,7 @@ test('第一腿零成交或被拒：放弃，不发第二腿，不算单腿也�
     assert.deepEqual([trade.state, trade.closeReason, trade.netUsd, trade.singleLeg, trade.a.qty, trade.b.qty, trade.note], ['closed', 'not_filled', 0, false, 0, 0, 'Lighter 第一腿没有成交，放弃'], label);
   }
   assert.deepEqual(live.view().totals, { trades: 0, netUsd: 0, wins: 0 }, '没成交的不算笔数');
+  for (const [label, trader] of [['逐笔累加', live], ['重启后从库里读', h.boot()]] as const) assert.deepEqual(trader.view().outcomes?.total, { traded: 0, notFilled: 3, other: 0, singleLeg: 0, unsent: 0 }, `${label}：第一腿发出去没成交，不算发单前放弃`);
   assert.deepEqual([live.view().paused, live.view().halt, h.alerts()], [{}, null, []]);
   assert.equal(h.events().filter(text => text === '实盘未开成：Lighter 第一腿没有成交，放弃').length, 3);
   // 放弃之后可以立刻再开。
@@ -1112,7 +1113,10 @@ test('开仓意图落库后没能马上发出（进程重启）：还新鲜且�
     const live = h.boot();
     live.tick(); await live.idle();
     if (sends) assert.deepEqual([h.orders(), h.position(live).state], [['lighter sell 1', 'entropy buy 1'], 'open'], label);
-    else assert.deepEqual([s.sent.length, live.view().positions.length, h.trades(live)[0]!.closeReason, h.trades(live)[0]!.note], [0, 0, 'not_filled', '开仓意图已过期，没有下单'], label);
+    else {
+      assert.deepEqual([s.sent.length, live.view().positions.length, h.trades(live)[0]!.closeReason, h.trades(live)[0]!.note], [0, 0, 'not_filled', '开仓意图已过期，没有下单'], label);
+      for (const trader of [live, h.boot()]) assert.deepEqual(trader.view().outcomes?.total, { traded: 0, notFilled: 1, other: 0, singleLeg: 0, unsent: 1 }, `${label}：没发单就放弃的单独计数（逐笔累加与重启后读库一致）`);
+    }
     h.check();
   }
   // 总开关已关、配对取消勾选、已停止。
@@ -1687,4 +1691,75 @@ test('v0.113.0 执行优化：余额 95% 自动缩量与回滚键隔离、实时
   s.accountAt.lighter = confirmAt + 1;
   assert.equal(await h.open(reborn, GOLD, { notionalUsd: 1500, sample: { aBid100k: 200.55, aAsk100k: 200.65, bBid100k: 99.95, bAsk100k: 100.05 } }), null);
   h.check();
+});
+
+test('被挡下的统计落库节流：同一秒里被挡多次只落一次库，下一次推进时补齐；只读的拦截检查不计入统计', async t => {
+  const h = harness(t), s = h.s, live = h.boot();
+  h.enable(live, [NVDA]);
+  s.accountAt.lighter = null;
+  const save = h.store.saveLiveState;
+  let writes = 0;
+  t.mock.method(h.store, 'saveLiveState', (key: string, value: unknown, at: number) => { if (key === LIVE_SKIP_STATS_KEY) writes++; return save(key, value, at); });
+  assert.match(live.blocker(NVDA, 100)?.reason ?? '', /账户读数不够新/);
+  assert.deepEqual([live.view().skipStats.total, writes], [0, 0], '只读检查不计数、不落库');
+  for (let index = 0; index < 20; index++) assert.match(commit(live.prepare(NVDA, sig('a_rich', 100), sample(NVDA.key, s.clock, 100.3, 100))) ?? '', /账户读数不够新/);
+  assert.deepEqual([live.view().skipStats.total, writes, h.store.state<LiveSkipStats>(LIVE_SKIP_STATS_KEY)?.total], [20, 1, 1], '第一次马上落库，同一秒里的后 19 次先记在内存');
+  live.tick(); await live.idle();
+  assert.deepEqual([writes, h.store.state<LiveSkipStats>(LIVE_SKIP_STATS_KEY)?.total], [2, 20], '下一次推进补齐');
+  live.tick(); await live.idle();
+  assert.equal(writes, 2, '没有新的就不再写');
+  s.clock += 1_000;
+  commit(live.prepare(NVDA, sig('a_rich', 100), sample(NVDA.key, s.clock, 100.3, 100)));
+  assert.deepEqual([writes, h.store.state<LiveSkipStats>(LIVE_SKIP_STATS_KEY)?.total], [3, 21], '隔了一秒的马上落库');
+  s.accountAt.lighter = undefined;
+  assert.equal(live.blocker(NVDA, 100), null);
+  h.check();
+});
+
+test('只读的拦截检查分出要不要人处理；一次页面读数里各配对共用签名器检查与当日已实现，下单路径每次现读', async t => {
+  const h = harness(t), s = h.s, live = h.boot();
+  // 用户自己的设置：不用处理。
+  assert.deepEqual(live.blocker(NVDA, 100), { reason: '实盘总开关未开', attention: false });
+  h.enable(live, [GOLD]);
+  assert.deepEqual(live.blocker(NVDA, 100), { reason: '这个配对没有开实盘', attention: false });
+  h.enable(live, [NVDA, GOLD, SHARED]);
+  assert.equal(live.blocker(NVDA, 100), null);
+  // 不处理就一直开不了的。
+  s.venueProblem = { lighter: 'Lighter 签名器文件不存在' };
+  assert.deepEqual(live.blocker(NVDA, 100), { reason: 'Lighter 签名器文件不存在', attention: true });
+  s.venueProblem = {};
+  s.accountAt.lighter = null;
+  assert.deepEqual(live.blocker(NVDA, 100), { reason: 'Lighter 账户读数不够新', attention: true });
+  s.accountAt.lighter = undefined;
+  s.keysProblem = '凭据文件读不懂';
+  assert.deepEqual(live.blocker(NVDA, 100), { reason: '凭据文件读不懂', attention: true });
+  s.keysProblem = null;
+  // 已有持仓、腿被占用是策略本来就会等的。
+  assert.equal(await h.open(live, NVDA), null);
+  assert.deepEqual(live.blocker(NVDA, 100), { reason: '这个配对已有实盘持仓', attention: false });
+  assert.deepEqual(live.blocker(SHARED, 100), { reason: '有一条腿已被别的实盘持仓占用', attention: false });
+
+  // NVDA 是 Lighter + Entropy，GOLD 是 RH + Lighter：共用读数时三个场所各查一次、当日已实现读一次。
+  const fresh = harness(t), other = fresh.boot();
+  fresh.enable(other, [NVDA, GOLD]);
+  let probes = 0;
+  fresh.s.venueProblem = new Proxy({}, { get: () => { probes++; return undefined; } });
+  const net = t.mock.method(fresh.store, 'liveNetSince');
+  const memo = { venues: new Map() };
+  assert.deepEqual([other.blocker(NVDA, 100, memo), other.blocker(GOLD, 100, memo), other.blocker(NVDA, 100, memo)], [null, null, null]);
+  assert.deepEqual([probes, net.mock.callCount()], [3, 1]);
+  probes = 0;
+  assert.deepEqual([other.blocker(NVDA, 100), other.blocker(GOLD, 100)], [null, null]);
+  assert.deepEqual([probes, net.mock.callCount()], [4, 3], '不传共用读数时每次现读');
+  // 共用读数只在一次读数里有效：下一次读数重新查。
+  fresh.s.venueProblem = { lighter: 'Lighter 签名器文件不存在' };
+  assert.equal(other.blocker(NVDA, 100, memo), null, '同一次读数内沿用');
+  assert.equal(other.blocker(NVDA, 100, { venues: new Map() })?.attention, true);
+  // 同一份 memo 跨过 UTC 零点：当日已实现按新的一天重读，不沿用昨天。
+  fresh.s.venueProblem = {};
+  fresh.s.clock += 86_400_000;
+  net.mock.mockImplementation((since: number) => since > T0 ? -100 : 0);
+  assert.match(other.blocker(NVDA, 100, memo)?.reason ?? '', /当日已实现亏损达到上限/);
+  assert.equal(net.mock.callCount(), 4);
+  h.check(); fresh.check();
 });

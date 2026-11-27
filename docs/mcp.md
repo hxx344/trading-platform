@@ -214,9 +214,9 @@ R3：改动令牌的权限范围，第 8.4 节还会改 `read-token.json` 的格
 
   | 接口 | 内容 | 核对 |
   | --- | --- | --- |
-  | `/api/varlighter/state` | 总览：各配对的价差、基线、参数、来源状态、实盘持仓摘要 | Var token 只给状态，不含 token 本身（`TokenView`） |
+  | `/api/varlighter/state` | 总览：各配对的价差、基线、参数、来源状态、实盘持仓摘要；v0.114.0 起已启用且没有持仓的配对带 `gate`（现在为什么没开仓、这个原因要不要人处理 `attention`、是否已到入场线、最近一次到线被挡的原因） | Var token 只给状态，不含 token 本身（`TokenView`） |
   | `/api/varlighter/symbol`（`symbol`、`hours`、`points`） | 单个配对的走势点（`points` 取 `0–1500`，默认 `1500`；MCP 默认传 `0` 只看摘要与成交）、分时段统计、下单预演、实盘成交 | 只读本地库 |
-  | `/api/varlighter/live` | 实盘开关、执行优化设置、私有 WS 流状态、日级跳过统计、在途持仓与近期已平仓（含逐单耗时/滑点/来源遥测） | 只读本地库；凭据仅返回是否已配置（布尔）与事件列表 |
+  | `/api/varlighter/live` | 实盘开关、执行优化设置、私有 WS 流状态、日级跳过统计、在途持仓与近期已平仓（含逐单耗时/滑点/来源遥测）；v0.114.0 起另有 `marks`（在途持仓的浮盈与平仓线）、`tradedMore`（更早的有成交持仓，与 `trades` 里有成交的合计最近 50 笔）、`outcomes`（结果计数，`unsent` 是第一腿没成交里发单前就放弃的）、`breakdown`（按配对、按日、按平仓原因的盈亏） | 只读本地库；凭据仅返回是否已配置（布尔）与事件列表 |
   | `/api/varlighter/entropy-cost`（`from`、`to`、`limit`） | Entropy 主网实际扣费与返佣明细 | 只读本地库 |
   | `/api/varlighter/readiness` | 实盘前核对清单（v0.112.0 去掉模拟盘，`/api/varlighter/paper` 不再提供） | 只读本地库 |
   | `/api/varlighter/samples`（`symbol`、`after`、`limit`） | 原始样本，见上 | 只读本地库 |

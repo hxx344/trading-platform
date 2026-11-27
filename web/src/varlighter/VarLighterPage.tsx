@@ -14,7 +14,7 @@ import { VarLighterAccounts } from './VarLighterAccounts.tsx';
 import { VarLighterDetail } from './VarLighterDetail.tsx';
 import { VarLighterReady } from './VarLighterReady.tsx';
 import {
-  IDENTITY_LABELS, LIVE_STATE_LABELS, OVERVIEW_MODES, OVERVIEW_MODE_KEY, REGIME_LABELS, SIMPLE_SORT_KEYS, VARLIGHTER_BASE, VARLIGHTER_TABS, age, bps, comboShort, costBreakdown, directionLabel, directionShort, directionSides, entryProgress, fundingAnnual, matchesCombo, matchesQuery, plain,
+  IDENTITY_LABELS, LIVE_STATE_LABELS, OVERVIEW_MODES, OVERVIEW_MODE_KEY, REGIME_LABELS, SIMPLE_SORT_KEYS, VARLIGHTER_BASE, VARLIGHTER_TABS, age, baselineMissing, blockedAtEntry, sampleStale, bps, comboShort, gateNote, type GateNote, costBreakdown, directionLabel, directionShort, directionSides, entryProgress, fundingAnnual, matchesCombo, matchesQuery, plain,
   quickEnableBody, readOverviewMode, settingsBody, signal, signedUsd, sortRows, tone, usd, varLighterHref, venueShort, type ComboFilter, type OverviewMode, type SortKey, type VarLighterTab,
 } from './varlighter-form.ts';
 
@@ -89,6 +89,7 @@ function Overview({ view, onChanged }: { view: StateView; onChanged: () => Promi
   for (const row of view.rows) counts[row.identity]++;
   // 样本过期的行不算机会，也不高亮：最后一个样本到过线不代表现在还在线上。
   const hits = view.rows.filter(row => !isStale(row, view.now) && (signal(row)?.gap ?? -1) >= 0).length;
+  const blocked = blockedAtEntry(view.rows, view.now);
   const trading = view.trading;
   const simple = mode === 'simple';
   const changeMode = (next: OverviewMode) => {
@@ -109,7 +110,7 @@ function Overview({ view, onChanged }: { view: StateView; onChanged: () => Promi
   const pairFoot = [...combos.map(item => `${comboShort(item.combo)} ${item.pairs}`), customCount ? `手动 ${customCount}` : '', counts.review ? `待确认 ${counts.review}` : '', counts.mismatch ? `规格不同 ${counts.mismatch}` : ''].filter(Boolean).join(' · ');
   return <>
     <section className="vl-metrics" aria-label="概览">
-      <Metric label="开仓机会" value={`${hits} 个`} tone={hits ? 'up' : ''} accent={hits > 0} foot={hits ? '价差偏离已到开仓线，表格里绿色高亮；含只采集、不下单的配对' : '暂时没有配对的偏离到开仓线'} />
+      <Metric label="开仓机会" value={`${hits} 个`} tone={hits ? 'up' : ''} accent={hits > 0} foot={`${hits ? '价差偏离已到开仓线，表格里绿色高亮；含只采集、不下单的配对' : '暂时没有配对的偏离到开仓线'}${blocked ? ` · 已启用的里到线被挡 ${blocked} 个，原因见表格` : ''}`} />
       <Metric label="监控中的配对" value={`${view.rows.length} 个`} foot={pairFoot || '还没有配对'} />
       <Metric label="实盘今日净盈亏" value={signedUsd(trading.todayNetUsd)} tone={tone(trading.todayNetUsd)} foot={trading.on ? '实盘已打开 · 明细在实盘准备页' : '实盘关闭，不开新仓'} />
       <Metric label="实盘持仓" value={`${trading.open} 笔`} foot={`名义金额 ${usd(trading.openNotionalUsd, 0)}（含开仓中、平仓中、待处理）`} />
@@ -199,7 +200,7 @@ function Orphans({ view, rows, write, onChanged }: { view: StateView; rows: Orph
 
 /** 当天只写时刻，跨日带日期。 */
 const clockOrDate = (at: number, now: number) => new Date(at).toDateString() === new Date(now).toDateString() ? new Date(at).toLocaleTimeString() : new Date(at).toLocaleString();
-const isStale = (row: StateRow, now: number) => row.sampleAt === null || now - row.sampleAt > 5 * 60_000;
+const isStale = sampleStale;
 
 function SymbolCell({ row, multi, simple }: { row: StateRow; multi: boolean; simple: boolean }) {
   // 简洁视图只标出需要处理的规格状态；「已确认」不占位置。
@@ -230,6 +231,13 @@ function CostCell({ row }: { row: StateRow }) {
   return <td className="num">{plain(cost.total)}<small className={cost.warn ? 'vl-warn' : undefined}>{cost.parts}</small></td>;
 }
 
+/** 到了开仓线的行高亮；到线却被挡住的另用警示色标出。 */
+const rowClass = (reached: boolean, gate: GateNote | null): string | undefined => reached ? gate?.tone === 'bad' ? 'vl-hit vl-blocked' : 'vl-hit' : undefined;
+/** 「为什么没开仓」：最多三行，全文与最近一次没开成在悬停提示里。 */
+function GateLine({ note }: { note: GateNote | null }) {
+  return note ? <small className={`vl-gate-note ${note.tone}`} title={note.title}>{note.text}</small> : null;
+}
+
 function SimpleRow(props: EnableProps) {
   const { row, now, multi } = props;
   const progress = entryProgress(row);
@@ -237,18 +245,19 @@ function SimpleRow(props: EnableProps) {
   const reached = !!progress?.reached && !stale;
   // 偏离不为正时按这个方向做，回到平时水平也赚不到，不给买卖提示。
   const sides = progress && progress.deviation > 0 ? directionSides(progress.direction, row.a.venue, row.b.venue) : null;
-  return <tr className={reached ? 'vl-hit' : undefined}>
+  const gate = gateNote(row, now);
+  return <tr className={rowClass(reached, gate)}>
     <SymbolCell row={row} multi={multi} simple />
     <EnableCell {...props} />
     <td className="num"><span className={`vl-value${stale ? ' vl-dim' : ''}`}>{bps(row.mid)}</span>
       {stale ? <small className="vl-warn">{row.sampleAt ? `${age(row.sampleAt, now)}的数据` : '暂无数据'}</small>
-        : <small title={row.baseline ? `${row.baseline.fallback ? '全天' : REGIME_LABELS[row.baseline.regime]}基线，${row.baseline.samples} 个样本` : undefined}>{row.baseline ? `平时 ${bps(row.baseline.median)}` : '平时水平统计中'}</small>}</td>
+        : <small title={row.baseline ? `${row.baseline.fallback ? '全天' : REGIME_LABELS[row.baseline.regime]}基线，${row.baseline.samples} 个样本` : undefined}>{row.baseline ? `平时 ${bps(row.baseline.median)}` : baselineMissing(row, true)}</small>}</td>
     <td>{progress ? <div className={`vl-gap${reached ? ' reached' : stale ? ' stale' : ''}`}>
       <span>{progress.reached ? '已到开仓线' : `还差 ${plain(progress.short)}`}</span>
       <svg viewBox="0 0 100 6" preserveAspectRatio="none" role="img" aria-label={`偏离 ${plain(progress.deviation)} 基点，开仓线 ${plain(progress.entry)} 基点`}>
         <rect className="track" width="100" height="6" /><rect className="fill" width={Math.round(progress.ratio * 100)} height="6" /></svg>
       <small>偏离 {plain(progress.deviation)} / 开仓线 {plain(progress.entry)}</small>
-    </div> : <span className="vl-dim">数据不足</span>}</td>
+    </div> : <span className="vl-dim">数据不足</span>}<GateLine note={gate} /></td>
     <td>{sides ? <span className="vl-sides"><span className="vl-side sell">卖 {venueShort(sides.sell)}</span><span className="vl-side buy">买 {venueShort(sides.buy)}</span></span> : <span className="vl-dim">—</span>}</td>
     <CostCell row={row} />
   </tr>;
@@ -259,16 +268,17 @@ function Row(props: EnableProps) {
   const hit = signal(row);
   const funding = fundingAnnual(row.aFunding, row.bFunding);
   const stale = isStale(row, now);
-  return <tr className={hit && hit.gap >= 0 && !stale ? 'vl-hit' : undefined}>
+  const gate = gateNote(row, now);
+  return <tr className={rowClass(!!hit && hit.gap >= 0 && !stale, gate)}>
     <SymbolCell row={row} multi={multi} simple={false} />
     <EnableCell {...props} />
     <td>{row.kindName}<small>{REGIME_LABELS[row.regime]}</small></td>
     <td className={`num ${stale ? 'vl-dim' : ''}`}>{bps(row.mid)}<small>{row.sampleAt ? age(row.sampleAt, now) : '无样本'}</small></td>
-    <td className="num">{row.baseline ? <>{bps(row.baseline.median)} <span className="vl-dim">± {plain(row.baseline.sigma)}</span><small>{row.baseline.fallback ? '全天基线 · ' : `${REGIME_LABELS[row.baseline.regime]} · `}{row.baseline.samples} 个</small></> : <span className="vl-dim">样本不足</span>}</td>
+    <td className="num">{row.baseline ? <>{bps(row.baseline.median)} <span className="vl-dim">± {plain(row.baseline.sigma)}</span><small>{row.baseline.fallback ? '全天基线 · ' : `${REGIME_LABELS[row.baseline.regime]} · `}{row.baseline.samples} 个</small></> : <span className="vl-dim">{baselineMissing(row, false)}</span>}</td>
     <td className={`num ${row.z !== null && Math.abs(row.z) >= 2 ? 'vl-warn' : ''}`}>{row.z === null ? '—' : row.z.toFixed(1)}</td>
     <td className="num">{bps(row.sellA)} / {bps(row.buyA)}{row.estimated ? <Badge>估</Badge> : null}</td>
     <CostCell row={row} />
-    <td className="num">{hit ? <><span className={hit.gap >= 0 ? 'vl-up' : undefined}>{bps(hit.gap)}</span><small title={directionLabel(hit.direction, row.a.venue, row.b.venue)}>{directionShort(hit.direction, row.a.venue)} {plain(hit.deviation)} / {plain(row.entryBps)}</small></> : '—'}</td>
+    <td className="num">{hit ? <><span className={hit.gap >= 0 ? 'vl-up' : undefined}>{bps(hit.gap)}</span><small title={directionLabel(hit.direction, row.a.venue, row.b.venue)}>{directionShort(hit.direction, row.a.venue)} {plain(hit.deviation)} / {plain(row.entryBps)}</small></> : '—'}<GateLine note={gate} /></td>
     <td className="num">{funding.a} / {funding.b}<small>{venueShort(row.a.venue)} / {venueShort(row.b.venue)}</small></td>
     <td className="num">{row.samples24h}</td>
   </tr>;

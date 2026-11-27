@@ -163,6 +163,8 @@ export const BOOK_KEEP_LEVELS = 5_000;
 const BOOK_TRIM_SLACK = 1_000;
 /** 一条消息里一侧超过这么多档就作废重订（防异常大的消息）。 */
 const BOOK_MESSAGE_LEVELS = 100_000;
+/** 盘口这么久没有任何消息、market_stats 却报了不同的买卖价，就认为盘口订阅没跟上，作废重订（实测 market_stats 比盘口最多晚约 10 秒）。 */
+export const BOOK_TOP_SILENT_MS = 15_000;
 /** 只留离最优价最近的 BOOK_KEEP_LEVELS 档，返回留下的最远一档价格（新的裁剪边界）。 */
 function trimBook(levels: Map<number, number>, descending: boolean): number {
   const kept = sortedLevels(levels, descending).slice(0, BOOK_KEEP_LEVELS);
@@ -186,12 +188,15 @@ interface LighterBook {
   /** 连续重订次数（算出一次盘口清零），决定下次重订前要等多久。 */ retries: number;
   /** 被限速推迟的重订在这个时刻执行（期间盘口作废）。 */ due: number | null;
   /** 按 nonce 缓存已排序的买卖档，未收到新 snapshot/delta 时复用。 */ cachedDepth: { nonce: number | null; depth: { bids: [number, number][]; asks: [number, number][] } } | null;
+  /** 随增量维护的最优买卖价（一侧为空是 null）与最近一条快照或增量的时刻。 */ bestBid: number | null; bestAsk: number | null; lastAt: number;
 }
 
 /**
  * 一个 Lighter 场所的只读行情流：订阅 market_stats/all 拿全市场一档、标记价、指数价与资金费；
  * 已启用或有持仓的配对的腿另订阅 order_book/{编号}（快照后推增量，begin_nonce 对不上前一条的 nonce 就重新订阅）。
  * 首个快照开一个连续区间，断线或长时间沉默结束区间；区间外的时刻不对齐，避免拿断线前的旧价当当时的行情。
+ * 订阅了盘口的市场，一档买卖价取已同步盘口的最优价（market_stats 约每秒一批，实测比盘口晚 0.3 到 9 秒），标记价、指数价与资金费仍取 market_stats；
+ * 盘口未同步、倒挂、一侧为空、重订或退订时退回 market_stats 的买卖价。
  */
 export class LighterStream implements LiveStream {
   private socket: SocketLike | null = null;
@@ -212,6 +217,12 @@ export class LighterStream implements LiveStream {
   /** 订阅完整盘口的市场编号与各自的盘口（断线清空，连上后重新订阅）。 */
   private depthIds = new Set<number>();
   private readonly books = new Map<number, LighterBook>();
+  /** 一档买卖价当前取自盘口的市场；其余取自 market_stats。 */
+  private readonly bookTops = new Set<number>();
+  /** market_stats 最近报的买卖价：盘口作废时退回用（断线清空）。 */
+  private readonly statsTop = new Map<number, { bid: number; ask: number }>();
+  /** 当前盘口已经和 market_stats 的这组买卖价核对过；两边恢复一致或新盘口快照到达时清掉，避免持续错位被永久豁免。 */
+  private readonly statsChecked = new Map<number, { bid: number; ask: number }>();
 
   private readonly options: { url?: string; venue?: Venue; connect: Connect; now?: () => number; log?: (line: string) => void; onTop?: TopListener };
   constructor(options: { url?: string; venue?: Venue; connect: Connect; now?: () => number; log?: (line: string) => void; onTop?: TopListener }) { this.options = options; }
@@ -260,7 +271,7 @@ export class LighterStream implements LiveStream {
 
   setDepthMarkets(markets: ReadonlyMap<number, string>): void {
     const next = new Set(markets.keys());
-    for (const id of this.depthIds) if (!next.has(id)) { this.books.delete(id); this.send({ type: 'unsubscribe', channel: `order_book/${id}` }); }
+    for (const id of this.depthIds) if (!next.has(id)) { this.books.delete(id); this.statsChecked.delete(id); this.releaseBookTop(id); this.send({ type: 'unsubscribe', channel: `order_book/${id}` }); }
     const added = [...next].filter(id => !this.depthIds.has(id));
     this.depthIds = next;
     if (this.state.connected) for (const id of added) this.subscribeBook(id);
@@ -292,7 +303,8 @@ export class LighterStream implements LiveStream {
     return book?.synced ? book.error : book?.error ?? '等待盘口快照';
   }
   private subscribeBook(id: number, error: string | null = null, retries = 0): void {
-    this.books.set(id, { bids: new Map(), asks: new Map(), synced: false, nonce: null, askedAt: this.now(), error, retries, due: null, bidFloor: null, askCeil: null, cachedDepth: null });
+    this.books.set(id, { bids: new Map(), asks: new Map(), synced: false, nonce: null, askedAt: this.now(), error, retries, due: null, bidFloor: null, askCeil: null, cachedDepth: null, bestBid: null, bestAsk: null, lastAt: this.now() });
+    this.releaseBookTop(id);
     this.send({ type: 'subscribe', channel: `order_book/${id}` });
   }
   /**
@@ -305,7 +317,9 @@ export class LighterStream implements LiveStream {
     const wait = Math.min(BOOK_RESYNC_MIN_MS * 2 ** book.retries, BOOK_RESYNC_MAX_MS);
     if (this.now() - book.askedAt < wait) {
       book.synced = false; book.bids.clear(); book.asks.clear(); book.nonce = null; book.error = reason; book.bidFloor = book.askCeil = null; book.cachedDepth = null;
+      book.bestBid = book.bestAsk = null;
       book.due ??= book.askedAt + wait;
+      this.releaseBookTop(id);
       return;
     }
     this.send({ type: 'unsubscribe', channel: `order_book/${id}` });
@@ -376,8 +390,9 @@ export class LighterStream implements LiveStream {
       }
       if (!this.topSegments.length || this.topSegments.at(-1)!.end !== null) return;
       const stats = object(message.market_stats);
-      if (!stats) return;
-      for (const raw of Object.values(stats)) this.mergeTop(object(raw), now, type === 'subscribed/market_stats');
+      if (stats) for (const raw of Object.values(stats)) this.mergeTop(object(raw), now, type === 'subscribed/market_stats');
+      // 区间刚开：盘口快照可能先于 market_stats 快照到，这时才能把盘口的最优价记进历史。
+      if (type === 'subscribed/market_stats') for (const [id, book] of this.books) this.syncBookTop(id, book, now);
     }
   }
 
@@ -388,6 +403,7 @@ export class LighterStream implements LiveStream {
     if (snapshot) {
       if (value.code !== undefined && value.code !== 0) { this.resyncBook(id, `盘口快照无效（code ${String(value.code).slice(0, 20)}）`); return; }
       book.bids.clear(); book.asks.clear(); book.synced = true; book.error = null; book.due = null; book.bidFloor = book.askCeil = null;
+      book.bestBid = book.bestAsk = null;
     } else {
       if (!book.synced) return;
       // begin_nonce 应等于上一条的 nonce；对不上说明漏了增量。
@@ -395,31 +411,86 @@ export class LighterStream implements LiveStream {
     }
     // 超大的消息不截断着用（行不一定按最优排好，截掉的部分会让盘口悄悄出错）：作废并重订。
     if ([value.bids, value.asks].some(rows => Array.isArray(rows) && rows.length > BOOK_MESSAGE_LEVELS)) { this.resyncBook(id, '盘口消息过大，重新订阅'); return; }
-    const apply = (levels: Map<number, number>, rows: unknown, outside: (price: number) => boolean) => {
-      if (!Array.isArray(rows)) return;
+    // 最优价随增量维护：新档更优就换上；删掉的正是最优档时这一侧重扫一遍（返回 true）。
+    const apply = (levels: Map<number, number>, rows: unknown, outside: (price: number) => boolean, best: number | null, better: (price: number, best: number) => boolean): { best: number | null; rescan: boolean } => {
+      let rescan = false;
+      if (!Array.isArray(rows)) return { best, rescan };
       for (const raw of rows) {
         const row = object(raw), price = decimal(row?.price), size = decimal(row?.size);
         if (price === null || size === null || price <= 0 || outside(price)) continue;
-        if (size <= 0) levels.delete(price); else levels.set(price, size);
+        if (size <= 0) { if (levels.delete(price) && price === best) rescan = true; }
+        else { levels.set(price, size); if (best === null || better(price, best)) best = price; }
       }
+      return { best, rescan };
     };
-    apply(book.bids, value.bids, price => book.bidFloor !== null && price < book.bidFloor);
-    apply(book.asks, value.asks, price => book.askCeil !== null && price > book.askCeil);
+    const extreme = (levels: ReadonlyMap<number, number>, better: (price: number, best: number) => boolean): number | null => {
+      let best: number | null = null;
+      for (const price of levels.keys()) if (best === null || better(price, best)) best = price;
+      return best;
+    };
+    const higher = (price: number, best: number) => price > best, lower = (price: number, best: number) => price < best;
+    const bids = apply(book.bids, value.bids, price => book.bidFloor !== null && price < book.bidFloor, book.bestBid, higher);
+    const asks = apply(book.asks, value.asks, price => book.askCeil !== null && price > book.askCeil, book.bestAsk, lower);
+    book.bestBid = bids.rescan ? extreme(book.bids, higher) : bids.best;
+    book.bestAsk = asks.rescan ? extreme(book.asks, lower) : asks.best;
     book.nonce = Number.isSafeInteger(value.nonce) ? value.nonce as number : null;
+    book.lastAt = this.now();
     if (book.bids.size > BOOK_KEEP_LEVELS + BOOK_TRIM_SLACK) book.bidFloor = trimBook(book.bids, true);
     if (book.asks.size > BOOK_KEEP_LEVELS + BOOK_TRIM_SLACK) book.askCeil = trimBook(book.asks, false);
     // 裁过的一侧被吃掉一半以上：价格走得远，边界外的档已经不知道，重新订阅拿完整快照。
-    if (book.bidFloor !== null && book.bids.size < BOOK_KEEP_LEVELS / 2 || book.askCeil !== null && book.asks.size < BOOK_KEEP_LEVELS / 2) this.resyncBook(id, '裁剪后的盘口变浅，重新订阅');
+    if (book.bidFloor !== null && book.bids.size < BOOK_KEEP_LEVELS / 2 || book.askCeil !== null && book.asks.size < BOOK_KEEP_LEVELS / 2) { this.resyncBook(id, '裁剪后的盘口变浅，重新订阅'); return; }
+    this.syncBookTop(id, book, book.lastAt);
+  }
+
+  /** 把已同步盘口的最优买卖价记成这个市场的一档；倒挂、一侧为空或还没有进行中的区间时不用盘口的（退回 market_stats 的）。 */
+  private syncBookTop(id: number, book: LighterBook, now: number): void {
+    if (this.topSegments.at(-1)?.end !== null) return;
+    const bid = book.bestBid, ask = book.bestAsk;
+    if (!book.synced || bid === null || ask === null || bid >= ask) { this.releaseBookTop(id); return; }
+    this.statsChecked.delete(id);
+    this.bookTops.add(id);
+    const previous = this.current.get(id);
+    if (previous && previous.bid === bid && previous.ask === ask) return;
+    this.recordTop(id, { bid, ask, mark: previous?.mark ?? null, index: previous?.index ?? null, funding: previous?.funding ?? null }, now);
+  }
+  /** 这个市场的一档不再取自盘口：买卖价退回 market_stats 最近报的；market_stats 没报过这个市场时就没有一档可用。 */
+  private releaseBookTop(id: number): void {
+    if (!this.bookTops.delete(id)) return;
+    const previous = this.current.get(id), quoted = this.statsTop.get(id);
+    if (!quoted || !(quoted.bid > 0 && quoted.ask >= quoted.bid)) { this.current.delete(id); this.top.delete(id); return; }
+    if (!previous || (previous.bid === quoted.bid && previous.ask === quoted.ask) || this.topSegments.at(-1)?.end !== null) return;
+    this.recordTop(id, { ...previous, ...quoted }, this.now());
+  }
+  /** 买卖价变了：换成当前状态，有效的记进历史并通知监听方。 */
+  private recordTop(id: number, next: Omit<TopPoint, 'at'>, now: number): void {
+    this.current.set(id, next);
+    if (!(next.bid > 0 && next.ask >= next.bid)) return;
+    const points = this.top.get(id) ?? [];
+    points.push({ at: now, ...next });
+    this.top.set(id, points);
+    this.options.onTop?.(id);
   }
 
   private mergeTop(item: Record<string, unknown> | null, now: number, snapshot: boolean): void {
     if (!item || !Number.isSafeInteger(item.market_id)) return;
     const id = item.market_id as number;
-    const previous = this.current.get(id);
     const field = (key: string) => key in item ? decimal(item[key]) : undefined;
+    const seen = this.statsTop.get(id);
+    const quoted = { bid: field('best_bid_price') ?? seen?.bid ?? 0, ask: field('best_ask_price') ?? seen?.ask ?? 0 };
+    this.statsTop.set(id, quoted);
+    // market_stats 的买卖价与盘口不同、盘口却已这么久没有任何消息：盘口订阅没跟上（market_stats 最多晚约 10 秒），作废重订，先退回 market_stats。
+    // 这个市场的每条 market_stats 都核对（只带标记价的也算：它不带买卖价时沿用上次报的），否则买卖价只变一次、之后只有标记价在动时，卡住的盘口会一直被当成新的。
+    const held = this.bookTops.has(id) ? this.current.get(id) : undefined, book = this.books.get(id), checked = this.statsChecked.get(id);
+    if (held && quoted.bid === held.bid && quoted.ask === held.ask) this.statsChecked.delete(id);
+    if (held && book && quoted.bid > 0 && quoted.ask > 0 && (quoted.bid !== held.bid || quoted.ask !== held.ask) && now - book.lastAt > BOOK_TOP_SILENT_MS
+      && !(checked && checked.bid === quoted.bid && checked.ask === quoted.ask)) {
+      this.statsChecked.set(id, quoted);
+      this.resyncBook(id, '盘口没有跟上一档的变化，重新订阅');
+    }
+    const previous = this.current.get(id), fromBook = this.bookTops.has(id) && previous !== undefined;
     const rate = field('current_funding_rate');
     const next = {
-      bid: field('best_bid_price') ?? previous?.bid ?? 0, ask: field('best_ask_price') ?? previous?.ask ?? 0,
+      bid: fromBook ? previous.bid : quoted.bid, ask: fromBook ? previous.ask : quoted.ask,
       mark: field('mark_price') ?? previous?.mark ?? null, index: field('index_price') ?? previous?.index ?? null,
       funding: rate === undefined ? previous?.funding ?? null : rate === null ? null : rate / 100,
     };
@@ -445,6 +516,9 @@ export class LighterStream implements LiveStream {
       if (last && last.end === null) last.end = this.state.lastMessageAt ?? now;
       this.current.clear();
       this.books.clear();
+      this.bookTops.clear();
+      this.statsTop.clear();
+      this.statsChecked.clear();
     }
     this.state.connected = false;
     this.lastRefresh = null;

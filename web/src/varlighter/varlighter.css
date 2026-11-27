@@ -210,3 +210,25 @@ a.vl-symbol:hover{color:var(--accent)}
 .vl-acc-facts dd:not(.vl-up):not(.vl-down){color:var(--text-primary)}
 @media (max-width:1100px){.vl-acc-grid{grid-template-columns:minmax(0,1fr)}}
 @media (max-width:650px){.vl-acc-facts{grid-template-columns:minmax(0,1fr)}}
+/* 总览「为什么没开仓」（VarLighterPage.tsx 的 GateLine）：长原因最多三行，全文在悬停提示里 */
+.vl-table small.vl-gate-note{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:3;overflow:hidden;max-width:240px;margin-top:4px;white-space:normal;overflow-wrap:anywhere;line-height:1.45;font-family:var(--font-sans)}
+.vl-table .num small.vl-gate-note{margin-left:auto;text-align:right}
+.vl-table small.vl-gate-note.bad{color:var(--error);font-weight:600}
+.vl-table small.vl-gate-note.warn{color:var(--warning)}
+.vl-table small.vl-gate-note.ok{color:var(--emerald)}
+.vl-overview tbody tr.vl-hit.vl-blocked{background:var(--warning-soft)}
+.vl-overview tbody tr.vl-hit.vl-blocked td:first-child{box-shadow:inset 3px 0 0 var(--warning)}
+
+/* 实盘页：持仓表的操作列在横向滚动时贴右不动（平仓按钮始终可见），说明折行放在状态下 */
+.vl-table td.vl-stick,.vl-table th.vl-stick{position:sticky;right:0;background:var(--surface-2)}
+.vl-table tbody tr:hover td.vl-stick{background:var(--surface-3)}
+.vl-table small.vl-live-note{max-width:220px;white-space:normal;overflow-wrap:anywhere}
+@media (max-width:650px){.vl-table td.vl-stick,.vl-table th.vl-stick{position:static}}
+/* 实盘页：字段范围提示、结果计数、盈亏分组 */
+.vl-field small.vl-warn{color:var(--warning)}
+.vl-field input[aria-invalid=true]{border-color:var(--warning)}
+.vl-live-outcomes{display:flex;flex-direction:column;gap:2px;border-bottom:1px solid var(--surface-4)}
+.vl-live-breakdown{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));align-items:start}
+.vl-live-breakdown>section{min-width:0;border-right:1px solid var(--surface-4)}
+.vl-live-breakdown>section:last-child{border-right:0}
+@media (max-width:1100px){.vl-live-breakdown{grid-template-columns:minmax(0,1fr)}.vl-live-breakdown>section{border-right:0;border-bottom:1px solid var(--surface-4)}.vl-live-breakdown>section:last-child{border-bottom:0}}

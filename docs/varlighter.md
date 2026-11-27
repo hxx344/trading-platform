@@ -59,8 +59,8 @@ Var（Variational Omni）与 Lighter 两个场所——Lighter RH（`api.rh.ligh
 | Var 公开报价 | `omni-client-api.prod.ap-northeast-1.variational.io/metadata/stats` | 每 60 秒 | 标记价、资金费、`quotes`（base / 1k / 100k 三档买卖价与 `updated_at`） |
 | Var token 询价（v0.82.0，有可用 token 时） | `omni.variational.io/api/quotes/indicative`，经 `scripts/variational-request.py` | 每 60 秒（与公开报价同一轮） | 已启用配对的开仓数量或持仓实际数量、相应买卖价与报价时刻 |
 | Lighter 目录 | 各场所 `/api/v1/orderBookDetails` | 每 10 分钟 | 市场编号、精度、最小数量与金额、标记价 |
-| Lighter 行情流 | 各场所 `wss://…/stream?readonly=true` 订阅 `market_stats/all` | 实时 | 全市场一档买卖价、标记价、资金费；按时刻保留历史以便回看 |
-| Lighter 盘口（v0.89.0 起） | 同一行情流再订阅 `order_book/{市场编号}`（快照加增量） | 实时 | 只订已启用或有持仓的配对，每个场所最多 10 个；v0.88.0 及以前是每分钟一次 REST `orderBookOrders` 快照，见 [dexspread.md](dexspread.md) 第 10.10 节 |
+| Lighter 行情流 | 各场所 `wss://…/stream?readonly=true` 订阅 `market_stats/all` | 实时 | 全市场一档买卖价、标记价、资金费；按时刻保留历史以便回看。v0.114.0 起订阅了盘口的市场一档买卖价改取盘口的最优价，这里只用它的标记价、指数价与资金费（[dexspread.md](dexspread.md) 第 20 节） |
+| Lighter 盘口（v0.89.0 起） | 同一行情流再订阅 `order_book/{市场编号}`（快照加增量） | 实时 | 只订已启用或有持仓的配对，每个场所最多 10 个；v0.114.0 起这些市场的一档也取自盘口，盘口不可用时退回 `market_stats`；v0.88.0 及以前是每分钟一次 REST `orderBookOrders` 快照，见 [dexspread.md](dexspread.md) 第 10.10 节 |
 
 - **Var token 询价**（`varquote.ts`）：合约写法按类别：加密货币 `{ underlying, instrument_type: 'perpetual_future', settlement_asset: 'USDC', funding_interval_s: 3600 }`，股票与商品 `{ underlying, instrument_type: 'perpetual_rwa_future', settlement_asset: 'USDC', kind: 'equity' | 'commodity' }`（公开目录里的 `funding_interval_s` 是 28800，价格流不接受）。应答要求标的与数量对得上请求、买卖价不倒挂、报价时刻在 [现在 − 15 秒, 现在 + 2 秒] 内，否则不用。询价阶段整个限 8 秒，到点用已拿到的。失败原因分缺 `python3`、超时、被拦截、应答对不上等固定文案（被拒与被拦截之外的都带标的代码），在状态里保留 90 秒，同一轮里别的配对成功不会盖掉它。token 的状态分未配置、已过期（到期前 30 秒起）、正常、会话已失效（被 Var 拒绝）、暂不可用（网络、拦截或缺 `python3`）；被拒的判定只落在发请求时用的那个 token 上，请求途中文件换了新 token 不会把新的标成失效。
 - **对齐**：Var 报价自带 `updated_at`，收到时一般已过去约 20 秒。每个样本按 Var 报价时刻 `t` 取该场所行情流在 `t` 之前最近的一档；行情流断线后的时刻不算有数据。同一报价时刻不重复计入。

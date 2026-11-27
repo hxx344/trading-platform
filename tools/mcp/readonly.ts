@@ -230,7 +230,7 @@ export const TOOLS: readonly Tool[] = [
   },
   {
     name: 'varlighter', scope: 'portfolio',
-    description: `DEX 价差模块（原 Var/Lighter 价差回归；场所 var、rh（Lighter RH）、lighter（Lighter 主网）、entropy，两腿 A/B；v0.112.0 起没有模拟盘，策略信号直接驱动实盘）：view=state 为各配对的价差、基线、参数、来源状态与实盘持仓摘要；symbol 为单个配对（symbol 为配对键，如 var:AAPL|rh:AAPL、lighter:BTC|entropy:BTC，hours 1–336，points 0–1500 默认 0 只看摘要与成交）的走势、分时段统计与实盘成交；live 为实盘开关、执行优化设置、私有流状态、日级跳过统计、在途持仓与成交订单全链路遥测；entropy_cost 为 Entropy 主网实际扣费与返佣明细；readiness 为实盘前核对清单。要回测或扫参数用 varlighter_backtest。${DATA_NOTE}`,
+    description: `DEX 价差模块（原 Var/Lighter 价差回归；场所 var、rh（Lighter RH）、lighter（Lighter 主网）、entropy，两腿 A/B；v0.112.0 起没有模拟盘，策略信号直接驱动实盘）：view=state 为各配对的价差、基线、参数、来源状态与实盘持仓摘要（已启用且没有持仓的配对带 gate：现在为什么没开仓、要不要人处理 attention、是否已到入场线、最近一次到线被挡的原因）；symbol 为单个配对（symbol 为配对键，如 var:AAPL|rh:AAPL、lighter:BTC|entropy:BTC，hours 1–336，points 0–1500 默认 0 只看摘要与成交）的走势、分时段统计与实盘成交；live 为实盘开关、执行优化设置、私有流状态、日级跳过统计、在途持仓（marks 为浮盈与平仓线）与成交订单全链路遥测、结果计数（outcomes）与按配对、按日、按平仓原因的盈亏（breakdown）；entropy_cost 为 Entropy 主网实际扣费与返佣明细；readiness 为实盘前核对清单。要回测或扫参数用 varlighter_backtest。${DATA_NOTE}`,
     inputSchema: schema({
       view: { type: 'string', enum: ['state', 'symbol', 'live', 'entropy_cost', 'readiness'] },
       symbol: { type: 'string', pattern: PAIR_KEY.source },

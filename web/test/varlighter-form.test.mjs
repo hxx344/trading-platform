@@ -5,12 +5,14 @@ import { readSymbolParams, readGlobalParams, DEFAULT_SYMBOL, DEFAULT_GLOBAL } fr
 import { backtestRequest } from '../../src/varlighter/backtest.ts';
 import { pairKey, parsePairKey } from '../../src/varlighter/model.ts';
 import { readCustomPair } from '../../src/varlighter/engine.ts';
-import { DEFAULT_LIVE_EXEC, readLiveExecSettings } from '../../src/varlighter/live.ts';
+import { DEFAULT_LIVE_EXEC, DEFAULT_LIVE_SETTINGS, LIVE_EXEC_RANGES as SERVER_EXEC_RANGES, LIVE_LIMIT_RANGES as SERVER_LIMIT_RANGES, readLiveExecSettings, readLiveSettings } from '../../src/varlighter/live.ts';
 import {
   EMPTY_PAIR_FORM, backtestBody, bps, bytesPerDay, chartRange, chartRows, comboLabel, comboShort, customPairKey, customPairRequest, directionLabel, directionShort, fundingAnnual, globalForm, globalRequest,
   SIMPLE_SORT_KEYS, directionSides, entryProgress, matchesCombo, pairLabel, readOverviewMode, rebateAudit, settingsBody, signal, sortRows, costBreakdown, symbolForm, symbolRequest, toggleConfirmed, usd, varLighterHref, AUTO_FIELDS, autoBody, autoFormPatch, quickEnableBody,
   VARLIGHTER_TABS, reasonLabel, ACCOUNT_VENUE_FILTERS, accountActivityFoot, filterAccountPositions, filterAccountTrades, filterAccountFunding, selectedEquitySeries, selectedVenuePnlCurve, formatCurrencyAmount, signedCurrencyAmount, formatRatePct, marginModeLabel, tradeDirLabel, accountHealthBadge,
   liveExecForm, parseLiveExec, tradeTelemetrySummary,
+  baselineMissing, blockedAtEntry, breakdownRows, firstLegMissRate, firstLegMissed, firstLegSent, followServerForm, gateNote, liveLimitsForm, liveOutcomes, liveSwitchForm, msText, orderTelemetryStats, outcomeCounts, outcomeText, parseLiveLimits, positionMarkCells, quantile, rangeFieldErrors, sameLiveForm,
+  tradedPositions, untradedPositions, LIVE_EXEC_FIELDS, LIVE_EXEC_RANGES, LIVE_LIMIT_FIELDS, LIVE_LIMIT_RANGES,
 } from '../src/varlighter/varlighter-form.ts';
 import { parseRoute } from '../src/route-parse.ts';
 
@@ -323,4 +325,186 @@ test('live exec form round-trips with server readLiveExecSettings and formats tr
   assert.equal(tradeTelemetrySummary({
     orders: [{ role: 'openA', leg: 'a', venue: 'lighter', side: 'sell', clientId: 1, qty: 1, filledQty: 1, expectedPrice: 100, limitPrice: 99.98, avgPrice: 99.99, slippageBps: 1, signalAt: 1000, sentAt: 1010, ackAt: 1050, confirmAt: 1190, confirmSource: 'ws', status: '已成交' }],
   }), 'WS · 180 ms · A滑点 +1.0 bps（共 1 笔单）');
+  assert.equal(tradeTelemetrySummary({
+    orders: [{ role: 'openA', leg: 'a', venue: 'lighter', side: 'sell', clientId: 1, qty: 1, filledQty: 1, expectedPrice: 100, limitPrice: 99.98, avgPrice: null, slippageBps: 280, signalAt: 1000, sentAt: 1010, ackAt: 1050, confirmAt: 1190, confirmSource: 'account', status: '已成交' }],
+  }), '对账 · 180 ms（共 1 笔单）', '成交均价是估算时不把限价算出的滑点当成实际滑点');
+});
+
+test('overview gate note: why an enabled pair without a position has not opened', () => {
+  const now = 1_000_000_000;
+  assert.equal(gateNote({}, now), null, '旧服务没有 gate');
+  assert.equal(gateNote({ gate: null }, now), null, '有持仓或未启用');
+  const gate = { blocker: null, reached: false, deviation: 3, expectedNetBps: null, last: null };
+  assert.equal(gateNote({ gate }, now), null, '没到入场线、没被挡、也没有最近一次：保持现状');
+  assert.deepEqual(gateNote({ gate: { ...gate, blocker: '实盘关闭' } }, now), { tone: 'warn', text: '未开仓：实盘关闭', title: '未开仓：实盘关闭' });
+  assert.deepEqual(gateNote({ gate: { ...gate, blocker: '可用余额不足', reached: true, deviation: 12 } }, now), { tone: 'bad', text: '未开仓：可用余额不足', title: '已到入场线，未开仓：可用余额不足' }, '到了入场线却被挡：更醒目');
+  assert.deepEqual(gateNote({ gate: { ...gate, reached: true, expectedNetBps: 4.25 } }, now), { tone: 'ok', text: '已到入场线，预期净利 +4.3 基点，等待确认或下单', title: '已到入场线，预期净利 +4.3 基点，等待确认或下单' });
+  assert.equal(gateNote({ gate: { ...gate, reached: true } }, now).text, '已到入场线，等待确认或下单', '缺预期净利时不写');
+  const last = { at: now - 180_000, reason: '实时价差已缩窄' };
+  assert.deepEqual(gateNote({ gate: { ...gate, last } }, now), { tone: 'dim', text: '最近一次没开成：3 分钟前，实时价差已缩窄', title: '最近一次没开成：3 分钟前，实时价差已缩窄' }, '只有最近一次时单独显示');
+  assert.deepEqual(gateNote({ gate: { ...gate, blocker: '冷却中', last: { at: now - 30_000, reason: '单腿' } } }, now), { tone: 'warn', text: '未开仓：冷却中', title: '未开仓：冷却中\n最近一次没开成：30 秒前，单腿' }, '有挡住原因时最近一次放进悬停提示');
+  assert.equal(blockedAtEntry([{ sampleAt: now }, { sampleAt: now }], now), null, '旧服务不显示到线被挡');
+  const fresh = { sampleAt: now - 1_000 };
+  assert.equal(blockedAtEntry([{ ...fresh, gate: null }, { ...fresh, gate: { ...gate, reached: true, blocker: 'x' } }, { ...fresh, gate: { ...gate, blocker: 'y' } }, { ...fresh, gate: { ...gate, reached: true } }], now), 1);
+  assert.equal(blockedAtEntry([{ sampleAt: now - 6 * 60_000, gate: { ...gate, reached: true, blocker: 'x' } }, { sampleAt: null, gate: { ...gate, reached: true, blocker: 'x' } }], now), 0, '样本过期的行不高亮，也不计入到线被挡');
+  // 策略本来就会等的、用户自己的设置（attention 为 false）：不用警示色，也不计入到线被挡。
+  assert.deepEqual(gateNote({ gate: { ...gate, blocker: '冷却中', attention: false, reached: true } }, now), { tone: 'dim', text: '未开仓：冷却中', title: '已到入场线，未开仓：冷却中' });
+  assert.equal(gateNote({ gate: { ...gate, blocker: '实盘总开关未开', attention: false } }, now).tone, 'dim');
+  assert.equal(gateNote({ gate: { ...gate, blocker: 'Lighter 账户读数不够新', attention: true, reached: true } }, now).tone, 'bad');
+  assert.equal(gateNote({ gate: { ...gate, blocker: 'Lighter 账户读数不够新', attention: true } }, now).tone, 'warn');
+  assert.equal(blockedAtEntry([{ ...fresh, gate: { ...gate, reached: true, blocker: '冷却中', attention: false } }, { ...fresh, gate: { ...gate, reached: true, blocker: '余额不足', attention: true } }], now), 1);
+  assert.equal(baselineMissing({ baselineWarming: true }, true), '基线预热中');
+  assert.equal(baselineMissing({}, true), '平时水平统计中');
+  assert.equal(baselineMissing({ baselineWarming: false }, false), '样本不足');
+});
+
+test('live limit and exec ranges match the server and reject what it rejects', () => {
+  assert.deepEqual(LIVE_LIMIT_RANGES, SERVER_LIMIT_RANGES);
+  assert.deepEqual(LIVE_EXEC_RANGES, SERVER_EXEC_RANGES);
+  for (const field of LIVE_LIMIT_FIELDS) assert.deepEqual([field.min, field.max], [...SERVER_LIMIT_RANGES[field.key]], field.key);
+  for (const field of LIVE_EXEC_FIELDS) assert.deepEqual([field.min, field.max], [...SERVER_EXEC_RANGES[field.key]], field.key);
+  const form = liveLimitsForm(DEFAULT_LIVE_SETTINGS.limits);
+  const parsed = parseLiveLimits(form);
+  assert.ok(parsed.ok);
+  assert.deepEqual(readLiveSettings({ on: false, pairs: [], limits: parsed.value }, () => true).limits, DEFAULT_LIVE_SETTINGS.limits, '服务端接受页面生成的限额');
+  const cases = [
+    [{ perTradeUsd: '9' }, '单笔名义（美元）须在 10 到 100000 之间'],
+    [{ maxOpen: '21' }, '同时持仓（笔）须在 1 到 20 之间'],
+    [{ maxOpen: '1.5' }, '同时持仓（笔）须为整数'],
+    [{ dailyLossUsd: '' }, '当日亏损上限（美元）须填数字'],
+    [{ slippageBps: '301' }, 'B 腿与平仓限价保护（基点）须在 1 到 300 之间'],
+  ];
+  for (const [patch, error] of cases) {
+    assert.deepEqual(parseLiveLimits({ ...form, ...patch }), { ok: false, error });
+    assert.throws(() => readLiveSettings({ on: false, pairs: [], limits: { ...DEFAULT_LIVE_SETTINGS.limits, ...Object.fromEntries(Object.entries(patch).map(([key, value]) => [key, value === '' ? null : Number(value)])) } }, () => true), undefined, `服务端同样拒绝 ${JSON.stringify(patch)}`);
+  }
+  assert.deepEqual(rangeFieldErrors(LIVE_LIMIT_FIELDS, form), {});
+  assert.deepEqual(rangeFieldErrors(LIVE_LIMIT_FIELDS, { ...form, maxOpen: '0', slippageBps: 'abc' }), { maxOpen: '须为 1 到 20 的整数', slippageBps: '须为 1 到 300 之间的数' });
+  assert.deepEqual(rangeFieldErrors(LIVE_EXEC_FIELDS, { ...liveExecForm(DEFAULT_LIVE_EXEC), confirmMs: '10001' }), { confirmMs: '须为 0 到 10000 的整数' });
+});
+
+test('live switch form follows the server only while the user has no unsaved edits (L089)', () => {
+  const settings = { on: false, pairs: ['b', 'a'], limits: DEFAULT_LIVE_SETTINGS.limits };
+  const base = liveSwitchForm(settings, DEFAULT_LIVE_EXEC);
+  const next = liveSwitchForm({ ...settings, limits: { ...settings.limits, maxOpen: 3 } }, DEFAULT_LIVE_EXEC);
+  assert.ok(sameLiveForm(base, liveSwitchForm({ ...settings, pairs: ['a', 'b'] }, DEFAULT_LIVE_EXEC)), '配对不计顺序');
+  assert.ok(sameLiveForm({ ...base, limits: { ...base.limits, perTradeUsd: '100.0' } }, base), '同一个数的不同写法相同');
+  assert.equal(followServerForm(base, base, next), true, '没改过：跟随服务器');
+  const edited = { ...base, limits: { ...base.limits, dailyLossUsd: '50' } };
+  assert.equal(followServerForm(edited, base, next), false, '有未保存的修改：保留编辑');
+  assert.equal(followServerForm(edited, base, base), false, '迟到的旧读数也不冲掉编辑');
+  const submitted = { ...base, exec: { ...base.exec, maxLeverage: '2' } };
+  const afterSave = liveSwitchForm(settings, { ...DEFAULT_LIVE_EXEC, maxLeverage: 2 });
+  assert.equal(followServerForm(submitted, base, afterSave), true, '保存成功：表单与新值一致，跟随');
+  assert.equal(followServerForm({ ...submitted, pairs: ['a'] }, base, afterSave), false, '保存期间接着改的保留');
+  assert.equal(followServerForm({ ...base, exec: { ...base.exec, autoSizeByBalance: false } }, base, next), false, '勾选框也算修改');
+});
+
+const order = (role, extra = {}) => ({ role, leg: role.endsWith('B') ? 'b' : 'a', venue: 'lighter', side: 'buy', clientId: 1, qty: 1, filledQty: 1, expectedPrice: 100, limitPrice: 100, avgPrice: 100, slippageBps: 1, signalAt: 900, sentAt: 1000, ackAt: 1050, confirmAt: 1200, confirmSource: 'ws', status: '已成交', ...extra });
+test('order telemetry stats by role: counts, fill rate, slippage and latency quantiles, confirm sources', () => {
+  assert.deepEqual(orderTelemetryStats([]), { positions: 0, orders: 0, roles: [] });
+  assert.deepEqual(orderTelemetryStats([{}, { orders: [] }]), { positions: 0, orders: 0, roles: [] });
+  const nulls = orderTelemetryStats([{ orders: [order('openA', { slippageBps: null, filledQty: 0 }), order('openA', { slippageBps: null, signalAt: null })] }]).roles[0];
+  assert.equal(nulls.slipMean, null);
+  assert.equal(nulls.slipP50, null);
+  assert.equal(nulls.slipSamples, 0);
+  assert.equal(nulls.fillRate, 0.5);
+  assert.equal(nulls.signalP50, 100, 'signalAt 为 null 的不计');
+  const single = orderTelemetryStats([{ orders: [order('closeB', { slippageBps: 2.5, confirmAt: 1300 })] }]).roles[0];
+  assert.deepEqual([single.slipMean, single.slipP50, single.slipP90, single.confirmP50, single.confirmP90], [2.5, 2.5, 2.5, 300, 300], '单个样本的分位数就是它本身');
+  const stats = orderTelemetryStats([
+    { orders: [order('openA', { slippageBps: 1 }), order('openB', { slippageBps: -1, confirmSource: 'sync' }), order('closeA', { confirmSource: 'rest' }), order('closeB')] },
+    { orders: [order('openA', { slippageBps: 3, confirmSource: 'rest', confirmAt: 1400 }), order('openB', { filledQty: 0, slippageBps: null }), order('flatten', { confirmSource: 'account' })] },
+    { orders: [order('openA', { slippageBps: 5, confirmSource: 'account', confirmAt: 1600 })] },
+  ]);
+  assert.equal(stats.positions, 3);
+  assert.equal(stats.orders, 8);
+  assert.deepEqual(stats.roles.map(item => [item.role, item.label, item.orders]), [['openA', '开仓 A 腿', 3], ['openB', '开仓 B 腿', 2], ['closeA', '平仓 A 腿', 1], ['closeB', '平仓 B 腿', 1], ['flatten', '回补', 1]]);
+  const openA = stats.roles[0];
+  assert.deepEqual([openA.slipMean, openA.slipP50, openA.slipP90], [3, 3, 4.6]);
+  assert.deepEqual([openA.confirmP50, openA.confirmP90], [400, 560]);
+  assert.deepEqual(openA.sources.map(item => item.label), ['WS', 'REST', '对账']);
+  for (const role of stats.roles) assert.ok(Math.abs(role.sources.reduce((sum, item) => sum + item.share, 0) - 1) < 1e-9, `${role.role} 来源占比合计 100%`);
+  assert.equal(stats.roles[1].fillRate, 0.5);
+  // 成交均价缺失（按账户持仓核对出来的成交）时服务端按限价算滑点，那是上限不是实际滑点：不计入。
+  const estimated = orderTelemetryStats([{ orders: [order('flatten', { slippageBps: 2 }), order('flatten', { slippageBps: 280, avgPrice: null, confirmSource: 'account' })] }]).roles[0];
+  assert.deepEqual([estimated.orders, estimated.filled, estimated.slipSamples, estimated.slipMean, estimated.slipP90], [2, 2, 1, 2, 2]);
+  assert.equal(quantile([1, 3], 0.5), 2);
+  assert.ok(Math.abs(quantile([1, 3], 0.9) - 2.8) < 1e-9);
+  assert.equal(quantile([], 0.5), null);
+  assert.equal(quantile([4, 1, 3, 2], 0.5), 2.5);
+  assert.equal(msText(null), '—');
+  assert.equal(msText(180.4), '180 ms');
+  assert.equal(msText(2_340), '2.3 s');
+});
+
+const leg = (qty) => ({ venue: 'lighter', symbol: 'X', side: 'buy', qty, entryQuote: qty * 10, exitQty: qty, exitQuote: qty * 10, feesUsd: 0, estimated: false });
+const closed = (id, closedAt, qtyA, qtyB, closeReason, singleLeg = false, extra = {}) => ({ id, symbol: 'lighter:X|entropy:X', a: leg(qtyA), b: leg(qtyB), closedAt, updatedAt: closedAt, closeReason, singleLeg, ...extra });
+test('live trades: only filled positions are listed, outcomes are counted with the server rules', () => {
+  const day = 86_400_000, now = 10 * day + 3_600_000;
+  // nf2 的第一腿发出去没成交，nf1 是发单前就放弃的。
+  const trades = [closed('nf2', now - 100, 0, 0, 'not_filled', false, { note: 'Lighter 第一腿没有成交，放弃' }), closed('nf1', now - 200, 0, 0, 'not_filled', false, { note: '开仓意图已过期，没有下单' }),
+    closed('t2', now - 300, 1, 0, 'single_leg', true), closed('o1', now - 400, 0, 0, 'manual'), closed('t1', 9 * day + 5, 1, 1, 'revert')];
+  const more = [closed('t0', 8 * day, 1, 1, 'stop'), closed('t1', 9 * day + 5, 1, 1, 'revert')];
+  assert.deepEqual(tradedPositions({ trades, tradedMore: more }).map(item => item.id), ['t2', 't1', 't0'], '有成交的去重、新的在前');
+  assert.deepEqual(tradedPositions({ trades }).map(item => item.id), ['t2', 't1'], '旧服务没有 tradedMore');
+  assert.equal(tradedPositions({ trades, tradedMore: more }, 2).length, 2);
+  assert.deepEqual(untradedPositions(trades).map(item => item.id), ['nf2', 'nf1', 'o1']);
+  assert.deepEqual(outcomeCounts(trades), { traded: 2, notFilled: 2, other: 1, singleLeg: 1, unsent: 1 });
+  const abnormal = closed('b-only', now, 0, 1, 'manual');
+  assert.deepEqual(outcomeCounts([abnormal]), { traded: 0, notFilled: 0, other: 1, singleLeg: 0, unsent: 0 }, '异常历史只有 B 腿有量时不算 A 腿成功，与服务端汇总一致');
+  assert.equal(tradedPositions({ trades: [abnormal] }).length, 1, '异常记录仍留在成交表里供人工核对');
+  assert.equal(firstLegSent(trades[0]), true);
+  assert.equal(firstLegSent(trades[1]), false);
+  assert.equal(firstLegSent({ note: '此刻的卖一已越过限价', orders: [{ role: 'openA' }] }), true, '逐单记录里有开仓 A 腿就是发出去过');
+  assert.equal(firstLegSent({ note: '', orders: [] }), false);
+  const fallback = liveOutcomes({ trades, now });
+  assert.deepEqual(fallback, { today: { traded: 1, notFilled: 2, other: 1, singleLeg: 1, unsent: 1 }, total: { traded: 2, notFilled: 2, other: 1, singleLeg: 1, unsent: 1 }, recent: 5 }, '没有 outcomes 时用最近的 trades 估，今天按 UTC 日');
+  // 旧服务的计数没有 unsent：第一腿没成交的全部按发出去算。
+  const server = { today: { traded: 0, notFilled: 1, other: 0, singleLeg: 0 }, total: { traded: 30, notFilled: 10, other: 2, singleLeg: 3 } };
+  assert.deepEqual(liveOutcomes({ trades, now, outcomes: server }), { ...server, recent: null });
+  assert.equal(outcomeText(server.total), '有成交 30 · 第一腿未成交 10 · 其他未成交 2 · 单腿 3');
+  assert.equal(firstLegMissRate(server.total), 0.25);
+  assert.equal(firstLegMissRate({ traded: 0, notFilled: 0, other: 4, singleLeg: 0 }), null);
+  // 发单前就放弃的不算第一腿未成交，也不进未成交率的分母。
+  const counted = { ...server.total, unsent: 4 };
+  assert.equal(firstLegMissed(counted), 6);
+  assert.equal(outcomeText(counted), '有成交 30 · 第一腿未成交 6 · 发单前放弃 4 · 其他未成交 2 · 单腿 3');
+  assert.equal(firstLegMissRate(counted), 6 / 36);
+  assert.equal(firstLegMissRate({ traded: 0, notFilled: 3, other: 0, singleLeg: 0, unsent: 3 }), null, '一笔第一腿都没发出去过');
+});
+
+test('live position mark cells and breakdown rows degrade to dashes', () => {
+  const none = positionMarkCells(undefined, 125 * 60_000);
+  assert.deepEqual([none.pnl, none.entry, none.exit, none.stop, none.hold], ['—', '—', '—', '—', '2 小时 5 分']);
+  const mark = { at: 1, pnlBps: 3.2, netUsd: 0.05, estimated: true, signalSpread: 12, entrySpread: 10.5, entryBaseline: 1, baseline: 1.5, deviation: 4, exitBps: 1, stopBps: 20, maxHoldMinutes: 120 };
+  const cells = positionMarkCells(mark, 30 * 60_000 + 5_000);
+  assert.deepEqual([cells.pnl, cells.pnlFoot, cells.pnlTone], ['+3.2', '净 +$0.05 · 估', 'up']);
+  assert.deepEqual([cells.entry, cells.entryFoot], ['10.5', '信号 12.0 · 差 -1.5']);
+  assert.deepEqual([cells.exit, cells.exitFoot], ['4.0 / 1.0', '还差 3.0']);
+  assert.deepEqual([cells.stop, cells.stopFoot, cells.stopWarn], ['还差 23.2', '止损线 -20.0', false]);
+  assert.deepEqual([cells.hold, cells.holdFoot], ['30 / 120 分钟', '还剩 90 分钟']);
+  const empty = positionMarkCells({ ...mark, pnlBps: null, netUsd: null, estimated: null, signalSpread: null, entrySpread: null, deviation: null }, 200 * 60_000);
+  assert.deepEqual([empty.pnl, empty.pnlFoot, empty.entry, empty.entryFoot, empty.exit, empty.exitFoot, empty.stop, empty.holdFoot], ['—', '', '—', '', '— / 1.0', '缺样本或基线', '—', '已到最长持有']);
+  assert.equal(positionMarkCells({ ...mark, pnlBps: -16 }, 0).stopWarn, true, '离止损不到四分之一时警示');
+  assert.equal(positionMarkCells({ ...mark, deviation: 0.5 }, 0).exitFoot, '已到出场线');
+  // 入场价差比信号好还是差随方向相反：A 偏贵时卖 A，成交价差比信号小是差；A 偏便宜时买 A，成交价差比信号小是好。
+  assert.equal(positionMarkCells(mark, 0, { direction: 'a_rich', state: 'open' }).entryFoot, '信号 12.0 · 比信号差 1.5');
+  assert.equal(positionMarkCells(mark, 0, { direction: 'a_cheap', state: 'open' }).entryFoot, '信号 12.0 · 比信号好 1.5');
+  assert.equal(positionMarkCells({ ...mark, entrySpread: 12.01 }, 0, { direction: 'a_rich', state: 'open' }).entryFoot, '信号 12.0 · 与信号一致');
+  // 出场线可以是负数：偏离要降到它及以下才回归平仓。
+  assert.equal(positionMarkCells({ ...mark, exitBps: -2, deviation: 1 }, 0).exitFoot, '还差 3.0');
+  assert.equal(positionMarkCells({ ...mark, exitBps: -2, deviation: -2 }, 0).exitFoot, '已到出场线');
+  assert.equal(positionMarkCells({ ...mark, deviation: null }, 0, { direction: 'a_rich', state: 'closing' }).exitFoot, '不在持有中，不估值');
+  assert.equal(positionMarkCells({ ...mark, deviation: null }, 0, { direction: 'a_rich', state: 'open' }).exitFoot, '缺样本或基线');
+  // 浮盈的颜色跟大字（不含成本的基点）走；净额在小字里。
+  assert.equal(positionMarkCells({ ...mark, pnlBps: 3, netUsd: -0.02 }, 0).pnlTone, 'up');
+  // 浮亏越过止损线：还差写成负数并警示。
+  const past = positionMarkCells({ ...mark, pnlBps: -21 }, 0);
+  assert.deepEqual([past.stop, past.stopWarn], ['还差 -1.0', true]);
+  assert.deepEqual(breakdownRows(undefined, 'pair'), []);
+  assert.deepEqual(breakdownRows([{ key: 'lighter:NVDA|entropy:NVDA', trades: 4, wins: 3, netUsd: 1.2 }], 'pair'), [{ key: 'lighter:NVDA|entropy:NVDA', label: 'NVDA', sub: '主网↔Entropy', trades: 4, winRate: 0.75, netUsd: 1.2 }]);
+  assert.equal(breakdownRows([{ key: 'not_a_reason', trades: 0, wins: 0, netUsd: 0 }], 'reason')[0].winRate, null);
+  assert.equal(breakdownRows([{ key: 'stop', trades: 1, wins: 0, netUsd: -1 }], 'reason')[0].label, '止损');
+  assert.equal(breakdownRows([{ key: '2026-01-02', trades: 1, wins: 1, netUsd: 1 }], 'day')[0].label, '2026-01-02');
 });

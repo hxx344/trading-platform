@@ -4,10 +4,11 @@
 // 不再写也不改：旧样本按配对键映射后与新表合并读出，旧持仓与成交在首次启动时一次性复制到新表（同一事务，带完成标记）。
 // 回退到 v0.87.0 时旧版本照常读写旧表，升级后新开的模拟盘记录在回退版本里看不到（docs/dexspread.md 第 9 节）。
 import { DatabaseSync } from 'node:sqlite';
-import { SAMPLE_FIELDS, legacyKeyOf, upgradeKey, varHourly, type Regime, type Sample } from './model.ts';
+import { SAMPLE_FIELDS, legacyKeyOf, upgradeKey, varHourly, type BaselinePoint, type Regime, type Sample } from './model.ts';
 import { upgradePosition, type ClosedTrade, type LegFees, type Position } from './strategy.ts';
 import type { Settings } from './views.ts';
 import type { LivePosition } from './live.ts';
+import { FIRST_LEG_MISSED_NOTE } from './live-summary.ts';
 
 export const VARLIGHTER_FILE = 'varlighter.sqlite';
 /** 样本保留天数：约 300 个配对每分钟各一条（两腿都是行情流的配对每 20 秒一条、启用的每 5 秒一条，条数随这类配对的个数变），容量估算见 docs/varlighter.md 第 7 节。 */
@@ -97,31 +98,43 @@ export type VarLighterStore = ReturnType<typeof openVarLighterStore>;
 /** 迁移用的转换：旧参数换成新参数（引擎提供），旧持仓的手续费取旧参数里的 Var 与 Lighter 手续费。 */
 export interface LegacyUpgrade { settings: (old: unknown) => unknown; cooldown: (old: unknown) => unknown; fees: (old: unknown) => LegFees }
 
+type RangeStatement = ReturnType<DatabaseSync['prepare']>;
+/** 旧表与新表里同一个配对 [from, to] 的行按时刻合并成一个升序序列；同一时刻以新表为准。 */
+function* mergedRange<T>(selectRange: RangeStatement, oldRange: RangeStatement, symbol: string, from: number, to: number, fromNew: (row: LegRow) => T, fromOld: (row: LegRow) => T): Generator<T> {
+  const old = legacyKeyOf(symbol);
+  let older: ReturnType<typeof oldRange.iterate> | undefined;
+  let newer: ReturnType<typeof selectRange.iterate> | undefined;
+  try {
+    older = old ? oldRange.iterate(old, from, to) : undefined;
+    newer = selectRange.iterate(symbol, from, to);
+    let left = older?.next(), right = newer.next();
+    while ((left && !left.done) || !right.done) {
+      if (left && !left.done && (right.done || Number(left.value.t) < Number(right.value.t))) {
+        yield fromOld(left.value);
+        left = older!.next();
+      } else if (!right.done) {
+        if (left && !left.done && left.value.t === right.value.t) left = older!.next();
+        yield fromNew(right.value);
+        right = newer.next();
+      }
+    }
+  } finally { newer?.return?.(); older?.return?.(); }
+}
 // Both the DEX writer and the read-only replay worker must resolve duplicate timestamps the same way.
 export function prepareSampleRange(db: DatabaseSync) {
   const selectRange = db.prepare(`SELECT ${LEG_COLUMNS.join(', ')} FROM leg_samples WHERE symbol = ? AND t >= ? AND t <= ? ORDER BY t`);
   const oldRange = db.prepare(`SELECT ${OLD_COLUMNS.join(', ')} FROM samples WHERE symbol = ? AND t >= ? AND t <= ? ORDER BY t`);
-  return function* (symbol: string, from: number, to: number): Generator<Sample> {
-    const old = legacyKeyOf(symbol);
-    let older: ReturnType<typeof oldRange.iterate> | undefined;
-    let newer: ReturnType<typeof selectRange.iterate> | undefined;
-    try {
-      older = old ? oldRange.iterate(old, from, to) : undefined;
-      newer = selectRange.iterate(symbol, from, to);
-      let left = older?.next(), right = newer.next();
-      while ((left && !left.done) || !right.done) {
-        if (left && !left.done && (right.done || Number(left.value.t) < Number(right.value.t))) {
-          yield fromOldRow(left.value as OldRow, symbol);
-          left = older!.next();
-        } else if (!right.done) {
-          if (left && !left.done && left.value.t === right.value.t) left = older!.next();
-          yield fromLegRow(right.value);
-          right = newer.next();
-        }
-      }
-    } finally { newer?.return?.(); older?.return?.(); }
-  };
+  return (symbol: string, from: number, to: number): Generator<Sample> => mergedRange(selectRange, oldRange, symbol, from, to, fromLegRow, row => fromOldRow(row as OldRow, symbol));
 }
+
+// ---- 基线只用到的列（预热基线时不读整行） ----
+const BASELINE_COLUMNS = 't, regime, ratio, a_bid0, a_ask0, b_bid0, b_ask0';
+const OLD_BASELINE_COLUMNS = 't, regime, var_bid0, var_ask0, rh_bid0, rh_ask0';
+const baselineFromLeg = (row: LegRow): BaselinePoint => ({ t: row.t as number, regime: row.regime as Regime, ratio: row.ratio as number, aBid0: row.a_bid0 as number, aAsk0: row.a_ask0 as number, bBid0: row.b_bid0 as number, bAsk0: row.b_ask0 as number });
+const baselineFromOld = (row: LegRow): BaselinePoint => ({ t: row.t as number, regime: row.regime as Regime, ratio: 1, aBid0: row.var_bid0 as number, aAsk0: row.var_ask0 as number, bBid0: row.rh_bid0 as number, bAsk0: row.rh_ask0 as number });
+/** 已结束实盘持仓按（配对、UTC 日、平仓原因、有没有成交、是否单腿）分组的一行。 */
+/** sent：第一腿发出去过（没成交的记录用它区分「发出去没成交」与「发单前就放弃」；有成交的恒为真）。 */
+export interface LiveSummaryRow { symbol: string; day: number; reason: string; traded: boolean; singleLeg: boolean; sent: boolean; count: number; netUsd: number; wins: number }
 
 export function openVarLighterStore(file: string) {
   const db = new DatabaseSync(file);
@@ -192,6 +205,12 @@ export function openVarLighterStore(file: string) {
   } catch (error) { db.close(); throw error; }
   const insertSample = db.prepare(`INSERT OR IGNORE INTO leg_samples(${LEG_COLUMNS.join(', ')}) VALUES (${LEG_COLUMNS.map(() => '?').join(', ')})`);
   const sampleRange = prepareSampleRange(db);
+  const baselineRange = db.prepare(`SELECT ${BASELINE_COLUMNS} FROM leg_samples WHERE symbol = ? AND t >= ? AND t <= ? ORDER BY t`);
+  const oldBaselineRange = db.prepare(`SELECT ${OLD_BASELINE_COLUMNS} FROM samples WHERE symbol = ? AND t >= ? AND t <= ? ORDER BY t`);
+  const seekSample = db.prepare(`SELECT ${LEG_COLUMNS.join(', ')} FROM leg_samples WHERE symbol = ? AND t >= ? AND t <= ? ORDER BY t LIMIT 1`);
+  const oldSeekSample = db.prepare(`SELECT ${OLD_COLUMNS.join(', ')} FROM samples WHERE symbol = ? AND t >= ? AND t <= ? ORDER BY t LIMIT 1`);
+  const seekBaseline = db.prepare(`SELECT ${BASELINE_COLUMNS} FROM leg_samples WHERE symbol = ? AND t >= ? AND t <= ? ORDER BY t LIMIT 1`);
+  const oldSeekBaseline = db.prepare(`SELECT ${OLD_BASELINE_COLUMNS} FROM samples WHERE symbol = ? AND t >= ? AND t <= ? ORDER BY t LIMIT 1`);
   const selectAfter = db.prepare(`SELECT ${LEG_COLUMNS.join(', ')} FROM leg_samples WHERE symbol = ? AND t > ? ORDER BY t LIMIT ?`);
   const selectLatest = db.prepare(`SELECT ${LEG_COLUMNS.join(', ')} FROM leg_samples WHERE symbol = ? ORDER BY t DESC LIMIT 1`);
   const countSince = db.prepare('SELECT COUNT(*) AS n FROM leg_samples WHERE symbol = ? AND t >= ?');
@@ -219,6 +238,13 @@ export function openVarLighterStore(file: string) {
   const liveClosed = db.prepare("SELECT json FROM live_positions WHERE state = 'closed' ORDER BY closed_at DESC LIMIT ?");
   const liveNetSince = db.prepare("SELECT COALESCE(SUM(net_usd), 0) AS net FROM live_positions WHERE state = 'closed' AND closed_at >= ?");
   const liveTotals = db.prepare("SELECT COUNT(*) AS n, COALESCE(SUM(net_usd), 0) AS net, SUM(CASE WHEN net_usd > 0 THEN 1 ELSE 0 END) AS wins FROM live_positions WHERE state = 'closed' AND json_extract(json, '$.a.qty') > 0");
+  const liveTradedClosed = db.prepare("SELECT json FROM live_positions WHERE state = 'closed' AND json_extract(json, '$.a.qty') > 0 ORDER BY closed_at DESC LIMIT ?");
+  const liveSummary = db.prepare(`SELECT symbol, CAST(closed_at / 86400000 AS INTEGER) AS day, COALESCE(json_extract(json, '$.closeReason'), '') AS reason,
+    json_extract(json, '$.a.qty') > 0 AS traded, COALESCE(json_extract(json, '$.singleLeg'), 0) AS single,
+    (json_extract(json, '$.a.qty') > 0 OR instr(COALESCE(json_extract(json, '$.note'), ''), '${FIRST_LEG_MISSED_NOTE}') > 0
+      OR EXISTS (SELECT 1 FROM json_each(live_positions.json, '$.orders') AS sent_order WHERE json_extract(sent_order.value, '$.role') = 'openA')) AS sent,
+    COUNT(*) AS n, COALESCE(SUM(net_usd), 0) AS net, SUM(CASE WHEN net_usd > 0 THEN 1 ELSE 0 END) AS wins
+    FROM live_positions WHERE state = 'closed' AND closed_at IS NOT NULL GROUP BY 1, 2, 3, 4, 5, 6`);
   const insertEvent = db.prepare('INSERT INTO events(at, kind, symbol, message) VALUES (?, ?, ?, ?)');
   const recentEvents = db.prepare('SELECT id, at, kind, symbol, message FROM events ORDER BY id DESC LIMIT ?');
   const pruneEvents = db.prepare('DELETE FROM events WHERE at < ?');
@@ -290,6 +316,20 @@ export function openVarLighterStore(file: string) {
       try { db.exec('PRAGMA synchronous=NORMAL'); } catch { /* ignore */ }
     }
   };
+  /**
+   * 逐条定位着读：从 from 起每次取新旧两表里时刻最早的一行（同一时刻以新表为准）交给 take，take 返回下一次从这行之后多久开始找（毫秒，至少 1），返回 null 就停。
+   */
+  const spaced = (symbol: string, from: number, to: number, seek: RangeStatement, oldSeek: RangeStatement, takeNew: (row: LegRow) => number | null, takeOld: (row: LegRow) => number | null): void => {
+    const old = legacyKeyOf(symbol);
+    for (let cursor = from; cursor <= to;) {
+      const fresh = seek.get(symbol, cursor, to) as LegRow | undefined, older = old ? oldSeek.get(old, cursor, to) as LegRow | undefined : undefined;
+      const useNew = fresh !== undefined && (older === undefined || Number(fresh.t) <= Number(older.t)), row = useNew ? fresh : older;
+      if (!row) return;
+      const step = useNew ? takeNew(row) : takeOld(row);
+      if (step === null) return;
+      cursor = Number(row.t) + Math.max(1, step);
+    }
+  };
   const legacy = (key: string, read: (old: string) => unknown[]): Sample[] => {
     const old = legacyKeyOf(key);
     return old ? (read(old) as OldRow[]).map(row => fromOldRow(row, key)) : [];
@@ -309,6 +349,23 @@ export function openVarLighterStore(file: string) {
     addNewSamples,
     samples(symbol: string, from: number, to: number): Sample[] {
       return [...sampleRange(symbol, from, to)];
+    },
+    /**
+     * 按间隔抽稀的样本（至多 limit 条）：[from, to] 里的第一条，之后每次取「上一条的时刻 + gapMs」以后的第一条，走主键逐条定位、不读中间的。
+     * 结果与按时间顺序逐条看、离上一条取用的不足 gapMs 就跳过相同。要接着读就把 from 换成最后一条的时刻 + gapMs。
+     */
+    samplesSpaced(symbol: string, from: number, to: number, gapMs: number, limit = Infinity): Sample[] {
+      const result: Sample[] = [];
+      spaced(symbol, from, to, seekSample, oldSeekSample, row => { result.push(fromLegRow(row)); return result.length < limit ? gapMs : null; }, row => { result.push(fromOldRow(row as OldRow, symbol)); return result.length < limit ? gapMs : null; });
+      return result;
+    },
+    /**
+     * 预热基线用：[from, to] 里只带基线用到的列，按时刻升序逐条交给 each，返回这条有没有被采用。
+     * gapMs 大于 0 时逐条定位着读：被采用的下一条从它的时刻 + gapMs 以后找，没被采用的从它之后紧接着找（与逐条全读的结果相同）。
+     */
+    baselineScan(symbol: string, from: number, to: number, gapMs: number, each: (point: BaselinePoint) => boolean): void {
+      if (gapMs > 0) spaced(symbol, from, to, seekBaseline, oldSeekBaseline, row => each(baselineFromLeg(row)) ? gapMs : 1, row => each(baselineFromOld(row)) ? gapMs : 1);
+      else for (const point of mergedRange(baselineRange, oldBaselineRange, symbol, from, to, baselineFromLeg, baselineFromOld)) each(point);
     },
     /** 某配对 after 之后（不含）按时刻升序的至多 limit 条样本，走主键；只读导出（docs/mcp.md 第 8.3 节）用。 */
     samplesAfter(symbol: string, after: number, limit: number): Sample[] {
@@ -379,6 +436,13 @@ export function openVarLighterStore(file: string) {
     liveTotals(): { trades: number; netUsd: number; wins: number } {
       const row = liveTotals.get() as { n: number; net: number; wins: number | null };
       return { trades: row.n, netUsd: row.net, wins: row.wins ?? 0 };
+    },
+    /** 最近 limit 笔有成交的已结束实盘持仓（新的在前）。没成交的多时要扫过它们，调用方缓存。 */
+    liveTradedClosed(limit: number): LivePosition[] { return parse<LivePosition>(liveTradedClosed.all(limit)); },
+    /** 全部已结束实盘持仓的分组汇总（扫全表、逐行解析 JSON；调用方启动后读一次，之后自己累加）。 */
+    liveSummaryRows(): LiveSummaryRow[] {
+      return (liveSummary.all() as { symbol: string; day: number; reason: string; traded: number | null; single: number | null; sent: number | null; n: number; net: number; wins: number | null }[])
+        .map(row => ({ symbol: row.symbol, day: row.day, reason: row.reason, traded: row.traded === 1, singleLeg: row.single === 1, sent: row.sent === 1, count: row.n, netUsd: row.net, wins: row.wins ?? 0 }));
     },
     event(at: number, kind: string, symbol: string | null, message: string): void { insertEvent.run(at, kind, symbol, message.slice(0, 500)); },
     events(limit: number): StoredEvent[] { return recentEvents.all(limit) as unknown as StoredEvent[]; },

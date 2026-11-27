@@ -435,7 +435,9 @@ export interface Spread {
   /** Var 成交价来源，0 表示公开一档。精确询价另带折算成 A 的实际数量。 */
   varSource?: VarPriceSource; varQtyA?: number;
 }
-export const midBasis = (sample: Sample): number => {
+/** 基线只用到的样本字段：时刻、时段与两腿一档。 */
+export type BaselinePoint = Pick<Sample, 't' | 'regime' | 'ratio' | 'aBid0' | 'aAsk0' | 'bBid0' | 'bAsk0'>;
+export const midBasis = (sample: Pick<Sample, 'ratio' | 'aBid0' | 'aAsk0' | 'bBid0' | 'bAsk0'>): number => {
   const bMid = sample.ratio * ((sample.bBid0 + sample.bAsk0) / 2);
   return ((sample.aBid0 + sample.aAsk0) / 2 / bMid - 1) * 10_000;
 };

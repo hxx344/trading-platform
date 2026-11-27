@@ -300,6 +300,9 @@ export function closeSpread(sample: Sample, position: Position): Spread | null {
  */
 export interface GateContext { openPositions: number; openNotionalUsd: number; dailyNetUsd: number; cooldownUntil: number; eligible: boolean; legBusy?: boolean; feeUnknown?: boolean; fallbackBaseline?: boolean; expectedNetBps?: number; costBps?: number; autoPending?: boolean }
 export const FALLBACK_BLOCK = '本时段基线样本不足（全天基线不开仓）', THIN_BLOCK = '预期净利不足', COST_BLOCK = '往返成本已达止损线', FEE_BLOCK = '手续费未知', BUSY_BLOCK = '同一腿已在另一配对持仓', AUTO_BLOCK = '自动配置的样本不足';
+export const SPEC_BLOCK = '规格未确认', LOSS_BLOCK = '当日亏损已达上限';
+/** openBlocker 的原因里不处理就一直开不了的；其余是策略本来就会等的（时段、冷却、净利不足、限额占满等）或用户自己的设置（暂停、未启用）。 */
+export const ATTENTION_BLOCKS: ReadonlySet<string> = new Set([SPEC_BLOCK, FEE_BLOCK, COST_BLOCK, LOSS_BLOCK]);
 /**
  * 复核后的开仓决定对应的两个门槛读数。
  * `quoted`：报价时刻（复核前）的开仓决定，只在样本带 Var token 询价时传（不带询价时与 v0.81.0 相同，只看复核后的）。开仓后的止损仍按公开报价的样本判断，所以成本门槛取复核后与报价时刻两种口径里
@@ -310,7 +313,7 @@ export const openEconomics = (decision: Extract<Decision, { kind: 'open' }>, par
 export function openBlocker(sample: Sample, params: SymbolParams, global: GlobalParams, context: GateContext): string | null {
   if (global.paused) return '已暂停';
   if (!params.enabled) return '未启用';
-  if (!context.eligible) return '规格未确认';
+  if (!context.eligible) return SPEC_BLOCK;
   if (context.autoPending) return AUTO_BLOCK;
   if (!params.regimes.includes(sample.regime)) return '当前时段不开仓';
   if (context.fallbackBaseline) return FALLBACK_BLOCK;
@@ -321,7 +324,7 @@ export function openBlocker(sample: Sample, params: SymbolParams, global: Global
   if (context.legBusy) return BUSY_BLOCK;
   if (context.openPositions >= global.maxOpenPositions) return '持仓数已满';
   if (context.openNotionalUsd + params.notionalUsd > global.maxTotalNotionalUsd) return '名义合计将超上限';
-  if (context.dailyNetUsd <= -global.dailyLossLimitUsd) return '当日亏损已达上限';
+  if (context.dailyNetUsd <= -global.dailyLossLimitUsd) return LOSS_BLOCK;
   return null;
 }
 

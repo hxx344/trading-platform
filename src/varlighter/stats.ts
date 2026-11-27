@@ -1,6 +1,6 @@
 // 价差基线（docs/varlighter.md 第 4 节）：按时段分组的滚动中位数与稳健离散度，以及页面的基线统计。
 // 模拟盘与回测共用 BaselineTracker，任何时刻的基线只用该时刻之前的样本（不看未来）。
-import { midBasis, regimesOf, spreadOf, type AssetKind, type Regime, type Sample, type SizeBucket } from './model.ts';
+import { midBasis, regimesOf, spreadOf, type AssetKind, type BaselinePoint, type Regime, type Sample, type SizeBucket } from './model.ts';
 
 /** 中位数绝对偏差换算成正态标准差的系数。 */
 const MAD_SCALE = 1.4826;
@@ -81,12 +81,14 @@ export class BaselineTracker {
     this.all = new RollingWindow(windowMs);
     for (const regime of regimesOf(kind)) if (regime !== 'all') this.windows.set(regime, new RollingWindow(windowMs));
   }
-  push(sample: Sample): void {
+  /** 返回这条有没有计入：基差算不出，或离上一条计入的不足 minGapMs 时不计。 */
+  push(sample: BaselinePoint): boolean {
     const value = midBasis(sample);
-    if (!Number.isFinite(value) || sample.t - this.last < this.minGapMs) return;
+    if (!Number.isFinite(value) || sample.t - this.last < this.minGapMs) return false;
     this.last = sample.t;
     this.all.push(sample.t, value);
     this.windows.get(sample.regime)?.push(sample.t, value);
+    return true;
   }
   value(regime: Regime, now: number): Baseline | null {
     const own = this.windows.get(regime);

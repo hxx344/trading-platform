@@ -13,6 +13,8 @@ import type { LiveKeys, LiveKeysStore } from './livekeys.ts';
 import { VENUE_NAMES, type LegInfo, type MarketSpec, type PairInfo, type Regime, type Sample } from './model.ts';
 import { ORDER_EXPIRY_MS, cloidOf, type OrderConfirmSource, type OrderOutcome, type ResolveOutcome, type VenueOrder, type VenueTrader } from './orders.ts';
 import { floorTo, limitPrice, orderPlan } from './plan.ts';
+import { FIRST_LEG_MISSED_NOTE, createLiveSummary, summaryRowOf } from './live-summary.ts';
+import type { LiveSummaryRow } from './store.ts';
 import type { Direction } from './strategy.ts';
 
 export const LIVE_SETTINGS_KEY = 'liveSettings', LIVE_RUNTIME_KEY = 'liveRuntime';
@@ -108,6 +110,9 @@ export interface LiveStore {
   liveClosed(limit: number): LivePosition[];
   liveNetSince(time: number): number;
   liveTotals(): { trades: number; netUsd: number; wins: number };
+  /** 最近若干笔有成交的已结束持仓，与全部已结束持仓的分组汇总（实盘页用；没有时页面少这几块）。 */
+  liveTradedClosed?(limit: number): LivePosition[];
+  liveSummaryRows?(): LiveSummaryRow[];
   state<T>(key: string): T | null;
   setState(key: string, value: unknown, at: number): void;
   event(at: number, kind: string, symbol: string | null, message: string): void;
@@ -133,6 +138,8 @@ export interface LiveDeps {
 export class LiveError extends Error { readonly code: string; readonly status: number; constructor(code: string, message: string, status = 400) { super(message); this.code = code; this.status = status; } }
 
 const MAX_FLATTEN_TRIES = 3, MAX_CLOSE_TRIES = 10, RETRY_MS = 5_000;
+/** 实盘页的成交表列这么多笔；被挡下的统计最多这么久落一次库。 */
+export const LIVE_TRADES_SHOWN = 50, SKIP_SAVE_MS = 1_000;
 /** 结果未知的单：发出后过这么久还查不到，就按账户持仓核对；再久仍定不下来就停止。 */
 const POSITION_CHECK_MS: Record<KeyVenue, number> = { entropy: 20_000, lighter: 60_000, rh: 60_000 };
 const UNKNOWN_STUCK_MS = 15 * 60_000;
@@ -217,6 +224,10 @@ function normalizeSkipStats(raw: unknown, today: number): LiveSkipStats {
   return { day: today, total: raw.total, byReason };
 }
 export interface LiveAlert { key: string; text: string }
+/** 实盘检查挡下开仓的原因。attention 为 false：策略本来就会等的（已有持仓、腿被占用、持仓上限）或用户自己的设置（总开关、没勾选、带 Var 腿）；为 true：不处理就一直开不了（停止、暂停、凭据、签名器、账户读数、余额、当日亏损上限）。 */
+export interface LiveBlock { reason: string; attention: boolean }
+/** 一次页面读数里各配对共用的读数：凭据文件、各场所的前置检查、当日已实现各只取一次。 */
+export interface BlockerMemo { keys?: ReturnType<LiveKeysStore['read']>; venues: Map<KeyVenue, string | null>; todayNet?: { day: number; value: number } }
 
 export function createLiveTrader(deps: LiveDeps) {
   const { store, now, log } = deps;
@@ -237,6 +248,14 @@ export function createLiveTrader(deps: LiveDeps) {
   let lastClientId = Math.max(0, Number(runtime.lastClientId) || 0, ...[...active.values()].flatMap(position => [position.pending?.clientId ?? 0, position.pendingB?.clientId ?? 0]));
   let sequence = 0, busy = false, lastSkip: { at: number; symbol: string; reason: string } | null = null;
   const skipEventAt = new Map<string, number>();
+  let skipSavedAt = -Infinity, skipDirty = false;
+  // 实盘页的累计与分组：启动时读一次，之后每结束一笔累加；成交列表到下一笔结束前不变，读一次留着。
+  const summary = (() => {
+    if (!store.liveSummaryRows) return null;
+    // 读不出来不拦实盘启动：页面少结果计数与盈亏分组，累计退回每次读库。
+    try { return createLiveSummary(store.liveSummaryRows()); } catch (error) { log(`varlighter: 实盘汇总读取失败，实盘页暂不显示结果计数与盈亏分组：${message(error)}`); return null; }
+  })();
+  let closedCache: { trades: LivePosition[]; tradedMore: LivePosition[] | undefined } | null = null;
   let lastOperationAt = now(), nextReconcile = now() + RECONCILE_MS, mismatchStreak = 0, blindSince: number | null = null;
 
   const saveRuntime = () => { try { (store.saveLiveState ?? store.setState)(LIVE_RUNTIME_KEY, runtime, now()); } catch (error) { log(`varlighter: 实盘运行状态保存失败：${message(error)}`); } };
@@ -304,6 +323,9 @@ export function createLiveTrader(deps: LiveDeps) {
     if (note) position.note = note;
     save(position);
     active.delete(position.id);
+    closedCache = null;
+    const row = summaryRowOf(position);
+    if (row) summary?.add(row);
     const traded = position.a.qty > 0 || position.b.qty > 0;
     if (traded) event(position.symbol, `实盘平仓（${reason}）：净 ${fmt(position.netUsd, 2)} 美元${position.a.estimated || position.b.estimated ? '（部分成交价按限价估）' : ''}${note ? `，${note}` : ''}`);
     else event(position.symbol, `实盘未开成：${note || reason}`);
@@ -554,7 +576,7 @@ export function createLiveTrader(deps: LiveDeps) {
           if (!sentA) return;
           continue;
         }
-        if (position.a.qty <= 0) { finish(position, 'not_filled', `${VENUE_NAMES[position.a.venue]} 第一腿没有成交，放弃`); return; }
+        if (position.a.qty <= 0) { finish(position, 'not_filled', `${VENUE_NAMES[position.a.venue]} ${FIRST_LEG_MISSED_NOTE}，放弃`); return; }
         if (position.step === 'b') {
           const target = floorTo(position.a.qty * position.ratio, b.market.sizeDecimals ?? 0), quote = deps.quote(b);
           if (target >= Math.max(stepOf(b), b.market.minBase) && quote) {
@@ -700,29 +722,34 @@ export function createLiveTrader(deps: LiveDeps) {
     return used;
   }
 
-  /** 开仓前检查并计算可用余额与倍率上限允许的有效名义金额（>1x 时强制保留 5% 缓冲）。 */
-  function resolveBlocker(pair: PairInfo, requestedUsd: number): string | { notionalUsd: number } {
-    if (!settings.on) return '实盘总开关未开';
-    if (!settings.pairs.includes(pair.key)) return '这个配对没有开实盘';
-    if (runtime.halt) return `实盘已停止：${runtime.halt}`;
-    if (runtime.paused[pair.key]) return `这个配对的实盘已暂停：${runtime.paused[pair.key]}`;
-    if (!isKeyVenue(pair.a.venue) || !isKeyVenue(pair.b.venue)) return '带 Var 腿的配对不上实盘';
-    const { keys, problem } = deps.keys.read();
-    if (problem) return problem;
+  /**
+   * 开仓前检查并计算可用余额与倍率上限允许的有效名义金额（>1x 时强制保留 5% 缓冲）。
+   * memo 只给只读的页面读数用：一次读数里各配对共用凭据文件、签名器检查与当日已实现的读数；下单路径不传，每次现读。
+   */
+  function checkOpen(pair: PairInfo, requestedUsd: number, memo?: BlockerMemo): LiveBlock | { notionalUsd: number } {
+    const wait = (reason: string): LiveBlock => ({ reason, attention: false }), act = (reason: string): LiveBlock => ({ reason, attention: true });
+    if (!settings.on) return wait('实盘总开关未开');
+    if (!settings.pairs.includes(pair.key)) return wait('这个配对没有开实盘');
+    if (runtime.halt) return act(`实盘已停止：${runtime.halt}`);
+    if (runtime.paused[pair.key]) return act(`这个配对的实盘已暂停：${runtime.paused[pair.key]}`);
+    if (!isKeyVenue(pair.a.venue) || !isKeyVenue(pair.b.venue)) return wait('带 Var 腿的配对不上实盘');
+    const { keys, problem } = memo ? memo.keys ??= deps.keys.read() : deps.keys.read();
+    if (problem) return act(problem);
     const lev = execSettings.maxLeverage, marginReserve = lev > 1 ? 0.95 : 1;
     let tightVenue: KeyVenue = pair.a.venue, tightAvail = Infinity, tightCap = Infinity;
     for (const venue of [pair.a.venue, pair.b.venue]) {
-      if (!keys[venue]) return `${VENUE_NAMES[venue]} 还没有录入凭据`;
-      const missing = deps.venueProblem(venue);
-      if (missing) return missing;
+      if (!keys[venue]) return act(`${VENUE_NAMES[venue]} 还没有录入凭据`);
+      let missing = memo?.venues.get(venue);
+      if (missing === undefined) { missing = deps.venueProblem(venue); memo?.venues.set(venue, missing); }
+      if (missing) return act(missing);
       const read = deps.account(venue);
-      if (!read || now() - read.at > ACCOUNT_FRESH_MS) return `${VENUE_NAMES[venue]} 账户读数不够新`;
+      if (!read || now() - read.at > ACCOUNT_FRESH_MS) return act(`${VENUE_NAMES[venue]} 账户读数不够新`);
       const effectiveAvail = Math.max(0, read.snapshot.available - committedSinceRead(venue, read.at));
       const venueCap = effectiveAvail * lev * marginReserve;
       if (!execSettings.autoSizeByBalance && venueCap < requestedUsd) {
-        return lev > 1
+        return act(lev > 1
           ? `${VENUE_NAMES[venue]} 可用余额 ${fmt(effectiveAvail, 2)}（按 ${lev}× 预留 5% 缓冲上限 ${fmt(venueCap, 2)}）不足单笔金额 ${fmt(requestedUsd, 0)}`
-          : `${VENUE_NAMES[venue]} 可用余额 ${fmt(effectiveAvail, 2)} 不足单笔金额 ${fmt(requestedUsd, 0)}`;
+          : `${VENUE_NAMES[venue]} 可用余额 ${fmt(effectiveAvail, 2)} 不足单笔金额 ${fmt(requestedUsd, 0)}`);
       }
       if (venueCap < tightCap) {
         tightCap = venueCap;
@@ -735,19 +762,26 @@ export function createLiveTrader(deps: LiveDeps) {
       const scaled = Math.floor(lev > 1 ? tightCap : tightAvail * 0.95);
       const minFloor = Math.max(10, pair.a.market.minQuote, pair.b.market.minQuote);
       if (scaled < minFloor) {
-        return lev > 1
+        return act(lev > 1
           ? `${VENUE_NAMES[tightVenue]} 可用余额 ${fmt(tightAvail, 2)}（按 ${lev}× 预留 5% 缓冲上限 ${fmt(tightCap, 2)}）不足最小金额 ${fmt(minFloor, 0)}`
-          : `${VENUE_NAMES[tightVenue]} 可用余额 ${fmt(tightAvail, 2)} 不足最小金额 ${fmt(minFloor, 0)}`;
+          : `${VENUE_NAMES[tightVenue]} 可用余额 ${fmt(tightAvail, 2)} 不足最小金额 ${fmt(minFloor, 0)}`);
       }
       notionalUsd = scaled;
     }
     const open = [...active.values()];
-    if (open.some(position => position.symbol === pair.key)) return '这个配对已有实盘持仓';
+    if (open.some(position => position.symbol === pair.key)) return wait('这个配对已有实盘持仓');
     const legs = new Set([`${pair.a.venue}:${positionSymbol(pair.a)}`, `${pair.b.venue}:${positionSymbol(pair.b)}`]);
-    if (open.some(position => legs.has(`${position.a.venue}:${position.a.symbol}`) || legs.has(`${position.b.venue}:${position.b.symbol}`))) return '有一条腿已被别的实盘持仓占用';
-    if (open.length >= settings.limits.maxOpen) return `实盘持仓已到上限 ${settings.limits.maxOpen} 笔`;
-    if (store.liveNetSince(dayStart(now())) <= -settings.limits.dailyLossUsd) return `当日已实现亏损达到上限 ${fmt(settings.limits.dailyLossUsd, 0)} 美元`;
+    if (open.some(position => legs.has(`${position.a.venue}:${position.a.symbol}`) || legs.has(`${position.b.venue}:${position.b.symbol}`))) return wait('有一条腿已被别的实盘持仓占用');
+    if (open.length >= settings.limits.maxOpen) return wait(`实盘持仓已到上限 ${settings.limits.maxOpen} 笔`);
+    const today = dayStart(now());
+    if (memo && memo.todayNet?.day !== today) memo.todayNet = { day: today, value: store.liveNetSince(today) };
+    const todayNet = memo ? memo.todayNet!.value : store.liveNetSince(today);
+    if (todayNet <= -settings.limits.dailyLossUsd) return act(`当日已实现亏损达到上限 ${fmt(settings.limits.dailyLossUsd, 0)} 美元`);
     return { notionalUsd };
+  }
+  function resolveBlocker(pair: PairInfo, requestedUsd: number): string | { notionalUsd: number } {
+    const checked = checkOpen(pair, requestedUsd);
+    return 'reason' in checked ? checked.reason : checked;
   }
 
   async function drive(): Promise<void> {
@@ -767,6 +801,11 @@ export function createLiveTrader(deps: LiveDeps) {
     if (position.state === 'open') { position.state = 'closing'; position.closeReason = reason; position.closeSignalAt = signalAt; position.tries = 0; position.retryAt = 0; save(position); }
     // 还在开仓的不动：开仓走完变成持有中后，引擎下一次判断会再给出平仓信号。
   }
+  function flushSkipStats(): void {
+    if (!skipDirty) return;
+    skipDirty = false; skipSavedAt = now();
+    try { (store.saveLiveState ?? store.setState)(LIVE_SKIP_STATS_KEY, skipStats, skipSavedAt); } catch (error) { log(`varlighter: 实盘跳过统计写入失败：${message(error)}`); }
+  }
   function skip(key: string, reason: string): string {
     const time = now(), today = dayStart(time);
     lastSkip = { at: time, symbol: key, reason };
@@ -774,7 +813,9 @@ export function createLiveTrader(deps: LiveDeps) {
     const bucket = Object.keys(skipStats.byReason).length >= 32 && !(skipBucket(reason) in skipStats.byReason) ? '其他原因' : skipBucket(reason);
     skipStats.total++;
     skipStats.byReason[bucket] = (skipStats.byReason[bucket] ?? 0) + 1;
-    try { (store.saveLiveState ?? store.setState)(LIVE_SKIP_STATS_KEY, skipStats, time); } catch (error) { log(`varlighter: 实盘跳过统计写入失败：${message(error)}`); }
+    // 行情流推送判断下，同一个原因一秒里可能被挡很多次：统计每次都记，落库（一次同步刷盘）最多一秒一次，余下的由下一次推进补上。
+    skipDirty = true;
+    if (Math.abs(time - skipSavedAt) >= SKIP_SAVE_MS) flushSkipStats();
     const id = `${key}\n${reason}`;
     if (time - (skipEventAt.get(id) ?? -Infinity) >= SKIP_EVENT_MS) {
       skipEventAt.set(id, time);
@@ -782,6 +823,15 @@ export function createLiveTrader(deps: LiveDeps) {
       event(key, `实盘没有开仓：${reason}`);
     }
     return reason;
+  }
+
+  /** 最近 50 笔已结束的持仓，以及其中排不下的更早的有成交持仓（两者里有成交的合起来是最近 50 笔有成交的）。 */
+  function closedLists(): { trades: LivePosition[]; tradedMore?: LivePosition[] } {
+    if (!closedCache) {
+      const trades = store.liveClosed(LIVE_TRADES_SHOWN), listed = new Set(trades.map(position => position.id));
+      closedCache = { trades, tradedMore: store.liveTradedClosed?.(LIVE_TRADES_SHOWN).filter(position => !listed.has(position.id)) };
+    }
+    return { trades: closedCache.trades, ...(closedCache.tradedMore && { tradedMore: closedCache.tradedMore }) };
   }
 
   return {
@@ -833,9 +883,17 @@ export function createLiveTrader(deps: LiveDeps) {
     /** 未结束的实盘持仓（开仓中、持有中、平仓中、需要人工处理）。 */
     active: (): LivePosition[] => [...active.values()],
     /** 每秒调用一次：推进在途的持仓、对账。 */
-    tick: kick,
+    tick(): void { flushSkipStats(); kick(); },
     /** 等当前这一轮推进结束（测试用）。 */
-    async idle(): Promise<void> { while (busy) await new Promise(resolve => setImmediate(resolve)); },
+    async idle(): Promise<void> { while (busy) await new Promise(resolve => setImmediate(resolve)); flushSkipStats(); },
+    /**
+     * 现在给这个配对一个开仓信号，实盘检查（总开关、勾选、停止与暂停、凭据、账户读数与余额、持仓占用与上限、当日亏损）会不会挡下：返回原因，不挡为 null。
+     * 只读、不计入被挡统计；下单预演与两腿此刻的实时价差要等真有信号才看。
+     */
+    blocker(pair: PairInfo, notionalUsd: number, memo?: BlockerMemo): LiveBlock | null {
+      const checked = checkOpen(pair, Math.min(notionalUsd, settings.limits.perTradeUsd), memo);
+      return 'reason' in checked ? checked : null;
+    },
     drive,
     alerts: (): LiveAlert[] => [...alerts],
     settings: () => settings,
@@ -894,7 +952,8 @@ export function createLiveTrader(deps: LiveDeps) {
         now: time, settings, exec: execSettings, halt: runtime.halt, paused: runtime.paused, lastSkip, skipStats,
         privateStreams: deps.privateStreams?.() ?? {},
         positions: [...active.values()].sort((x, y) => x.openedAt - y.openedAt),
-        trades: store.liveClosed(50), todayNetUsd: store.liveNetSince(today), totals: store.liveTotals(),
+        ...closedLists(), todayNetUsd: store.liveNetSince(today), totals: summary?.totals() ?? store.liveTotals(),
+        ...(summary && { outcomes: summary.outcomes(time), breakdown: summary.breakdown(time) }),
       };
     },
   };

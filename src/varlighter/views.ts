@@ -52,6 +52,22 @@ export interface PositionSummary {
   /** 开仓或估值使用估算价时为 true；缺估值返回 null，旧服务未提供该字段。 */
   estimated?: boolean | null;
 }
+/**
+ * 为什么没开仓（v0.114.0 起；只给已启用、当前没有实盘持仓的配对，其余为 null）：按引擎判断的顺序给出第一个挡住的原因，
+ * 读数取最新样本（两腿都是行情流的启用配对每 5 秒一条，推送判断用的是更新的一档，两者可能差几秒）。
+ */
+export interface GateView {
+  /** 现在不会开仓的原因；null 表示没有东西挡着（没到入场线就是在等信号）。 */
+  blocker: string | null;
+  /** blocker 要不要人去处理：false 是策略本来就会等的（时段、冷却、净利不足、信号消失、限额占满）或用户自己的设置（暂停、没开实盘、没勾选）；true 是不处理就一直开不了的（规格、手续费、凭据、余额、账户读数、实盘停止、当日亏损上限）。blocker 为 null 时为 false。 */
+  attention: boolean;
+  /** 允许的方向里较大的可成交偏离（基点）是否已到入场线；没有样本或基线时 deviation 为 null。 */
+  reached: boolean; deviation: number | null;
+  /** 已到入场线时这次开仓的预期净利（基点）；没到为 null。 */
+  expectedNetBps: number | null;
+  /** 服务启动以来最近一次到了入场线却没开成的时刻与原因（策略风控或实盘检查）。 */
+  last: { at: number; reason: string } | null;
+}
 export interface StateRow {
   /** 配对键；symbol 是页面上的代码（同代码写一次，否则「A / B」，乘数不是 1 时带「×乘数」）。venue、venueName 是旧接口字段（B 腿）。 */
   key: string; a: LegRef; b: LegRef; ratio: number; custom: boolean; note: string; venue: VenueId; venueName: string;
@@ -69,6 +85,8 @@ export interface StateRow {
   position: PositionSummary | null;
   /** 两腿每小时资金费率（小数，多头付费为正）。 */ aFunding: number | null; bFunding: number | null;
   /** 两腿手续费（基点，手动值或目录费率）；取不到为 null（不开仓）。 */ aFeeBps: number | null; bFeeBps: number | null;
+  /** v0.114.0 起；旧服务没有这个字段。 */ gate?: GateView | null;
+  /** 基线还在后台预热（服务刚启动或刚改了基线窗口）：baseline 暂时为 null，不是样本不足。v0.114.0 起。 */ baselineWarming?: boolean;
 }
 export interface OrphanRow {
   key: string; a: LegRef | null; b: LegRef | null; venue: VenueId | null; venueName: string; symbol: string; reason: string; enabled: boolean; lastSampleAt: number | null;
@@ -119,12 +137,41 @@ export interface StoredEventView { id: number; at: number; kind: string; symbol:
 export interface SamplesView { symbol: string; format: number; columns: (keyof Sample)[]; rows: unknown[][]; next: number | null; firstAt: number | null; retentionDays: number }
 /** 实盘页（docs/dexspread.md 第 13 节）：设置、凭据是否已录入（不含任何凭据内容）、持仓、成交与事件。 */
 export interface LiveCandidate { key: string; symbol: string; a: LegRef; b: LegRef; /** 总览里是否启用了这个配对（实盘还要求启用）。 */ enabled: boolean }
+/** 一笔未结束的实盘持仓按最新样本的估值与它的平仓线（v0.114.0 起）。 */
+export interface LivePositionMark {
+  /** 估值所用样本的时刻；没有样本为 null。 */ at: number | null;
+  /** 按可成交价现在平掉的收益：相对入场的基点（不含滑点与手续费）与净额（美元，已扣四次成交的滑点与手续费）；不在持有中或缺可成交价为 null。 */
+  pnlBps: number | null; netUsd: number | null; estimated: boolean | null;
+  /** 开仓信号里的入场价差与按两腿实际成交均价算的入场价差（基点）；旧记录没有信号读数、两腿没都成交时分别为 null。 */
+  signalSpread: number | null; entrySpread: number | null;
+  /** 开仓时的基线、现在的基线（基点），以及中间价还偏离现在的基线多少（降到 exitBps 及以下回归平仓）；没有为 null。 */
+  entryBaseline: number | null; baseline: number | null; deviation: number | null;
+  /** 这笔仓的平仓规则：出场偏离、止损（基点）、最长持有（分钟）。 */
+  exitBps: number; stopBps: number; maxHoldMinutes: number;
+}
+/** 有成交的已结束实盘持仓的分组汇总的一行：key 是配对键、UTC 日期（YYYY-MM-DD）或平仓原因。 */
+export interface LiveBreakdownRow { key: string; trades: number; wins: number; netUsd: number }
+/** 已结束实盘持仓的结果计数：有成交的、第一腿没成交的（not_filled）、其余没有成交就结束的；singleLeg 是有成交里单腿的笔数。 */
+export interface LiveOutcomeCounts {
+  traded: number; notFilled: number; other: number; singleLeg: number;
+  /** notFilled 里没发出第一腿就放弃的笔数（意图过期、发单前的报价或实时价差复核没过）；其余是第一腿发出去却没成交。 */
+  unsent?: number;
+}
 export interface LiveView {
   now: number; settings: LiveSettings; exec: LiveExecSettings; halt: string | null; paused: Record<string, string>;
   lastSkip: { at: number; symbol: string; reason: string } | null;
   skipStats: LiveSkipStats;
   privateStreams: Partial<Record<'lighter' | 'rh', LighterPrivateStatus>>;
+  /** trades 是最近 50 笔已结束的持仓（含第一腿没成交、什么都没发生的）；totals 只算有成交的。 */
   positions: LivePosition[]; trades: LivePosition[]; todayNetUsd: number; totals: { trades: number; netUsd: number; wins: number };
+  /** 以下 v0.114.0 起，旧服务没有：未结束持仓的估值与平仓线（按持仓编号）。 */
+  marks?: Record<string, LivePositionMark>;
+  /** trades 里排不下的、更早的有成交持仓（新的在前）：与 trades 里有成交的合起来是最近 50 笔有成交的，没成交的再多也挤不掉它们。 */
+  tradedMore?: LivePosition[];
+  /** 已结束持仓的结果计数：今天（UTC）与全部。 */
+  outcomes?: { today: LiveOutcomeCounts; total: LiveOutcomeCounts };
+  /** 有成交的已结束持仓按配对（净额绝对值大的在前，最多 50 个）、按 UTC 日（最近 14 天，新的在前）、按平仓原因的汇总。 */
+  breakdown?: { byPair: LiveBreakdownRow[]; byDay: LiveBreakdownRow[]; byReason: LiveBreakdownRow[] };
   keys: LiveKeysView; keysProblem: string | null; signerProblem: string | null; venueNames: Record<VenueId, string>;
   candidates: LiveCandidate[]; events: StoredEventView[];
 }

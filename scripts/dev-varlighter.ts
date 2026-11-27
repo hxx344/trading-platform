@@ -165,6 +165,26 @@ const now = Date.now();
     { role: 'openB', leg: 'b', venue: 'entropy', side: 'buy', clientId: 10006, qty: 0.5, filledQty: 0, expectedPrice: 182.1, limitPrice: 182.65, avgPrice: null, slippageBps: null, signalAt: now - 3_599_350, sentAt: now - 3_599_345, ackAt: now - 3_599_285, confirmAt: now - 3_599_285, confirmSource: 'sync', status: '未成交：Order could not immediately match' },
     { role: 'flatten', leg: 'a', venue: 'lighter', side: 'buy', clientId: 10007, qty: 0.5, filledQty: 0.5, expectedPrice: 182.4, limitPrice: 184.2, avgPrice: 182.46, slippageBps: 3.3, signalAt: now - 3_599_285, sentAt: now - 3_599_280, ackAt: now - 3_599_220, confirmAt: now - 3_599_090, confirmSource: 'ws', status: '已成交' },
   ]));
+  // 成交表与结果计数的预览：两笔成交之后有 6 笔第一腿没成交的（不该挤掉成交表），另有两笔不同配对、不同平仓原因的成交（含一笔止损亏损），让执行质量与盈亏分组有内容。
+  const emptyLeg = (venue: LiveLeg['venue'], symbol: string, side: LiveLeg['side']): LiveLeg => ({ ...liveLeg(venue, symbol, side, 0, 0, 0), feesUsd: 0 });
+  [2_400_000, 2_100_000, 1_800_000, 1_500_000, 1_200_000, 900_000].forEach((ago, index) => {
+    const sentAt = now - ago + 10;
+    store.saveLive({ ...liveTrade(`preview-live-nf-${index + 1}`, ago, emptyLeg('lighter', 'NVDA', 'sell'), emptyLeg('entropy', 'io:NVDA', 'buy'), 0, false, 'not_filled', '第一腿没有成交（预览）', [
+      { role: 'openA', leg: 'a', venue: 'lighter', side: 'sell', clientId: 10100 + index, qty: 0.5, filledQty: 0, expectedPrice: 182.3, limitPrice: 182.26, avgPrice: null, slippageBps: null, signalAt: now - ago, sentAt, ackAt: sentAt + 55, confirmAt: sentAt + 180, confirmSource: 'ws', status: '未成交：价格已离开限价' },
+    ]), updatedAt: now - ago + 2_000, closedAt: now - ago + 2_000 });
+  });
+  store.saveLive({ ...liveTrade('preview-live-3', 18_000_000, liveLeg('rh', 'ETH', 'buy', 0.03, 3201.5, 3190.0), liveLeg('lighter', 'ETH', 'sell', 0.03, 3202.1, 3197.9), -0.26, false, 'stop', '', [
+    { role: 'openA', leg: 'a', venue: 'rh', side: 'buy', clientId: 10011, qty: 0.03, filledQty: 0.03, expectedPrice: 3201.2, limitPrice: 3201.8, avgPrice: 3201.5, slippageBps: 0.94, signalAt: now - 18_000_000, sentAt: now - 17_999_985, ackAt: now - 17_999_920, confirmAt: now - 17_999_790, confirmSource: 'ws', status: '已成交' },
+    { role: 'openB', leg: 'b', venue: 'lighter', side: 'sell', clientId: 10012, qty: 0.03, filledQty: 0.03, expectedPrice: 3202.4, limitPrice: 3192.8, avgPrice: 3202.1, slippageBps: 0.94, signalAt: now - 17_999_790, sentAt: now - 17_999_785, ackAt: now - 17_999_720, confirmAt: now - 17_999_610, confirmSource: 'ws', status: '已成交' },
+    { role: 'closeA', leg: 'a', venue: 'rh', side: 'sell', clientId: 10013, qty: 0.03, filledQty: 0.03, expectedPrice: 3190.6, limitPrice: 3181.0, avgPrice: 3190.0, slippageBps: 1.88, signalAt: now - 17_100_010, sentAt: now - 17_100_000, ackAt: now - 17_099_930, confirmAt: now - 17_099_200, confirmSource: 'rest', status: '已成交' },
+    { role: 'closeB', leg: 'b', venue: 'lighter', side: 'buy', clientId: 10014, qty: 0.03, filledQty: 0.03, expectedPrice: 3197.6, limitPrice: 3207.2, avgPrice: 3197.9, slippageBps: 0.94, signalAt: now - 17_100_010, sentAt: now - 17_100_000, ackAt: now - 17_099_940, confirmAt: now - 17_099_850, confirmSource: 'ws', status: '已成交' },
+  ]), symbol: 'rh:ETH|lighter:ETH', direction: 'a_cheap' });
+  store.saveLive(liveTrade('preview-live-4', 93_600_000, liveLeg('lighter', 'NVDA', 'sell', 0.5, 181.9, 181.78), liveLeg('entropy', 'io:NVDA', 'buy', 0.5, 181.7, 181.69), 0.03, false, 'timeout', '', [
+    { role: 'openA', leg: 'a', venue: 'lighter', side: 'sell', clientId: 10021, qty: 0.5, filledQty: 0.5, expectedPrice: 181.92, limitPrice: 181.88, avgPrice: 181.9, slippageBps: 1.1, signalAt: null, sentAt: now - 93_599_990, ackAt: now - 93_599_930, confirmAt: now - 93_599_700, confirmSource: 'rest', status: '已成交' },
+    { role: 'openB', leg: 'b', venue: 'entropy', side: 'buy', clientId: 10022, qty: 0.5, filledQty: 0.5, expectedPrice: 181.7, limitPrice: 182.25, avgPrice: 181.7, slippageBps: 0, signalAt: now - 93_599_700, sentAt: now - 93_599_695, ackAt: now - 93_599_640, confirmAt: now - 93_599_640, confirmSource: 'sync', status: '已成交' },
+    { role: 'closeA', leg: 'a', venue: 'lighter', side: 'buy', clientId: 10023, qty: 0.5, filledQty: 0.5, expectedPrice: 181.77, limitPrice: 182.32, avgPrice: 181.78, slippageBps: 0.55, signalAt: now - 92_700_010, sentAt: now - 92_700_000, ackAt: now - 92_699_950, confirmAt: now - 92_698_800, confirmSource: 'account', status: '已成交' },
+    { role: 'closeB', leg: 'b', venue: 'entropy', side: 'sell', clientId: 10024, qty: 0.5, filledQty: 0.5, expectedPrice: 181.7, limitPrice: 181.15, avgPrice: 181.69, slippageBps: 0.55, signalAt: now - 92_700_010, sentAt: now - 92_700_000, ackAt: now - 92_699_945, confirmAt: now - 92_699_945, confirmSource: 'sync', status: '已成交' },
+  ]));
   store.setState(LIVE_EXEC_KEY, DEFAULT_LIVE_EXEC, now);
   store.setState(LIVE_SKIP_STATS_KEY, { day: Math.floor(now / 86_400_000) * 86_400_000, total: 14, byReason: { '实时价差已缩窄': 9, '价格已越过限价': 5 } }, now);
   store.event(now - 3_600_000, 'live', 'lighter:NVDA|entropy:NVDA', '（预览）第二腿没有成交，第一腿已反向平掉，记一次单腿');

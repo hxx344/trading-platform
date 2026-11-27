@@ -74,9 +74,11 @@ export function prepareSampleRange(db: DatabaseSync) {
   const oldRange = db.prepare(`SELECT ${OLD_COLUMNS.join(', ')} FROM samples WHERE symbol = ? AND t >= ? AND t <= ? ORDER BY t`);
   return function* (symbol: string, from: number, to: number): Generator<Sample> {
     const old = legacyKeyOf(symbol);
-    const older = old ? oldRange.iterate(old, from, to) : undefined;
-    const newer = selectRange.iterate(symbol, from, to);
+    let older: ReturnType<typeof oldRange.iterate> | undefined;
+    let newer: ReturnType<typeof selectRange.iterate> | undefined;
     try {
+      older = old ? oldRange.iterate(old, from, to) : undefined;
+      newer = selectRange.iterate(symbol, from, to);
       let left = older?.next(), right = newer.next();
       while ((left && !left.done) || !right.done) {
         if (left && !left.done && (right.done || Number(left.value.t) < Number(right.value.t))) {
@@ -88,7 +90,7 @@ export function prepareSampleRange(db: DatabaseSync) {
           right = newer.next();
         }
       }
-    } finally { newer.return?.(); older?.return?.(); }
+    } finally { newer?.return?.(); older?.return?.(); }
   };
 }
 

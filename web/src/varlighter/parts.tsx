@@ -70,7 +70,7 @@ export function SpreadChart({ rows, trades, from, to, label, aName = 'A' }: { ro
       <span>基线中位数</span><span>{bps(item.median)}</span><span>入场上 / 下线</span><span>{bps(item.upper)} / {bps(item.lower)}</span></div>; }}
     overlay={scales => <g aria-hidden="true">{inside.map(trade => <g key={trade.id}>
       {trade.openedAt >= from ? <circle className="vl-marker-open" data-outside={clamp(trade.entrySpread, domain) !== trade.entrySpread || undefined} cx={scales.x(trade.openedAt)} cy={scales.y(clamp(trade.entrySpread, domain))} r={4} /> : null}
-      <circle className="vl-marker-close" data-outside={clamp(trade.exitSpread, domain) !== trade.exitSpread || undefined} cx={scales.x(trade.closedAt)} cy={scales.y(clamp(trade.exitSpread, domain))} r={3.5} />
+      {trade.closedAt <= to ? <circle className="vl-marker-close" data-outside={clamp(trade.exitSpread, domain) !== trade.exitSpread || undefined} cx={scales.x(trade.closedAt)} cy={scales.y(clamp(trade.exitSpread, domain))} r={3.5} /> : null}
     </g>)}</g>} />;
 }
 export function SpreadLegend({ aName = 'A' }: { aName?: string }) {

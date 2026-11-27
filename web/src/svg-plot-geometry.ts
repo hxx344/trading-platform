@@ -77,3 +77,16 @@ export function dotsPath(rows: readonly ({ time: number })[], key: string, x: Sc
   }
   return path;
 }
+
+export function inPlotDomain(value: number, yDomain: readonly [number, number]): boolean {
+  const low = Math.min(yDomain[0], yDomain[1]), high = Math.max(yDomain[0], yDomain[1]);
+  return value >= low && value <= high;
+}
+
+export function clampedBandY(from: number, to: number, y: Scale, topBound: number, bottomBound: number): { y: number; height: number } {
+  const rawA = y(from), rawB = y(to);
+  const rawTop = Math.min(rawA, rawB), rawBottom = Math.max(rawA, rawB);
+  const yTop = Math.max(topBound, Math.min(bottomBound, rawTop));
+  const yBottom = Math.max(topBound, Math.min(bottomBound, rawBottom));
+  return { y: yTop, height: Math.max(0, yBottom - yTop) };
+}

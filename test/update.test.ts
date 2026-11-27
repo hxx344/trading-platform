@@ -10,7 +10,7 @@ import {
   UPDATE_READY_FILE, UPDATE_REQUEST_FILE, UPDATE_RESULT_FILE, compareVersions, createUpdates, parseRelease, readInstalledVersion, readUpdateResult,
   releaseNotes, updateReadyFile, type InstalledVersion, type UpdateFetch, type UpdateResult,
 } from '../src/service/update.ts';
-import { checksumOf, recoverUpdate, runUpdateHelper, takeUpdateRequest } from '../src/service/update-helper.ts';
+import { assertNonRootOwner, checksumOf, recoverUpdate, runUpdateHelper, takeUpdateRequest } from '../src/service/update-helper.ts';
 import { createExecutorServer } from '../src/http.ts';
 import { bindAccounts, createHarness } from './harness.ts';
 
@@ -456,4 +456,30 @@ test('在线更新助手：请求文件是符号链接、多个硬链接或过�
     assert.ok('invalid' in (takeUpdateRequest(l.dir, owner) ?? {}), '过大');
     assert.equal(existsSync(join(l.dir, UPDATE_REQUEST_FILE)), false);
   } finally { rmSync(l.root, { recursive: true, force: true }); }
+});
+
+test('在线更新助手：root 身份下拒绝由 root 拥有的请求账户或数据目录', async () => {
+  const { assertNonRootOwner, recoverUpdateHelper, runUpdateHelper } = await import('../src/service/update-helper.ts');
+  assert.throws(() => assertNonRootOwner({ uid: 0 }, '更新请求账户', 0), /属主不能是 root/);
+  assert.doesNotThrow(() => assertNonRootOwner({ uid: 1000 }, '更新请求账户', 0));
+  assert.doesNotThrow(() => assertNonRootOwner({ uid: 0 }, '更新请求账户', 1000));
+  const dir = mkdtempSync(join(tmpdir(), 'tp-update-root-'));
+  try {
+    await assert.rejects(
+      () => runUpdateHelper({ dir, appDir: dir, dataDir: dir, requestOwner: { uid: 0, gid: 0 }, checkHandoffDir: () => {}, currentUid: 0, log: () => undefined }),
+      /属主不能是 root/,
+    );
+    await assert.rejects(
+      () => runUpdateHelper({ dir, appDir: dir, dataDir: dir, checkHandoffDir: () => {}, readOwner: () => ({ uid: 0, gid: 0 }), currentUid: 0, log: () => undefined }),
+      /属主不能是 root/,
+    );
+    assert.throws(
+      () => recoverUpdateHelper({ dir, appDir: dir, dataDir: dir, requestOwner: { uid: 0, gid: 0 }, checkHandoffDir: () => {}, currentUid: 0 }),
+      /属主不能是 root/,
+    );
+    assert.throws(
+      () => recoverUpdateHelper({ dir, appDir: dir, dataDir: dir, checkHandoffDir: () => {}, readOwner: () => ({ uid: 0, gid: 0 }), currentUid: 0 }),
+      /属主不能是 root/,
+    );
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

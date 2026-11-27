@@ -8,6 +8,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import type { FeishuSecret } from './config.ts';
 import { sendFeishu } from './feishu.ts';
+import { redactDiagnostic } from '../redact-diagnostic.ts';
 import { reject } from '../contracts.ts';
 import { add, cmp, decimal, sub } from '../decimal.ts';
 
@@ -254,7 +255,7 @@ export function createSummary({ file, intervalMinutes, robot, collect, now = Dat
       advance('next_due_at = ?, attempts = 0, retry_at = NULL', boundary);
       log(`定时运行摘要已发送（${input.pairs.length} 个配对，${ROBOT_NAME[robot.kind]}）`);
     } catch (error) {
-      const reason = error instanceof Error ? error.message.slice(0, 200) : '未知错误';
+      const reason = error instanceof Error ? redactDiagnostic(error.message).slice(0, 200) : '未知错误';
       const attempts = row.attempts + 1;
       const giveUp = attempts >= TRIES;
       db.prepare('UPDATE summary_schedule SET last_error = ?, last_error_at = ? WHERE id = 1').run(reason, now());
@@ -272,7 +273,7 @@ export function createSummary({ file, intervalMinutes, robot, collect, now = Dat
       robot: robot?.kind ?? null,
       nextDueAt: enabled ? Math.max(row.nextDueAt, row.retryAt ?? 0, warming(now(), interval) ? startedAt + first(interval) : 0) : null,
       lastSentAt: row.lastSentAt, lastSentRobot: row.lastSentRobot,
-      lastError: row.lastError, lastErrorAt: row.lastErrorAt,
+      lastError: row.lastError && redactDiagnostic(row.lastError), lastErrorAt: row.lastErrorAt,
     };
   }
 

@@ -12,7 +12,7 @@ import { parseEnv } from 'node:util';
 import { fileText, planImport, readWorkbench, readerIdentity } from '../src/service/import-workbench.ts';
 import { optionalSourceText, withDatabasePath } from '../src/service/workbench-source.ts';
 import { REQUEST_FILE, RESULT_FILE, RUNNING_STALE_MS, parseImportBody, readImportResult, submitImportRequest, takeImportRequest, writeImportResult } from '../src/service/import-channel.ts';
-import { runImportHelper } from '../src/service/import-helper.ts';
+import { assertNonRootOwner, runImportHelper } from '../src/service/import-helper.ts';
 import { parseServiceConfig } from '../src/service/config.ts';
 import { LONG, MAIN, SHORT } from './aster-fake.ts';
 import { addressOf } from '../src/aster/eip712.ts';
@@ -485,5 +485,23 @@ test('页面导入：预览逐个列出工作台配对能否导入；导入写�
     assert.match(readFileSync(configFile, 'utf8'), /"id": "gold"/, '没有撤销记录时不动配置');
 
   } finally { rmSync(wb.root, { recursive: true, force: true }); }
+});
+
+test('页面导入助手：root 身份下拒绝由 root 拥有的数据目录，普通账户与非 root 进程放行', async () => {
+  const { assertNonRootOwner, recoverImportHelper, runImportHelper } = await import('../src/service/import-helper.ts');
+  assert.throws(() => assertNonRootOwner({ uid: 0 }, '/var/lib/trading-platform', 0), /属主不能是 root/);
+  assert.doesNotThrow(() => assertNonRootOwner({ uid: 1000 }, '/var/lib/trading-platform', 0));
+  assert.doesNotThrow(() => assertNonRootOwner({ uid: 0 }, '/var/lib/trading-platform', 1000));
+  const dir = mkdtempSync(join(tmpdir(), 'tp-import-root-'));
+  try {
+    await assert.rejects(
+      () => runImportHelper({ dir, configFile: join(dir, 'config.json'), dataDir: dir, workbenchEnv: join(dir, 'wb.env'), checkHandoffDir: () => {}, readOwner: () => ({ uid: 0, gid: 0 }), currentUid: 0, restart: async () => true, log: () => undefined }),
+      /属主不能是 root/,
+    );
+    assert.throws(
+      () => recoverImportHelper({ dir, configFile: join(dir, 'config.json'), dataDir: dir, checkHandoffDir: () => {}, readOwner: () => ({ uid: 0, gid: 0 }), currentUid: 0, log: () => undefined }),
+      /属主不能是 root/,
+    );
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

@@ -2415,3 +2415,50 @@ test('两腿行情流的配对：一档推送到就按当时两腿判断并开�
     assert.equal(stats().checks, 5, '停用且没有持仓的配对不按推送判断');
   } finally { engine.close(); rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('回测只读线程：并发未提交写入进行中仍读到一致快照并完成回测', async () => {
+  const params = { ...DEFAULT_SYMBOL, notionalUsd: 100, entryBps: 15, exitBps: 2 }, global = { ...DEFAULT_GLOBAL, minSamples: 10 };
+  const warm = Array.from({ length: 12 }, (_, i) => sample(T0 - (12 - i) * 60_000, 100, 100));
+  const fixture = seededEngine(s => {
+    s.addSamples([...warm, sample(T0, 100.5, 100), sample(T0 + 60_000, 100, 100)]);
+    s.setState(SETTINGS_KEY, settings2({ [RH_BTC]: { ...params, enabled: true } }, global), T0);
+  }, { clock: () => T0 + 120_000 });
+  const db = new DatabaseSync(path.join(fixture.dir, 'varlighter.sqlite'));
+  try {
+    await fixture.engine.refreshCatalog(AbortSignal.timeout(1000), 'rh');
+    await fixture.engine.pollVar(AbortSignal.timeout(1000));
+    db.exec('PRAGMA busy_timeout=2000; BEGIN IMMEDIATE');
+    db.prepare('INSERT INTO leg_samples(symbol, t, received_at, regime, ratio, a_at, a_bid0, a_ask0, b_at, b_bid0, b_ask0) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(RH_BTC, T0 + 90_000, T0 + 90_000, 'rth', 1, T0 + 90_000, 101.9, 102.1, T0 + 90_000, 100, 100);
+    const replay = await fixture.engine.views.backtest({ symbol: RH_BTC, hours: 2 });
+    assert.equal(replay.trades.length, 1, '回测只读线程不受另一连接未提交写事务影响');
+    db.exec('ROLLBACK');
+  } finally {
+    if (db.isTransaction) db.exec('ROLLBACK');
+    db.close();
+    fixture.dispose();
+  }
+});
+
+test('回测只读线程：失败清理后不残留锁，恢复后后续回测正常完成', async () => {
+  const params = { ...DEFAULT_SYMBOL, notionalUsd: 100, entryBps: 15, exitBps: 2 }, global = { ...DEFAULT_GLOBAL, minSamples: 10 };
+  const warm = Array.from({ length: 12 }, (_, i) => sample(T0 - (12 - i) * 60_000, 100, 100));
+  const fixture = seededEngine(s => {
+    s.addSamples([...warm, sample(T0, 100.5, 100), sample(T0 + 60_000, 100, 100)]);
+    s.setState(SETTINGS_KEY, settings2({ [RH_BTC]: { ...params, enabled: true } }, global), T0);
+  }, { clock: () => T0 + 120_000 });
+  const db = new DatabaseSync(path.join(fixture.dir, 'varlighter.sqlite'));
+  try {
+    await fixture.engine.refreshCatalog(AbortSignal.timeout(1000), 'rh');
+    await fixture.engine.pollVar(AbortSignal.timeout(1000));
+    db.exec('ALTER TABLE leg_samples RENAME TO leg_samples_bak');
+    await assert.rejects(() => fixture.engine.views.backtest({ symbol: RH_BTC, hours: 2 }));
+    db.exec('ALTER TABLE leg_samples_bak RENAME TO leg_samples');
+    const replay = await fixture.engine.views.backtest({ symbol: RH_BTC, hours: 2 });
+    assert.equal(replay.trades.length, 1);
+  } finally {
+    try { db.exec('ALTER TABLE leg_samples_bak RENAME TO leg_samples'); } catch { /* 已恢复 */ }
+    db.close();
+    fixture.dispose();
+  }
+});

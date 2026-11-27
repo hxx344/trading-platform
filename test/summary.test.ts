@@ -235,3 +235,38 @@ test('定时摘要排程：发送途中页面改间隔不被覆盖、再点立�
     summary.close();
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('定时摘要发送失败与历史状态：剥离异常文本里的地址与令牌', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tp-summary-redact-'));
+  const file = join(dir, 'notify.sqlite');
+  let clock = NOW;
+  const logs: string[] = [];
+  const webhook = 'https://open.feishu.cn/open-apis/bot/v2/hook/secret987654';
+  const open = () => createSummary({
+    file, intervalMinutes: 60, robot: { secret: { webhook, secret: null }, kind: 'scheduled' },
+    collect: () => input([pair('xau')]), now: () => clock, log: line => logs.push(line),
+    fetchImpl: async () => { throw new Error(`post ${webhook} failed with vr-token=secret-vr`); },
+  });
+  try {
+    let summary = open();
+    clock += FIRST_SUMMARY_MS;
+    await summary.tick();
+    const status = summary.status();
+    assert.ok(status.lastError && !status.lastError.includes('secret987654') && !status.lastError.includes('secret-vr'), status.lastError ?? '');
+    assert.match(status.lastError!, /\[URL\].*vr-token=\[隐藏\]/);
+    assert.ok(logs.some(line => line.includes('[URL]') && !line.includes('secret987654')));
+    summary.close();
+
+    const { DatabaseSync } = await import('node:sqlite');
+    const db = new DatabaseSync(file);
+    try {
+      const stored = db.prepare('SELECT last_error FROM summary_schedule WHERE id = 1').get() as { last_error: string };
+      assert.ok(!stored.last_error.includes('secret987654') && !stored.last_error.includes('secret-vr'));
+      db.prepare('UPDATE summary_schedule SET last_error = ? WHERE id = 1').run(`legacy error ${webhook}`);
+    } finally { db.close(); }
+
+    summary = open();
+    assert.equal(summary.status().lastError, 'legacy error [URL]');
+    summary.close();
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

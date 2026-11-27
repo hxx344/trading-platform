@@ -1,7 +1,7 @@
 // 复制自 project-aggregation 工作台 modules/monitor/app/svg-plot.tsx（提交 8bc3bee）：去掉 "use client"，
 // nearestTimeIndex 内联，横轴标签可传入格式（默认仍为月/日）。
 import { memo, useId, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
-import { bandPath, dotsPath, linePath, plotValue } from "./svg-plot-geometry.ts";
+import { bandPath, clampedBandY, dotsPath, inPlotDomain, linePath, plotValue } from "./svg-plot-geometry.ts";
 
 type Row = { time: number };
 export type PlotLayer =
@@ -126,9 +126,9 @@ export const SvgPlot = memo(function SvgPlot({ rows, hoverRows = rows, xDomain, 
       onBlur={event => { if (event.target === event.currentTarget) store.set(null); }}
       onKeyDown={event => { if (event.target !== event.currentTarget) return; if (event.key === "Escape") { store.set(null); return; } if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return; event.preventDefault(); step(event.key); }}>
       <title>{label}</title><desc>缺失时段断线；触摸、鼠标或左右方向键查看各时点数值。</desc>
-      <defs>{defs}<clipPath id={clip}><rect x={geometry.left} y={geometry.top} width={Math.max(0, geometry.right - geometry.left)} height={geometry.bottom - geometry.top}/></clipPath></defs>
+      <defs>{defs}<clipPath id={clip}><rect x={geometry.left} y={geometry.top - 2} width={Math.max(0, geometry.right - geometry.left)} height={geometry.bottom - geometry.top + 4}/></clipPath></defs>
       <g clipPath={`url(#${clip})`}>
-      {zones.map((zone, key) => { const top = geometry.y(Math.max(zone.from, zone.to)), bottom = geometry.y(Math.min(zone.from, zone.to)); return <rect key={key} x={geometry.left} width={geometry.right - geometry.left} y={top} height={Math.max(0, bottom - top)} fill={zone.fill} fillOpacity={zone.opacity}/>; })}
+      {zones.map((zone, key) => { const band = clampedBandY(zone.from, zone.to, geometry.y, geometry.top, geometry.bottom); return <rect key={key} x={geometry.left} width={Math.max(0, geometry.right - geometry.left)} y={band.y} height={band.height} fill={zone.fill} fillOpacity={zone.opacity}/>; })}
       </g>
       {yTicks.map(value => { const y = geometry.y(value); return <g key={value}>
         <line x1={geometry.left} x2={geometry.right} y1={y} y2={y} stroke="var(--border)" strokeDasharray="3 5"/>
@@ -143,12 +143,12 @@ export const SvgPlot = memo(function SvgPlot({ rows, hoverRows = rows, xDomain, 
           <path d={geometry.paths[key]} fill="none" stroke={layer.color} strokeWidth={layer.width} strokeDasharray={layer.dash} strokeOpacity={layer.opacity} strokeLinecap={layer.dash ? "butt" : "round"} strokeLinejoin="round"/>
           {layer.dots ? <path d={geometry.dots[key]} fill="none" stroke={layer.color} strokeWidth={layer.dots * 2 + layer.width} strokeLinecap="round"/> : null}
         </g>)}
+      </g>
       {row && <g aria-hidden="true" pointerEvents="none">
         <line x1={cursorX} x2={cursorX} y1={geometry.top} y2={geometry.bottom} stroke="var(--muted-foreground)" strokeDasharray="3 3"/>
-        {layers.map(layer => { if (layer.kind !== "line" || !layer.active) return null; const value = plotValue(row, layer.key); return value === null ? null : <circle key={layer.key} cx={cursorX} cy={geometry.y(value)} r={4} fill={layer.color} stroke="var(--card)" strokeWidth={2}/>; })}
+        {layers.map(layer => { if (layer.kind !== "line" || !layer.active) return null; const value = plotValue(row, layer.key); return value === null || !inPlotDomain(value, yDomain) ? null : <circle key={layer.key} cx={cursorX} cy={geometry.y(value)} r={4} fill={layer.color} stroke="var(--card)" strokeWidth={2}/>; })}
       </g>}
       {overlay?.({ x: geometry.x, y: geometry.y })}
-      </g>
     </svg>
     {content && <div ref={tip} className="svg-plot-tooltip">{content}</div>}
   </div>;

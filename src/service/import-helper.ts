@@ -19,6 +19,8 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { parseArgs } from 'node:util';
 import { REQUEST_STALE_MS, readImportResult, takeImportRequest, writeImportResult, type ImportRequest, type ImportResult } from './import-channel.ts';
+import { assertNonRootOwner } from './take-handoff.ts';
+export { assertNonRootOwner };
 import { fileText, filesUnchanged, planImport, previewImport, readExisting, readWorkbench, readWorkbenchOil, readerIdentity, replaceOne, restoreFiles, variationalInput, writeBoth, WORKBENCH_ENV, type FileOwner, type OilSource, type VariationalInput } from './import-workbench.ts';
 import { VENUE_NAMES } from '../contracts.ts';
 import type { FetchLike } from '../live/http.ts';
@@ -56,6 +58,9 @@ export interface HelperOptions {
   restart: () => Promise<boolean>;
   /** Checks the written files as the service account would at start; throws with the reason. */
   checkConfig?: (configFile: string, owner: { uid: number; gid: number }) => string;
+  checkHandoffDir?: (dir: string) => void;
+  readOwner?: (path: string) => { uid: number; gid: number };
+  currentUid?: number;
   /** The Bybit requests of the options account read (tests); the network by default. */
   optionsFetch?: FetchLike;
   /** Tests: where the running workbench Greeks module is looked for (default /proc). */
@@ -182,13 +187,55 @@ export function checkAsService(configFile: string, owner: { uid: number; gid: nu
   return run.stdout.trim();
 }
 
+/** Recovers any interrupted import during ExecStopPost cleanup before the service user changes. */
+export function recoverImportHelper(options: {
+  dir: string;
+  configFile: string;
+  dataDir: string;
+  unit?: string;
+  checkHandoffDir?: (dir: string) => void;
+  readOwner?: (path: string) => { uid: number; gid: number };
+  currentUid?: number;
+  restartService?: (unit: string) => void;
+  log?: (line: string) => void;
+}): void {
+  const {
+    dir,
+    configFile,
+    dataDir,
+    unit = 'trading-platform.service',
+    checkHandoffDir = checkImportDir,
+    readOwner = statSync,
+    currentUid,
+    restartService = target => { spawnSync('systemctl', ['restart', '--no-block', target], { timeout: 30_000 }); },
+    log = line => { process.stderr.write(`${line}\n`); },
+  } = options;
+  if (![dir, configFile, dataDir].every(isAbsolute)) throw new Error('目录与文件须为绝对路径');
+  checkHandoffDir(dir);
+  const stat = readOwner(dataDir);
+  const owner = { uid: stat.uid, gid: stat.gid };
+  assertNonRootOwner(owner, dataDir, currentUid);
+  const latest = (() => { try { return readImportResult(dir); } catch { return null; } })();
+  const done = recoverInterrupted(configFile, owner);
+  if (done) {
+    log(done.message);
+    if (done.restored) restartService(unit);
+    safeAnswer(dir, { id: done.requestId, action: 'import', at: Date.now(), phase: done.kept ? 'done' : 'failed', message: `${done.message}${LEDGER_NOTE}${done.restored ? '，正在重启服务；请稍后刷新页面' : ''}` }, owner, log);
+  } else if (latest && (latest.phase === 'running' || latest.phase === 'restarting')) {
+    // Cut short with nothing to put back (a stuck read, or the restart after putting the files back).
+    safeAnswer(dir, { ...latest, at: Date.now(), phase: 'failed', message: latest.phase === 'restarting' ? '导入助手在重启服务时被中断，导入可能已生效，也可能已恢复；请点「读取工作台」核对，并查看 journalctl -u trading-platform' : '导入助手处理超时被中断，配置未改动（若勾选了资产账本，账本可能已写入并保留，请在资产页核对）；请稍后重试' }, owner, log);
+  }
+  sweepLeftovers(configFile, log);
+}
+
 /** Handles the pending requests; returns how many were answered. */
 export async function runImportHelper(options: HelperOptions): Promise<number> {
-  const { dir, dataDir, now = Date.now, log = line => process.stderr.write(`${line}\n`) } = options;
+  const { dir, dataDir, checkHandoffDir = checkImportDir, readOwner = statSync, currentUid, now = Date.now, log = line => process.stderr.write(`${line}\n`) } = options;
   if (![dir, options.configFile, dataDir, options.workbenchEnv].every(isAbsolute)) throw new Error('目录与文件须为绝对路径');
-  checkImportDir(dir);
-  const stat = statSync(dataDir);
+  checkHandoffDir(dir);
+  const stat = readOwner(dataDir);
   const owner = { uid: stat.uid, gid: stat.gid };
+  assertNonRootOwner(owner, dataDir, currentUid);
   const started = now();
   sweepLeftovers(options.configFile, log);
   const recovered = recoverInterrupted(options.configFile, owner, options.checkConfig ?? checkAsService);
@@ -509,21 +556,7 @@ async function main(): Promise<void> {
   const unit = values.unit ?? 'trading-platform.service';
   if (values.recover) {
     // ExecStopPost: runs after every stop of the helper; acts only when an import was left unsettled.
-    if (!isAbsolute(values.config) || !isAbsolute(values['data-dir'])) throw new Error('目录与文件须为绝对路径');
-    checkImportDir(values.dir);
-    const stat = statSync(values['data-dir']);
-    const owner = { uid: stat.uid, gid: stat.gid };
-    const latest = (() => { try { return readImportResult(values.dir!); } catch { return null; } })();
-    const done = recoverInterrupted(values.config, owner);
-    if (done) {
-      log(done.message);
-      if (done.restored) spawnSync('systemctl', ['restart', '--no-block', unit], { timeout: 30_000 });
-      safeAnswer(values.dir, { id: done.requestId, action: 'import', at: Date.now(), phase: done.kept ? 'done' : 'failed', message: `${done.message}${LEDGER_NOTE}${done.restored ? '，正在重启服务；请稍后刷新页面' : ''}` }, owner, log);
-    } else if (latest && (latest.phase === 'running' || latest.phase === 'restarting')) {
-      // Cut short with nothing to put back (a stuck read, or the restart after putting the files back).
-      safeAnswer(values.dir, { ...latest, at: Date.now(), phase: 'failed', message: latest.phase === 'restarting' ? '导入助手在重启服务时被中断，导入可能已生效，也可能已恢复；请点「读取工作台」核对，并查看 journalctl -u trading-platform' : '导入助手处理超时被中断，配置未改动（若勾选了资产账本，账本可能已写入并保留，请在资产页核对）；请稍后重试' }, owner, log);
-    }
-    sweepLeftovers(values.config, log);
+    recoverImportHelper({ dir: values.dir, configFile: values.config, dataDir: values['data-dir'], unit, log });
     return;
   }
   await runImportHelper({

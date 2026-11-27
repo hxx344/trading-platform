@@ -15,7 +15,8 @@ import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { parseArgs } from 'node:util';
-import { takeHandoff } from './take-handoff.ts';
+import { assertNonRootOwner, takeHandoff } from './take-handoff.ts';
+export { assertNonRootOwner };
 import {
   RELEASE_REPO, UPDATE_REQUEST_FILE, UPDATE_REQUEST_STALE_MS, UPDATE_RESULT_FILE, compareVersions, parseUpdateRequest, readInstalledVersion,
   readUpdateResult, writeHandoff, type UpdateRequest, type UpdateResult,
@@ -39,6 +40,9 @@ export interface UpdateHelperOptions {
   dataDir: string;
   /** UID/GID rendered into the root-owned update unit. Older single-process units use the owner of dataDir. */
   requestOwner?: Owner;
+  checkHandoffDir?: (dir: string) => void;
+  readOwner?: (path: string) => Owner;
+  currentUid?: number;
   releaseBase?: string;
   /** Fetches `url` to `target`; throws with the reason. curl by default. */
   download?: (url: string, target: string) => void;
@@ -125,12 +129,32 @@ export function recoverUpdate(dir: string, appDir: string, owner: Owner, now = D
   return true;
 }
 
+/** Marks any unfinished update as interrupted during ExecStopPost cleanup. */
+export function recoverUpdateHelper(options: {
+  dir: string;
+  appDir: string;
+  dataDir: string;
+  requestOwner?: Owner;
+  checkHandoffDir?: (dir: string) => void;
+  readOwner?: (path: string) => Owner;
+  currentUid?: number;
+  now?: () => number;
+}): boolean {
+  const { dir, appDir, dataDir, requestOwner, checkHandoffDir = checkDir, readOwner = statSync, currentUid, now = Date.now } = options;
+  if (![dir, appDir, dataDir].every(isAbsolute)) throw new Error('目录须为绝对路径');
+  checkHandoffDir(dir);
+  const owner = requestOwner ?? readOwner(dataDir);
+  assertNonRootOwner(owner, requestOwner ? '更新请求账户' : dataDir, currentUid);
+  return recoverUpdate(dir, appDir, owner, now());
+}
+
 /** Handles the pending request, if any; returns whether one was answered. */
 export async function runUpdateHelper(options: UpdateHelperOptions): Promise<boolean> {
-  const { dir, appDir, dataDir, releaseBase = RELEASE_BASE, download = curl, runInstaller = bash, now = Date.now, log = line => process.stderr.write(`${line}\n`) } = options;
+  const { dir, appDir, dataDir, checkHandoffDir = checkDir, readOwner = statSync, currentUid, releaseBase = RELEASE_BASE, download = curl, runInstaller = bash, now = Date.now, log = line => process.stderr.write(`${line}\n`) } = options;
   if (![dir, appDir, dataDir].every(isAbsolute)) throw new Error('目录须为绝对路径');
-  checkDir(dir);
-  const owner = options.requestOwner ?? statSync(dataDir);
+  checkHandoffDir(dir);
+  const owner = options.requestOwner ?? readOwner(dataDir);
+  assertNonRootOwner(owner, options.requestOwner ? '更新请求账户' : dataDir, currentUid);
   if (recoverUpdate(dir, appDir, owner, now())) log('上一次更新没有正常结束，已标为中断');
   const request = takeUpdateRequest(dir, owner);
   if (!request) return false;
@@ -215,9 +239,7 @@ async function main(): Promise<void> {
   }
   const log = (line: string): void => { process.stderr.write(`${line}\n`); };
   if (values.recover === true) {
-    if (![dir, appDir, dataDir].every(isAbsolute)) throw new Error('目录须为绝对路径');
-    checkDir(dir);
-    if (recoverUpdate(dir, appDir, requestOwner ?? statSync(dataDir))) log('更新助手被中断，已把未结束的更新标为中断');
+    if (recoverUpdateHelper({ dir, appDir, dataDir, requestOwner })) log('更新助手被中断，已把未结束的更新标为中断');
     return;
   }
   await runUpdateHelper({ dir, appDir, dataDir, requestOwner, log });

@@ -209,12 +209,15 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
   let admitting = false, held = false, shutdown = false;
   let tail: Promise<void> = Promise.resolve();
 
-  const save = () => store.save(state);
+  let performanceRevision = 0;
+  const save = () => { performanceRevision++; store.save(state); };
   // The fills ledger and the samples (G2b) live in their own tables; v0.14's first start copies in the recent fills.
   const ledger = new Map(store.executions().map(record => [record.execId, record]));
   const unarchived = state.executions.filter(record => !ledger.has(record.execId));
   if (unarchived.length) { store.saveExecutions(unarchived); for (const record of unarchived) ledger.set(record.execId, record); }
   const samples = store.samples();
+  const archiveChecked = new Set<string>();
+  const archiveAgeMs = 90 * 86_400_000;
   const backfillAt = new Map<string, number>();
   // Only this running process can prove a journaled intent has not reached the transport yet.
   const awaitingFirstSend = new Set<string>();
@@ -1376,6 +1379,7 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
     const changed = [...records.values()].filter(record => sortedJson(ledger.get(record.execId)) !== sortedJson(record));
     if (changed.length) {
       store.saveExecutions(changed);
+      performanceRevision++;
       for (const record of changed) ledger.set(record.execId, record);
       archivedQuantities = null;
     }
@@ -1421,8 +1425,9 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
   }
 
   // ---- 收益 (G2b) ------------------------------------------------------------------------------------------------
+  const freshPositions = (at: number) => positions !== null && at >= positions.at && at - positions.at <= POSITIONS_FRESH_MS ? positions.rows : null;
   function performanceInput(at: number): PerformanceInput {
-    const fresh = positions !== null && at - positions.at >= 0 && at - positions.at <= POSITIONS_FRESH_MS ? positions.rows : null;
+    const fresh = freshPositions(at);
     const executions = [...ledger.values()].filter(row => !state.journal[row.orderLinkId] || matchesJournal(row, state.journal[row.orderLinkId]!));
     return { groups: state.tasks, executions, journal: state.journal, positions: fresh, samples, sampleSeconds: PERFORMANCE_SAMPLE_MS / 1000 };
   }
@@ -1449,13 +1454,28 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
     try {
       const at = now();
       // Status, value and expiry do not depend on the samples, so this build skips them; its cost stays flat as they grow.
+      let archivedThisTick = false;
       for (const row of buildPerformance({ ...performanceInput(at), samples: new Map() }).groups) {
+        if (!archivedThisTick && row.status === 'closed' && row.expiry !== null && row.closedAt !== null
+          && Math.max(row.expiry, row.closedAt) < at - archiveAgeMs && !archiveChecked.has(row.id)) {
+          const history = samples.get(row.id);
+          if (history && history.length > GROUP_POINTS && history[0].archiveGap === undefined) {
+            const retained = thinPoints(history, GROUP_POINTS, SAMPLE_GAP_MS, point => Number(point.pnl))
+              .map((point, index) => ({ time: point.time, pnl: point.pnl, archiveGap: index === 0 || point.gapBefore === true }));
+            store.archiveSamples(row.id, retained);
+            samples.set(row.id, retained);
+            performanceRevision++;
+            archivedThisTick = true;
+          }
+          archiveChecked.add(row.id);
+        }
         if (row.status !== 'open' || row.markToMarketPnl === null || row.expiry === null || at >= row.expiry) continue;
         const history = samples.get(row.id) ?? [];
         const last = history.at(-1);
         if (last && at - last.time < PERFORMANCE_SAMPLE_MS) continue;
         const sample: Sample = { time: at, pnl: amountText(exact(row.markToMarketPnl)) };
         store.addSample(row.id, sample);
+        performanceRevision++;
         history.push(sample);
         samples.set(row.id, history);
       }
@@ -1623,18 +1643,26 @@ export function createOptionsEngine({ client, market, store, uid, settings, now 
   }
 
   /** The 收益 page: every opening with its amounts, samples and fills, and the per-currency curve of those held to expiry. */
-  function performanceView() {
-    const at = now();
+  function computePerformanceView(at: number) {
     const report = buildPerformance(performanceInput(at));
     let firstAt: number | null = null;
     for (const record of ledger.values()) if (firstAt === null || record.execTime < firstAt) firstAt = record.execTime;
     return {
       account: `***${uid.slice(-4)}`, sampleSeconds: PERFORMANCE_SAMPLE_MS / 1000, unassignedCloses: report.unassignedCloses,
-      groups: report.groups.map(group => ({ ...group, samples: thinPoints(group.samples, GROUP_POINTS, SAMPLE_GAP_MS, point => point.pnl) })),
+      groups: report.groups.map(group => ({ ...group, archived: samples.get(group.id)?.[0]?.archiveGap !== undefined, samples: thinPoints(group.samples, GROUP_POINTS, SAMPLE_GAP_MS, point => point.pnl) })),
       series: report.series.map(series => ({ ...series, points: thinPoints(series.points, SERIES_POINTS, SAMPLE_GAP_MS, point => point.cumulative) })),
       ledger: { count: ledger.size, firstAt },
       positionsAt: positions?.at ?? null, error: performanceError,
     };
+  }
+
+  let performanceCache: { revision: number; positions: Position[] | null; result: ReturnType<typeof computePerformanceView> } | null = null;
+  function performanceView() {
+    const at = now(), fresh = freshPositions(at);
+    if (!performanceCache || performanceCache.revision !== performanceRevision || performanceCache.positions !== fresh) {
+      performanceCache = { revision: performanceRevision, positions: fresh, result: computePerformanceView(at) };
+    }
+    return { ...performanceCache.result, positionsAt: positions?.at ?? null, error: performanceError };
   }
 
   return { createPlan, startTask, stopTask, createRfq, executeQuote, cancelRfq, rfqTick, reconcileOnce, refreshHealth, autoOpenTick, trendTick, setAutoOpen, performanceTick, close, marketView, previewView, stateView, performanceView, rfqView, state: () => state };

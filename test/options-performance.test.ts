@@ -59,6 +59,19 @@ test('收益：零手续费的提前部分减仓让整组到期后也不纳入',
   assert.deepEqual(value.series, []);
 });
 
+test('归档持仓连续采样区间内出现另一组记录时，综合走势仍连续', () => {
+  const other = expiryGroup({ total: 90 });
+  other.closureEvidence[`${SYMBOL}|Sell`]![0]!.openTime = String(NOW + 1_000);
+  const samples = new Map<string, Sample[]>([
+    ['held', [{ time: NOW, pnl: '0', archiveGap: true }, { time: NOW + HOUR, pnl: '12', archiveGap: false }]],
+    ['other', [{ time: NOW + HOUR / 2, pnl: '4' }]],
+  ]);
+  const value = report({ held: expiryGroup(), other }, [], {}, { samples });
+  const points = thinPoints(value.series[0].points, 300, 180_000, point => point.cumulative);
+  assert.deepEqual(points.slice(0, 3).map(p => [p.time, !!p.gapBefore]), [[NOW, false], [NOW + HOUR / 2, false], [NOW + HOUR, false]]);
+  assert.equal(points.at(-1)!.gapBefore, true);
+});
+
 test('收益：到期后手动平仓、没有交割证据，不算到期结束', () => {
   const row = report({}, [fill('open', 'Sell', 1, 100, 1, 0), fill('late', 'Buy', 1, 50, 1, 6, 'c', 'a')]).groups[0]!;
   assert.equal(row.closureKind, 'unknown');

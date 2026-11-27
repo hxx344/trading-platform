@@ -55,14 +55,14 @@ export interface GroupInput {
 }
 /** What the report needs of an order record (engine JournalEntry satisfies it). */
 export interface JournalInput { taskId: string; symbol: string; side: Side; filledQty: string; reduceOnly: boolean; terminal: boolean }
-export interface Sample { time: number; pnl: string }
+export interface Sample { time: number; pnl: string; archiveGap?: boolean }
 export interface PerformanceInput {
   groups: Readonly<Record<string, GroupInput>>; executions: readonly ExecutionRecord[]; journal: Readonly<Record<string, JournalInput>>;
   /** The latest positions, or null when they are not fresh enough to value a holding. */
   positions: readonly Position[] | null;
   samples: ReadonlyMap<string, readonly Sample[]>; sampleSeconds: number;
 }
-export interface SamplePoint { time: number; pnl: number; terminal?: true }
+export interface SamplePoint { time: number; pnl: number; terminal?: true; archiveGap?: boolean }
 export interface SeriesPoint extends SamplePoint { groupId: string; cumulative: number }
 export type GroupStatus = 'open' | 'closed' | 'pending';
 export type ClosureKind = 'early' | 'expiry' | 'unknown' | 'holding';
@@ -302,7 +302,7 @@ export function buildPerformance({ groups, executions, journal, positions, sampl
   }
   rows.sort((a, b) => (b.openedAt ?? 0) - (a.openedAt ?? 0) || (b.id < a.id ? -1 : b.id > a.id ? 1 : 0));
   for (const row of rows) {
-    let history: SamplePoint[] = [...samples.get(row.id) ?? []].map(sample => ({ time: sample.time, pnl: Number(sample.pnl) })) /* stored by amountText, already rounded */.sort((a, b) => a.time - b.time);
+    let history: SamplePoint[] = [...samples.get(row.id) ?? []].map(sample => ({ ...sample, pnl: Number(sample.pnl) })) /* stored by amountText, already rounded */.sort((a, b) => a.time - b.time);
     if (row.status === 'closed' && row.closedAt !== null) {
       history = history.filter(sample => sample.time < row.closedAt!);
       history.push({ time: row.closedAt, pnl: row.netPnl!, terminal: true });
@@ -313,6 +313,16 @@ export function buildPerformance({ groups, executions, journal, positions, sampl
   const series: SeriesReport[] = [];
   for (const currency of [...new Set(rows.filter(row => row.eligible).map(row => row.currency))].sort()) {
     const completed = rows.filter(row => row.eligible && row.currency === currency);
+    // Each archived interval still represents continuous raw sampling for the portfolio,
+    // including times when another group contributed a mark or settlement in its interior.
+    const continuous = new Map<number, number>();
+    for (const group of completed) {
+      for (let i = 1; i < group.samples.length; i++) {
+        const previous = group.samples[i - 1], point = group.samples[i];
+        if (point.archiveGap === false) continuous.set(previous.time, Math.max(continuous.get(previous.time) ?? 0, point.time));
+      }
+    }
+    let coveredUntil = -Infinity;
     const timeline = completed.flatMap(row => row.samples.map(point => ({ ...point, groupId: row.id }))).sort((a, b) => a.time - b.time || (a.groupId < b.groupId ? -1 : a.groupId > b.groupId ? 1 : 0));
     let total = 0n, peak = 0n, drawdown = 0n;
     const latest = new Map<string, bigint>(), points: SeriesPoint[] = [];
@@ -326,7 +336,9 @@ export function buildPerformance({ groups, executions, journal, positions, sampl
       }
       if (total > peak) peak = total;
       if (peak - total > drawdown) drawdown = peak - total;
-      points.push({ ...simultaneous.at(-1)!, cumulative: amount(total) }); // One point per time, as the workbench.
+      const { archiveGap: _gap, ...last } = simultaneous.at(-1)!;
+      points.push({ ...last, ...(time <= coveredUntil ? { archiveGap: false } : {}), cumulative: amount(total) });
+      coveredUntil = Math.max(coveredUntil, continuous.get(time) ?? -Infinity);
     }
     series.push({
       currency, points, totalPnl: amount(total), closedCount: completed.length, wins: completed.filter(row => row.netPnl! > 0).length, maxDrawdown: amount(drawdown),
@@ -341,8 +353,8 @@ export function buildPerformance({ groups, executions, journal, positions, sampl
  * than `gapMs`, and the lowest and highest of each equal slice. `gapBefore` marks where the line breaks, since the
  * spacing of thinned points no longer shows the gaps.
  */
-export function thinPoints<T extends { time: number; terminal?: true }>(points: readonly T[], limit: number, gapMs: number, value: (point: T) => number): (T & { gapBefore?: true })[] {
-  const gap = points.map((point, index) => index > 0 && point.time - points[index - 1]!.time > gapMs);
+export function thinPoints<T extends { time: number; terminal?: true; archiveGap?: boolean }>(points: readonly T[], limit: number, gapMs: number, value: (point: T) => number): (T & { gapBefore?: true })[] {
+  const gap = points.map((point, index) => index > 0 && point.time - points[index - 1]!.time > gapMs && point.archiveGap !== false);
   const keep = new Set<number>();
   if (points.length <= limit) points.forEach((_, index) => keep.add(index));
   else {

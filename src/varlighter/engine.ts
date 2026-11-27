@@ -4,7 +4,9 @@
 // 由本机每秒检查一次，启用或有持仓的每 5 秒、其余每 20 秒采一条（样本时刻 = 本机采样时刻）。
 import { anySignal } from '../any-signal.mjs';
 import { TOKEN_QUOTE_CONCURRENCY, TOKEN_QUOTE_MAX_AGE_MS, TOKEN_QUOTE_PHASE_MS, type TokenQuote, type VarQuoter } from './varquote.ts';
-import { backtestRequest, runBacktest } from './backtest.ts';
+import { Worker } from 'node:worker_threads';
+import { backtestRequest } from './backtest.ts';
+import type { ReplayJob } from './replay-worker.ts';
 import { HyperliquidStream, LighterStream, MAX_DEPTH_MARKETS, depthAt, fetchEntropyMarkets, fetchRhMarkets, fetchVarListings,
   type Connect, type DepthSnapshot, type FetchLike, type LiveStream, type TopPoint } from './feeds.ts';
 import { COLLATERAL_ASSET, fetchAccount, type AccountSnapshot } from './accounts.ts';
@@ -711,6 +713,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     const at = now(), until = sample.t + paramsOf(position.symbol).cooldownMinutes * 60_000;
     const nextCooldown = Object.fromEntries(Object.entries({ ...cooldown, [position.symbol]: until }).filter(([, end]) => end > at));
     store.closePosition(trade, { at, kind: 'close', message: `${note}${CLOSE_REASON_NAMES[reason]}${spread.estimated ? '（盘口估算）' : ''}：净 ${fmt(trade.netUsd, 2)} 美元（${fmt(trade.netBps, 1)} 基点），持有 ${fmt((trade.closedAt - trade.openedAt) / 60_000, 0)} 分钟` }, nextCooldown);
+    paperTotals = null;
     positions.delete(position.symbol);
     cooldown = nextCooldown;
     updateDepth();
@@ -720,6 +723,10 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
   }
 
   function noteSamples(samples: readonly Sample[]): void {
+    if (historyCache.size && samples.length) {
+      const changed = new Set(samples.map(sample => sample.symbol));
+      for (const [id, entry] of historyCache) if (changed.has(entry.key)) historyCache.delete(id);
+    }
     for (const sample of samples) {
       const counted = recent.get(sample.symbol);
       if (counted) counted.count++;
@@ -738,6 +745,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
   /** 分批删过期样本，批间让出事件循环；停服时停下。 */
   async function pruneSamples(time: number, stopped: () => boolean): Promise<void> {
     while (!stopped() && store.pruneSamples(time, PRUNE_BATCH) === PRUNE_BATCH) await new Promise(resolve => setImmediate(resolve));
+    historyCache.clear();
     store.pruneEvents(time);
     firsts.clear(); firstSample = undefined;
   }
@@ -754,6 +762,9 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     const mark = sample ? markOf(position, sample) : null;
     return { direction: position.direction, openedAt: position.openedAt, pnlBps: mark?.pnlBps ?? null, estimated: mark?.estimated ?? null };
   }
+
+  let paperTotals: ReturnType<VarLighterStore['totals']> | null = null;
+  const totals = () => paperTotals ??= store.totals();
 
   function state(): StateView {
     const time = now();
@@ -798,7 +809,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       rows,
       orphans: orphans(),
       settings,
-      paper: { open: open.length, openNotionalUsd: open.reduce((sum, item) => sum + item.notionalUsd, 0), todayNetUsd: store.netSince(dayStart(time)), ...store.totals() },
+      paper: { open: open.length, openNotionalUsd: open.reduce((sum, item) => sum + item.notionalUsd, 0), todayNetUsd: store.netSince(dayStart(time)), ...totals() },
       regimeNames: REGIME_NAMES,
       venueNames: VENUE_NAMES,
     };
@@ -851,28 +862,51 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     });
   }
 
+  // Cache only the replay. Order plans, freshness, live positions and trades are read on every request.
+  type History = Pick<SymbolView, 'stats' | 'samples' | 'points'>;
+  const historyCache = new Map<string, { key: string; from: number; expires: number; value: History }>();
+  function historyOf(pair: PairInfo, hours: number, time: number, bucket: SizeBucket, entryBps: number): History {
+    const span = hours * 3_600_000, from = time - span, windowMs = settings.global.windowHours * 3_600_000;
+    const id = JSON.stringify([pair.key, hours, pair.kind, settings.revision, bucket, entryBps]);
+    const hit = historyCache.get(id);
+    if (hit && from >= hit.from && time <= hit.expires) return hit.value;
+    const all = store.samples(pair.key, from - windowMs, time);
+    const livePair = bothLive(pair.key);
+    const local = new BaselineTracker(pair.kind, windowMs, settings.global.minSamples, livePair ? LIVE_BASELINE_GAP_MS : 0);
+    const gapMs = 3 * (livePair ? LIVE_IDLE_MS : VAR_POLL_MS);
+    const points: SymbolPoint[] = [], inRange: Sample[] = [];
+    for (const sample of all) {
+      if (sample.t >= from) {
+        const baseline = local.value(sample.regime, sample.t), spread = spreadOf(sample, bucket);
+        const previous = points.at(-1);
+        points.push({ t: sample.t, mid: midBasis(sample), sellA: spread?.sellA ?? null, buyA: spread?.buyA ?? null,
+          median: baseline?.median ?? null, sigma: baseline?.sigma ?? null, regime: sample.regime, estimated: spread?.estimated ?? false,
+          ...(previous && sample.t - previous.t > gapMs ? { gapBefore: true } : {}) });
+        inRange.push(sample);
+      }
+      local.push(sample);
+    }
+    const stats = symbolStats(pair.kind, inRange, entryBps, bucket);
+    const value = { points: downsample(points, 1500), samples: inRange.length, stats: stats.map(item => ({ ...item, suggestedEntryBps: suggestedEntryBps(item) })) };
+    // Sliding either SQL bound past its first sample changes the replay (including baseline warm-up).
+    // A small positive exchange-clock skew can also leave a committed sample just beyond the right bound.
+    const next = store.samplesAfter(pair.key, time, 1)[0];
+    const expires = Math.min((all[0]?.t ?? Infinity) + span + windowMs, (inRange[0]?.t ?? Infinity) + span,
+      next ? next.t - 1 : Infinity, time + VAR_POLL_MS);
+    if (!hit && historyCache.size >= 16) historyCache.delete(historyCache.keys().next().value!);
+    historyCache.set(id, { key: pair.key, from, expires, value });
+    return value;
+  }
+
   function symbolView(keyRaw: unknown, hoursRaw: unknown): SymbolView {
     const key = upgradeKey(String(keyRaw ?? ''));
     const pair = key ? pairOf(key) : undefined;
     if (!pair) return reject('unknown_symbol', '不是当前采集中的配对（或该场所组合未开启）');
     const hours = Number(hoursRaw ?? 24);
     if (!Number.isInteger(hours) || hours < 1 || hours > 24 * 14) reject('invalid_hours', '时长须为 1 到 336 小时');
-    const time = now(), from = time - hours * 3_600_000, windowMs = settings.global.windowHours * 3_600_000;
-    const params = paramsOf(pair.key);
-    const all = store.samples(pair.key, from - windowMs, time);
-    const local = new BaselineTracker(pair.kind, windowMs, settings.global.minSamples, bothLive(pair.key) ? LIVE_BASELINE_GAP_MS : 0);
-    const bucket = bucketOf(params.notionalUsd);
-    const points: SymbolPoint[] = [];
-    const inRange: Sample[] = [];
-    for (const sample of all) {
-      if (sample.t >= from) {
-        const baseline = local.value(sample.regime, sample.t), spread = spreadOf(sample, bucket);
-        points.push({ t: sample.t, mid: midBasis(sample), sellA: spread?.sellA ?? null, buyA: spread?.buyA ?? null, median: baseline?.median ?? null, sigma: baseline?.sigma ?? null, regime: sample.regime, estimated: spread?.estimated ?? false });
-        inRange.push(sample);
-      }
-      local.push(sample);
-    }
-    const stats: RegimeStats[] = symbolStats(pair.kind, inRange, params.entryBps, bucket);
+    const time = now(), from = time - hours * 3_600_000;
+    const params = paramsOf(pair.key), bucket = bucketOf(params.notionalUsd);
+    const history = historyOf(pair, hours, time, bucket, params.entryBps);
     const sample = latest.get(pair.key) ?? store.latest(pair.key);
     const quoted = sample ? spreadOf(sample, bucketOf(params.notionalUsd)) : null;
     const fees = feesOf(pair);
@@ -884,8 +918,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       venue: pair.b.venue, venueName: VENUE_NAMES[pair.b.venue],
       symbol: pair.symbol, name: pair.name, kind: pair.kind, kindName: KIND_NAMES[pair.kind], identity: pair.identity, eligible: eligible(pair), gapBps: pair.gapBps,
       regimes: regimesOf(pair.kind), hours, from, to: time, bucket,
-      points: downsample(points, 1500), samples: inRange.length,
-      stats: stats.map(item => ({ ...item, suggestedEntryBps: suggestedEntryBps(item) })),
+      ...history,
       params: storedOf(pair.key), effective: params, auto: { on: autoKeys.has(pair.key), ...recommendation(pair.key) }, global: settings.global, latest: sample ?? null, plans,
       fees: { a: legFeeBps(settings.global, pair.a.venue, pair.a.market.takerFeeBps), b: legFeeBps(settings.global, pair.b.venue, pair.b.market.takerFeeBps) },
       position: position ? { ...position, mark: sample ? markOf(position, sample) : null } : null,
@@ -900,15 +933,26 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     return { netUsd: trade.netUsd, pnlBps: markToMarket(position, spread).pnlBps, at: sample.t, estimated: trade.estimated, varSource: spread.varSource };
   }
 
-  function backtest(body: unknown): BacktestView {
+  let replayWorker: Worker | null = null;
+  async function backtest(body: unknown): Promise<BacktestView> {
     const request = backtestRequest(body, settings.symbols, settings.global);
     const pair = pairOf(request.symbol) ?? reject('unknown_symbol', '不是当前采集中的配对');
     const time = now(), from = time - request.hours * 3_600_000;
-    const samples = store.samples(pair.key, from - request.global.windowHours * 3_600_000, time);
     const fees = [legFeeBps(request.global, pair.a.venue, pair.a.market.takerFeeBps), legFeeBps(request.global, pair.b.venue, pair.b.market.takerFeeBps)];
-    const result = runBacktest(pair.key, pair.kind, samples, from, time, request.params, request.global, fees[0] === null || fees[1] === null ? null : { aFeeBps: fees[0], bFeeBps: fees[1] });
-    const truncated = result.trades.length > 1000;
-    return { ...result, trades: result.trades.slice(-1000), equity: result.equity.slice(-1000), truncated };
+    if (replayWorker) return reject('backtest_busy', '已有回测进行中，请稍后重试', 429);
+    const job: ReplayJob = { file: store.file, symbol: pair.key, kind: pair.kind, from, to: time, params: request.params, global: request.global,
+      fees: fees[0] === null || fees[1] === null ? null : { aFeeBps: fees[0], bFeeBps: fees[1] } };
+    const worker = new Worker(new URL('./replay-worker.ts', import.meta.url), { workerData: job, env: {}, execArgv: [] });
+    replayWorker = worker;
+    const timer = setTimeout(() => { void worker.terminate(); }, 110_000);
+    try {
+      return await new Promise<BacktestView>((resolve, fail) => {
+        let view: BacktestView | undefined;
+        worker.once('message', result => { view = result; });
+        worker.once('error', fail);
+        worker.once('exit', code => code === 0 && view ? resolve(view) : fail(new Error('回测未完成')));
+      });
+    } finally { clearTimeout(timer); replayWorker = null; }
   }
 
   /**
@@ -953,7 +997,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       now: time,
       positions: open.map(position => { const sample = latest.get(position.symbol); return { ...position, mark: sample ? markOf(position, sample) : null, sampleAt: sample?.t ?? null, maxHoldMinutes: holdParams(position).maxHoldMinutes }; }),
       trades, equity, daily: [...daily].map(([day, value]) => ({ day, ...value })),
-      totals: store.totals(), todayNetUsd: store.netSince(dayStart(time)),
+      totals: totals(), todayNetUsd: store.netSince(dayStart(time)),
       limits: { maxOpenPositions: settings.global.maxOpenPositions, maxTotalNotionalUsd: settings.global.maxTotalNotionalUsd, dailyLossLimitUsd: settings.global.dailyLossLimitUsd, paused: settings.global.paused },
       openNotionalUsd: open.reduce((sum, item) => sum + item.notionalUsd, 0),
       // 实盘事件只在实盘页（只读令牌读不到那里）。
@@ -1072,6 +1116,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
   function resetPaper(body: unknown) {
     if (!isObject(body) || body.confirm !== 'RESET' || Object.keys(body).length !== 1) return reject('invalid_body', '需要确认文字 RESET');
     store.resetPaper(now());
+    paperTotals = null;
     positions.clear(); cooldown = {}; dropExits();
     updateDepth();
     return { ok: true };
@@ -1225,7 +1270,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     /** 实盘告警（经执行服务发飞书）。 */
     liveAlerts: () => liveTrader?.alerts() ?? [],
     live: () => liveTrader,
-    close(): void { running = false; liveStop.abort(); syncStreams(); store.close(); },
+    close(): void { running = false; if (replayWorker) void replayWorker.terminate(); liveStop.abort(); syncStreams(); store.close(); },
   };
 }
 export type VarLighterEngine = ReturnType<typeof createVarLighterEngine>;
@@ -1234,18 +1279,24 @@ const message = (error: unknown) => error instanceof Error ? error.message.slice
 const fmt = (value: number, digits: number) => Number.isFinite(value) ? value.toFixed(digits) : '-';
 
 /** 按时间等分成不超过 limit 格：每格中间价取均值，卖 A 价差取最大、买 A 价差取最小（保留机会的极值），基线取格内最后一个。 */
-export function downsample<T extends { t: number; mid: number; sellA: number | null; buyA: number | null; median: number | null; sigma: number | null }>(points: T[], limit: number): T[] {
+export function downsample<T extends { t: number; mid: number; sellA: number | null; buyA: number | null; median: number | null; sigma: number | null; gapBefore?: boolean }>(points: T[], limit: number): T[] {
   if (points.length <= limit) return points;
   const first = points[0].t, span = points.at(-1)!.t - first + 1, result: T[] = [];
   let index = 0;
   for (let cell = 0; cell < limit && index < points.length; cell++) {
     const end = first + span * (cell + 1) / limit;
-    const group: T[] = [];
-    while (index < points.length && points[index].t < end) group.push(points[index++]);
-    if (!group.length) continue;
-    const last = group.at(-1)!;
-    const sells = group.map(point => point.sellA).filter((value): value is number => value !== null), buys = group.map(point => point.buyA).filter((value): value is number => value !== null);
-    result.push({ ...last, mid: group.reduce((sum, point) => sum + point.mid, 0) / group.length, sellA: sells.length ? Math.max(...sells) : null, buyA: buys.length ? Math.min(...buys) : null });
+    while (index < points.length && points[index].t < end) {
+      const start = index;
+      let mid = 0, sellA: number | null = null, buyA: number | null = null;
+      do {
+        const point = points[index++];
+        mid += point.mid;
+        if (point.sellA !== null) sellA = sellA === null ? point.sellA : Math.max(sellA, point.sellA);
+        if (point.buyA !== null) buyA = buyA === null ? point.buyA : Math.min(buyA, point.buyA);
+      } while (index < points.length && points[index].t < end && !points[index].gapBefore);
+      result.push({ ...points[index - 1], ...(points[start].gapBefore ? { gapBefore: true } : {}),
+        mid: mid / (index - start), sellA, buyA });
+    }
   }
   return result;
 }

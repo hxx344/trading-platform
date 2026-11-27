@@ -16,7 +16,7 @@ import { fakeVariationalToken } from './monitor-fake.ts';
 import { pairMarkets, parsePairKey, parseRhMarkets, parseVarListings, parseVarQuote, regimeOf, spreadOf, midBasis, type Sample } from '../src/varlighter/model.ts';
 import { BaselineTracker, RollingWindow, regimeStats, suggestedEntryBps } from '../src/varlighter/stats.ts';
 import { AUTO_BLOCK, DEFAULT_GLOBAL, DEFAULT_SYMBOL, closePosition, decide, markToMarket, openBlocker, openPosition, positionSpread, readGlobalParams, readSymbolParams, recommendParams, type GlobalParams, type Position, type SymbolParams } from '../src/varlighter/strategy.ts';
-import { backtestRequest, runBacktest } from '../src/varlighter/backtest.ts';
+import { backtestRequest, chartEquity, runBacktest } from '../src/varlighter/backtest.ts';
 import { BOOK_KEEP_LEVELS, CONNECT_TIMEOUT_MS, DEPTH_MAX_GAP_MS, HyperliquidStream, LighterStream, depthAt, depthSnapshot, vwap, type SocketLike } from '../src/varlighter/feeds.ts';
 import { orderPlan } from '../src/varlighter/plan.ts';
 import { MIGRATED_KEY, openVarLighterStore } from '../src/varlighter/store.ts';
@@ -804,6 +804,13 @@ test('下单预演：按场所精度向下取整，核对最小数量与金额�
   assert.equal(orderPlan(both, bothSample, 'a_rich', 999.7, 20, T0 + 200_000).ready, false, '报价太旧');
 });
 
+test('回测曲线保留完整周期、峰谷和时间顺序', () => {
+  const points = Array.from({length: 2100}, (_, t) => ({ t, net: t === 81 ? 99 : t === 82 ? -101 : 0 }));
+  const result = chartEquity(points);
+  assert.ok(result.length <= 1000 && result.every((p, i) => !i || p.t > result[i - 1].t));
+  assert.deepEqual([result[0].t, result.at(-1)!.t, Math.max(...result.map(p => p.net)), Math.min(...result.map(p => p.net))], [0, 2099, 99, -101]);
+});
+
 test('降采样：每格保留机会极值', () => {
   const points = Array.from({ length: 100 }, (_, index) => ({ t: index, mid: index % 2, sellA: index, buyA: -index, median: 0, sigma: 1 }));
   const result = downsample(points, 10);
@@ -811,6 +818,9 @@ test('降采样：每格保留机会极值', () => {
   assert.equal(result[0].sellA, 9);
   assert.equal(result[0].buyA, -9);
   assert.equal(result[0].mid, 0.5);
+  const broken = points.map((point, i) => ({ ...point, sellA: i === 3 ? 1001 : point.sellA, gapBefore: i === 5 }));
+  const segments = downsample(broken, 10);
+  assert.deepEqual(segments.slice(0, 2).map(p => [p.sellA, p.gapBefore]), [[1001, false], [9, true]]);
 });
 
 test('引擎：各组合各自对齐样本写库，盘口快照，模拟盘开平仓与同腿互斥，关闭组合，参数版本冲突与清空确认', async () => {
@@ -949,7 +959,7 @@ test('引擎：各组合各自对齐样本写库，盘口快照，模拟盘开�
     assert.equal(detail.trades.length, 2);
     assert.equal(engine.views.symbol('rh:BTC', '24').key, RH_BTC, '旧键照样能看');
     assert.throws(() => engine.views.symbol('BTC', '24'), /不是当前采集中的配对/);
-    const bt = engine.views.backtest({ symbol: 'rh:BTC', hours: 1 });
+    const bt = await engine.views.backtest({ symbol: 'rh:BTC', hours: 1 });
     assert.equal(bt.symbol, RH_BTC);
     assert.ok(engine.views.readiness().items.some(item => item.key === 'lighter_order' && item.status === 'todo'));
     // 关掉 Var 对主网、主网对 Entropy 与 Var 对 Entropy：先要停用主网上启用的配对。
@@ -1124,6 +1134,20 @@ function seededEngine(seed: (store: SeedStore) => void, options: { fetchImpl?: (
   const engine = createVarLighterEngine({ store: openVarLighterStore(file), fetchImpl, connect: () => { const socket = new FakeSocket(); sockets.push(socket); return socket; }, now, log: options.log });
   return { dir, file, engine, sockets, dispose(keep = false) { engine.close(); if (!keep) rmSync(dir, { recursive: true, force: true }); } };
 }
+
+test('详情滑窗经过已落盘的未来报价时及时更新走势', async () => {
+  let clock = T0;
+  const fixture = seededEngine(store => { store.addSamples([sample(T0 - 10_000, 100), sample(T0 + 4_000, 101)]); }, { clock: () => clock });
+  try {
+    await fixture.engine.refreshCatalog(AbortSignal.timeout(1000), 'rh');
+    await fixture.engine.pollVar(AbortSignal.timeout(1000));
+    const before = fixture.engine.views.symbol(RH_BTC, 1);
+    assert.ok(before.points.some(point => point.t === T0 - 10_000));
+    assert.ok(!before.points.some(point => point.t > T0));
+    clock += 4_000;
+    assert.ok(fixture.engine.views.symbol(RH_BTC, 1).points.some(point => point.t === clock));
+  } finally { fixture.dispose(); }
+});
 
 const RH_SNAPSHOT = { type: 'subscribed/market_stats', channel: 'market_stats:all', market_stats: { 1: { market_id: 1, best_bid_price: '99.99', best_ask_price: '100.01', mark_price: '100' } } };
 
@@ -2150,7 +2174,7 @@ test('引擎接 Var 询价：只给已启用的配对询价，按询价复核与
     assert.equal(opened[0].qty, Number(asked.at(-1)![2]));
     const sampled = store.latest(RH_BTC)!;
     assert.deepEqual([sampled.decisionAt! - sampled.aAt, sampled.aTkQty, sampled.aTkReceivedAt], [37_000, opened[0].qty, clock]);
-    const replay = engine.views.backtest({ symbol: RH_BTC, hours: 2 });
+    const replay = await engine.views.backtest({ symbol: RH_BTC, hours: 2 });
     assert.deepEqual([replay.open?.qty, replay.open?.aEntry, replay.summary.blocked[STALE_QUOTE]], [opened[0].qty, opened[0].aEntry, 3]);
     tokenWait = 0; publicAge = 2_000;
     engine.views.settings({ revision: engine.views.state().settings.revision, symbols: { [RH_BTC]: { notionalUsd: 100_000 } } });
@@ -2257,7 +2281,7 @@ test('账户风控读取后才决定开仓；已提交样本只推进一次，�
     quoteAt += 60_000; riskWait = 500;
     await poll();
     assert.deepEqual([store.positions()[0].symbol, store.latest(RH_BTC)!.decisionAt! - quoteAt], [RH_BTC, 30_000]);
-    const replay = engine.views.backtest({ symbol: RH_BTC, hours: 2 });
+    const replay = await engine.views.backtest({ symbol: RH_BTC, hours: 2 });
     assert.deepEqual([replay.summary.blocked[STALE_QUOTE], replay.open?.openedAt], [1, quoteAt], '回测从持久化时刻还原超界和恰好达界');
     engine.views.close({ symbol: RH_BTC });
 
@@ -2347,7 +2371,7 @@ test('没有 Var 的双行情流也在风控读取后检查两腿年龄并落盘
     assert.deepEqual([first.aRxAt, first.bRxAt, first.decisionAt, store.positions().length], [lateAt, lateAt, lateAt + 30_001, 0]);
     riskWait = 30_000;
     assert.deepEqual(snapshot(validAt).blocked, {});
-    const result = engine.views.backtest({ symbol: key, hours: 2 });
+    const result = await engine.views.backtest({ symbol: key, hours: 2 });
     assert.deepEqual([store.positions()[0]?.openedAt, result.open?.openedAt, result.summary.blocked[STALE_QUOTE], result.summary.blocked[NO_QUOTE_TIME]], [validAt, validAt, 1, 2]);
   } finally { engine.close(); rmSync(dir, { recursive: true, force: true }); }
 });

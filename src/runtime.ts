@@ -158,7 +158,7 @@ export function runExecutor({ executor, store, dir, port, socketPath, executionB
   })();
   const accessToken = randomBytes(32).toString('base64url');
   const status = (): Record<string, unknown> => {
-    const writes = store.stats();
+    const writes = store.stats(false);
     return {
       health: {
         startedAt, now: Date.now(), generation: executor.generation, retired: executor.retired, schemaVersion: store.schemaVersion(), walBytes: store.walBytes(), walLimitBytes: WAL_SIZE_LIMIT_BYTES,

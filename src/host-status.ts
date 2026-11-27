@@ -31,13 +31,14 @@ const cpuTimes = (list: os.CpuInfo[]): CpuSample => list.reduce((sum, cpu) => {
 const percent = (part: number, whole: number): number | null => whole > 0 ? Math.min(100, Math.max(0, Math.round(part / whole * 1000) / 10)) : null;
 const round = (value: number, digits = 1) => Math.round(value * 10 ** digits) / 10 ** digits;
 
-async function readSwap(meminfo: () => Promise<string>): Promise<HostStatus['memory']['swap']> {
+async function readMemoryInfo(meminfo: () => Promise<string>) {
   try {
     const text = await meminfo();
     const field = (name: string) => { const match = new RegExp(`^${name}:\\s+(\\d+) kB`, 'm').exec(text); return match ? Number(match[1]) * 1024 : null; };
     const total = field('SwapTotal'), free = field('SwapFree');
-    return total === null || free === null ? null : { totalBytes: total, usedBytes: total - free, usedPercent: percent(total - free, total) };
-  } catch { return null; }
+    const swap = total === null || free === null ? null : { totalBytes: total, usedBytes: total - free, usedPercent: percent(total - free, total) };
+    return { available: field('MemAvailable'), swap };
+  } catch { return { available: null, swap: null }; }
 }
 
 export interface HostStatusOptions {
@@ -110,13 +111,13 @@ export function createHostStatus({ dataDir, now = Date.now, cpus = os.cpus, tota
     return value;
   }
   async function read(): Promise<HostStatus> {
-    const total = totalmem(), available = Math.min(freemem(), total);
-    const [cpu, swap, diskList] = await Promise.all([cpuUsage(), readSwap(meminfo), disks()]);
+    const [cpu, info, diskList] = await Promise.all([cpuUsage(), readMemoryInfo(meminfo), disks()]);
+    const total = totalmem(), available = Math.min(info.available ?? freemem(), total);
     const memory = memoryUsage();
     return {
       generatedAt: now(),
       cpu: { usagePercent: cpu, cores, loadAverage: loadavg().map(value => round(value, 2)) },
-      memory: { totalBytes: total, availableBytes: available, usedBytes: total - available, usedPercent: percent(total - available, total), swap },
+      memory: { totalBytes: total, availableBytes: available, usedBytes: total - available, usedPercent: percent(total - available, total), swap: info.swap },
       disks: diskList,
       uptimeSeconds: Math.floor(uptime()),
       process: { rssBytes: memory.rss, heapUsedBytes: memory.heapUsed, uptimeSeconds: Math.floor(process.uptime()), loopDelayMs: loopDelay() },

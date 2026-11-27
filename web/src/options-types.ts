@@ -125,7 +125,7 @@ export interface PerformanceGroup {
   legCount: number; openPremium: number | null; openFee: number | null; closeFee: number | null; deliveryFee: number;
   netPnl: number | null; floatingPnl: number | null; markToMarketPnl: number | null; expiry: number | null; eligible: boolean;
   closureKind: 'early' | 'expiry' | 'unknown' | 'holding'; exclusionReason: string; remainingQty: number; source: 'executions' | 'exchange_closed_positions';
-  fills: PerformanceFill[]; samples: PerformancePoint[]; sampleCount: number;
+  fills: PerformanceFill[]; samples: PerformancePoint[]; sampleCount: number; archived?: boolean;
 }
 export interface PerformanceSeries {
   currency: string; points: PerformanceSeriesPoint[]; totalPnl: number; closedCount: number; wins: number; maxDrawdown: number;

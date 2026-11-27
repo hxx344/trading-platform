@@ -922,6 +922,22 @@ test('期权收益：持仓每分钟一个采样，持仓数据过期时不采�
     assert.deepEqual([group.status, group.closureKind, group.eligible, group.netPnl, group.sampleCount], ['closed', 'expiry', true, 4, 2]);
     assert.equal(view.series.length, 1);
     assert.deepEqual([view.series[0]!.currency, view.series[0]!.closedCount, view.series[0]!.totalPnl, view.series[0]!.points.length], ['USDC', 1, 4, 3]);
+    // Reopen with a realistic minute series so both eviction and the restart path see persisted samples.
+    for (let i = 0; i < 750; i++) {
+      s.store.addSample(started.taskId, { time: EXPIRY - (1000 - i) * 60_000, pnl: String(i === 355 ? 17 : i % 3) });
+    }
+    const restored = s.make(s.store);
+    s.hooks.skewMs += 89 * 86_400_000;
+    await restored.performanceTick();
+    assert.equal(s.store.samples().get(started.taskId)!.some(item => item.archiveGap !== undefined), false);
+    s.hooks.skewMs += 2 * 86_400_000;
+    await restored.performanceTick();
+    const retained = s.store.samples().get(started.taskId)!;
+    assert.ok(retained.length < 750 && retained.every(item => typeof item.archiveGap === 'boolean'));
+    assert.ok(retained.some(item => item.pnl === '17'));
+    assert.equal(s.make(s.store).performanceView().groups.find(item => item.id === started.taskId)!.archived, true);
+    await restored.performanceTick();
+    assert.deepEqual(s.store.samples().get(started.taskId), retained);
   } finally { s.dispose(); }
 });
 

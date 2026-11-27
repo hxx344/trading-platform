@@ -100,9 +100,13 @@ export function createNewsFeed({ fetchImpl = fetch, connect = url => new WebSock
       // 没有 Retry-After 或不是秒数（HTTP 日期）时按 10 秒。
       const header = response.headers.get('retry-after'), retry = header === null || header.trim() === '' ? NaN : Number(header);
       cooldownUntil = now() + Math.min(120, Math.max(5, Number.isFinite(retry) ? retry : 10)) * 1_000;
+      await response.body?.cancel().catch(() => {});
       throw new Error('EQN 接口限流（429），稍后重试');
     }
-    if (!response.ok) throw new Error(`EQN 快讯接口返回 ${response.status}`);
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => {});
+      throw new Error(`EQN 快讯接口返回 ${response.status}`);
+    }
     // 先按 content-length 拒掉大应答；没有这个头时读完再按字符数比较（读取受 8 秒超时约束）。
     if (Number(response.headers.get('content-length')) > BODY_MAX) { await response.body?.cancel().catch(() => {}); throw new Error('EQN 快讯应答过大'); }
     const body = await response.text();

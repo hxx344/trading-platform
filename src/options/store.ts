@@ -16,6 +16,7 @@ export interface OptionsStore {
   saveExecutions(records: readonly ExecutionRecord[]): void;
   executions(): ExecutionRecord[];
   addSample(groupId: string, sample: Sample): void;
+  archiveSamples(groupId: string, samples: Sample[]): void;
   samples(): Map<string, Sample[]>;
   close(): void;
 }
@@ -27,14 +28,19 @@ export function openOptionsStore(file: string): OptionsStore {
     if (mode !== 'wal') throw new Error(`期权状态库未能进入 WAL 模式：${mode}`);
     db.exec('PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS state (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL, json TEXT NOT NULL, updated_at INTEGER NOT NULL); '
       + 'CREATE TABLE IF NOT EXISTS executions (exec_id TEXT PRIMARY KEY, exec_time INTEGER NOT NULL, json TEXT NOT NULL); '
+      + 'CREATE INDEX IF NOT EXISTS executions_time ON executions(exec_time, exec_id); '
       + 'CREATE TABLE IF NOT EXISTS samples (group_id TEXT NOT NULL, time INTEGER NOT NULL, pnl TEXT NOT NULL, PRIMARY KEY (group_id, time))');
+    const columns = db.prepare('PRAGMA table_info(samples)').all();
+    if (!columns.some(row => row.name === 'archived_gap')) db.exec('ALTER TABLE samples ADD COLUMN archived_gap INTEGER');
   } catch (error) { db.close(); throw error; }
   const read = db.prepare('SELECT version, json FROM state WHERE id = 1');
   const write = db.prepare('INSERT INTO state (id, version, json, updated_at) VALUES (1, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET version = excluded.version, json = excluded.json, updated_at = excluded.updated_at');
   const writeExecution = db.prepare('INSERT INTO executions (exec_id, exec_time, json) VALUES (?, ?, ?) ON CONFLICT(exec_id) DO UPDATE SET exec_time = excluded.exec_time, json = excluded.json');
   const readExecutions = db.prepare('SELECT json FROM executions ORDER BY exec_time, exec_id');
   const writeSample = db.prepare('INSERT OR REPLACE INTO samples (group_id, time, pnl) VALUES (?, ?, ?)');
-  const readSamples = db.prepare('SELECT group_id, time, pnl FROM samples ORDER BY group_id, time');
+  const clearSamples = db.prepare('DELETE FROM samples WHERE group_id = ?');
+  const writeArchived = db.prepare('INSERT INTO samples (group_id, time, pnl, archived_gap) VALUES (?, ?, ?, ?)');
+  const readSamples = db.prepare('SELECT group_id, time, pnl, archived_gap FROM samples ORDER BY group_id, time');
   return {
     load() {
       const row = read.get() as { version: number; json: string } | undefined;
@@ -54,11 +60,19 @@ export function openOptionsStore(file: string): OptionsStore {
       return (readExecutions.all() as { json: string }[]).map(row => { try { return JSON.parse(row.json) as ExecutionRecord; } catch { throw new Error('期权成交台账内容无法解析'); } });
     },
     addSample(groupId, sample) { writeSample.run(groupId, sample.time, sample.pnl); },
+    archiveSamples(groupId, retained) {
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        clearSamples.run(groupId);
+        for (const sample of retained) writeArchived.run(groupId, sample.time, sample.pnl, Number(sample.archiveGap === true));
+        db.exec('COMMIT');
+      } catch (error) { db.exec('ROLLBACK'); throw error; }
+    },
     samples() {
       const result = new Map<string, Sample[]>();
-      for (const row of readSamples.all() as { group_id: string; time: number; pnl: string }[]) {
+      for (const row of readSamples.all() as { group_id: string; time: number; pnl: string; archived_gap: number | null }[]) {
         const list = result.get(row.group_id) ?? [];
-        list.push({ time: Number(row.time), pnl: row.pnl });
+        list.push({ time: Number(row.time), pnl: row.pnl, ...(row.archived_gap === null ? {} : { archiveGap: row.archived_gap !== 0 }) });
         result.set(row.group_id, list);
       }
       return result;

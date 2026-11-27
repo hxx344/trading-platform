@@ -103,7 +103,7 @@ export async function routePage(views: VarLighterViews, request: DexPageRequest,
     if (method === 'GET' && path === 'samples') return { status: 200, body: views.samples(query.get('symbol'), query.get('after'), query.get('limit')) };
     if (method === 'GET' && path === 'paper') return { status: 200, body: views.paper() };
     if (method === 'GET' && path === 'readiness') return { status: 200, body: views.readiness() };
-    if (method === 'POST' && path === 'backtest') return { status: 200, body: views.backtest(body) };
+    if (method === 'POST' && path === 'backtest') return { status: 200, body: await views.backtest(body) };
     if (method === 'POST' && path === 'settings') return { status: 200, body: views.settings(body) };
     if (method === 'POST' && path === 'paper/close') return { status: 200, body: views.close(body) };
     if (method === 'POST' && path === 'paper/reset') return { status: 200, body: views.reset(body) };

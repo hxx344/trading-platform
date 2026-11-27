@@ -38,6 +38,8 @@ v0.75.0 起。改动定级 R2（只读与告警，不改交易执行）；会话
 - 只用本机系统调用，不出网，不含路径、主机名和进程号。
 - 页面顶栏右侧每 3 秒读一次（页面隐藏时暂停），往返耗时即“本机 → 服务器”的延迟，见 [frontend.md](frontend.md)《顶栏服务器负载与连线》。
 
+Linux 顶栏内存使用率采用同次读取的 `/proc/meminfo` 中的 `MemAvailable`，内核未提供该字段时使用系统空闲内存。页面日志每 250 ms 批量落盘，读取、正常停止和进程退出时同步冲刷。普通日志、问题和告警分别保留最近 4 万、8 千和 2 千行，最长 14 天。系统 journal 保留原始输出。
+
 ## 4 读索引（`src/store.ts` 的 `READ_INDEXES`）
 
 `operations` 未结算部分、`jobs.created_at`、`transfers.created_at` 三个索引用 `CREATE INDEX IF NOT EXISTS` 在迁移之后建立，不改结构版本号，回退旧版不会因“数据库版本更新”拒绝启动。README《回滚》里的退回语句不删这几个索引，留着对旧版无影响（要删可执行 `DROP INDEX IF EXISTS read_jobs_created` 等）。累计开仓名义金额在事务外按 `total_changes()` 与 `PRAGMA data_version` 缓存，任何已提交的写入（本连接或别的连接）都会让它重算；确认任务的事务内始终重算。

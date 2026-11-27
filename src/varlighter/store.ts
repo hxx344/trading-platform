@@ -68,10 +68,34 @@ export type VarLighterStore = ReturnType<typeof openVarLighterStore>;
 /** 迁移用的转换：旧参数换成新参数（引擎提供），旧持仓的手续费取旧参数里的 Var 与 Lighter 手续费。 */
 export interface LegacyUpgrade { settings: (old: unknown) => unknown; cooldown: (old: unknown) => unknown; fees: (old: unknown) => LegFees }
 
+// Both the DEX writer and the read-only replay worker must resolve duplicate timestamps the same way.
+export function prepareSampleRange(db: DatabaseSync) {
+  const selectRange = db.prepare(`SELECT ${LEG_COLUMNS.join(', ')} FROM leg_samples WHERE symbol = ? AND t >= ? AND t <= ? ORDER BY t`);
+  const oldRange = db.prepare(`SELECT ${OLD_COLUMNS.join(', ')} FROM samples WHERE symbol = ? AND t >= ? AND t <= ? ORDER BY t`);
+  return function* (symbol: string, from: number, to: number): Generator<Sample> {
+    const old = legacyKeyOf(symbol);
+    const older = old ? oldRange.iterate(old, from, to) : undefined;
+    const newer = selectRange.iterate(symbol, from, to);
+    try {
+      let left = older?.next(), right = newer.next();
+      while ((left && !left.done) || !right.done) {
+        if (left && !left.done && (right.done || Number(left.value.t) < Number(right.value.t))) {
+          yield fromOldRow(left.value as OldRow, symbol);
+          left = older!.next();
+        } else if (!right.done) {
+          if (left && !left.done && left.value.t === right.value.t) left = older!.next();
+          yield fromLegRow(right.value);
+          right = newer.next();
+        }
+      }
+    } finally { newer.return?.(); older?.return?.(); }
+  };
+}
+
 export function openVarLighterStore(file: string) {
   const db = new DatabaseSync(file);
   try {
-    db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=2000;
+    db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=2000; PRAGMA journal_size_limit=4194304;
     CREATE TABLE IF NOT EXISTS samples (symbol TEXT NOT NULL, t INTEGER NOT NULL, received_at INTEGER NOT NULL, regime TEXT NOT NULL,
       var_mark REAL NOT NULL, var_bid0 REAL NOT NULL, var_ask0 REAL NOT NULL, var_bid1k REAL NOT NULL, var_ask1k REAL NOT NULL, var_bid100k REAL, var_ask100k REAL, var_funding REAL,
       rh_at INTEGER NOT NULL, rh_bid0 REAL NOT NULL, rh_ask0 REAL NOT NULL, rh_mark REAL, rh_index REAL, rh_funding REAL, rh_bid1k REAL, rh_ask1k REAL, rh_bid100k REAL, rh_ask100k REAL,
@@ -90,7 +114,8 @@ export function openVarLighterStore(file: string) {
     CREATE INDEX IF NOT EXISTS leg_trades_closed ON leg_trades(closed_at);
     CREATE INDEX IF NOT EXISTS leg_trades_symbol ON leg_trades(symbol, closed_at);
     CREATE TABLE IF NOT EXISTS live_positions (id TEXT PRIMARY KEY, symbol TEXT NOT NULL, state TEXT NOT NULL, opened_at INTEGER NOT NULL, closed_at INTEGER, net_usd REAL, json TEXT NOT NULL);
-    CREATE INDEX IF NOT EXISTS live_positions_state ON live_positions(state, closed_at);`);
+    CREATE INDEX IF NOT EXISTS live_positions_state ON live_positions(state, closed_at);
+    CREATE INDEX IF NOT EXISTS events_at ON events(at);`);
     // v0.81.0、v0.82.0 给旧表加的可空列；新版本不再写旧表，但旧库可能还没有这些列（读旧样本时按列名读）。
     db.exec('BEGIN IMMEDIATE');
     const existing = new Set((db.prepare('PRAGMA table_info(samples)').all() as { name: string }[]).map(column => column.name));
@@ -110,14 +135,13 @@ export function openVarLighterStore(file: string) {
     db.exec('COMMIT');
   } catch (error) { db.close(); throw error; }
   const insertSample = db.prepare(`INSERT OR IGNORE INTO leg_samples(${LEG_COLUMNS.join(', ')}) VALUES (${LEG_COLUMNS.map(() => '?').join(', ')})`);
-  const selectRange = db.prepare(`SELECT ${LEG_COLUMNS.join(', ')} FROM leg_samples WHERE symbol = ? AND t >= ? AND t <= ? ORDER BY t`);
+  const sampleRange = prepareSampleRange(db);
   const selectAfter = db.prepare(`SELECT ${LEG_COLUMNS.join(', ')} FROM leg_samples WHERE symbol = ? AND t > ? ORDER BY t LIMIT ?`);
   const selectLatest = db.prepare(`SELECT ${LEG_COLUMNS.join(', ')} FROM leg_samples WHERE symbol = ? ORDER BY t DESC LIMIT 1`);
   const countSince = db.prepare('SELECT COUNT(*) AS n FROM leg_samples WHERE symbol = ? AND t >= ?');
   const firstSample = db.prepare('SELECT MIN(t) AS first FROM leg_samples');
   const firstOf = db.prepare('SELECT MIN(t) AS first FROM leg_samples WHERE symbol = ?');
   const pruneBatch = db.prepare('DELETE FROM leg_samples WHERE (symbol, t) IN (SELECT symbol, t FROM leg_samples WHERE t < ? ORDER BY t LIMIT ?)');
-  const oldRange = db.prepare(`SELECT ${OLD_COLUMNS.join(', ')} FROM samples WHERE symbol = ? AND t >= ? AND t <= ? ORDER BY t`);
   const oldAfter = db.prepare(`SELECT ${OLD_COLUMNS.join(', ')} FROM samples WHERE symbol = ? AND t > ? ORDER BY t LIMIT ?`);
   const oldLatest = db.prepare(`SELECT ${OLD_COLUMNS.join(', ')} FROM samples WHERE symbol = ? ORDER BY t DESC LIMIT 1`);
   const oldCount = db.prepare('SELECT COUNT(*) AS n FROM samples WHERE symbol = ? AND t >= ?');
@@ -159,13 +183,14 @@ export function openVarLighterStore(file: string) {
   const addNewSamples = (samples: readonly Sample[]): Sample[] => samples.length
     ? transaction(() => samples.filter(sample => Number(insertSample.run(...legRow(sample)).changes) > 0)) : [];
   return {
+    file,
     /** 写入一批样本，已有同一时刻的忽略；返回新写入的条数。 */
     addSamples(samples: readonly Sample[]): number {
       return addNewSamples(samples).length;
     },
     addNewSamples,
     samples(symbol: string, from: number, to: number): Sample[] {
-      return mergeByTime(legacy(symbol, old => oldRange.all(old, from, to)), fresh(selectRange.all(symbol, from, to)));
+      return [...sampleRange(symbol, from, to)];
     },
     /** 某配对 after 之后（不含）按时刻升序的至多 limit 条样本，走主键；只读导出（docs/mcp.md 第 8.3 节）用。 */
     samplesAfter(symbol: string, after: number, limit: number): Sample[] {

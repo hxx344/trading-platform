@@ -22,8 +22,26 @@ export interface BacktestResult {
   summary: BacktestSummary;
 }
 
+/** Send the whole equity period at display resolution, retaining both endpoints and chronological bucket extremes. */
+export function chartEquity(points: BacktestResult['equity'], limit = 1000) {
+  if (points.length <= limit) return points;
+  const result = [points[0]], buckets = Math.max(1, Math.floor((limit - 2) / 2));
+  const size = Math.ceil((points.length - 2) / buckets);
+  for (let start = 1; start < points.length - 1; start += size) {
+    let low = start, high = start;
+    for (let i = start + 1; i < Math.min(start + size, points.length - 1); i++) {
+      if (points[i].net < points[low].net) low = i;
+      if (points[i].net > points[high].net) high = i;
+    }
+    result.push(points[Math.min(low, high)]);
+    if (low !== high) result.push(points[Math.max(low, high)]);
+  }
+  result.push(points.at(-1)!);
+  return result;
+}
+
 /** fees：两腿手续费（手动值或场所目录费率）；取不到时为 null，回测照常判断但每次开仓都记「手续费未知」。 */
-export function runBacktest(symbol: string, kind: AssetKind, samples: readonly Sample[], from: number, to: number, params: SymbolParams, global: GlobalParams, fees: LegFees | null): BacktestResult {
+export function runBacktest(symbol: string, kind: AssetKind, samples: Iterable<Sample>, from: number, to: number, params: SymbolParams, global: GlobalParams, fees: LegFees | null): BacktestResult {
   const tracker = new BaselineTracker(kind, global.windowHours * 3_600_000, global.minSamples, bothLive(symbol) ? LIVE_BASELINE_GAP_MS : 0);
   const costs = { slippageBps: global.slippageBps, aFeeBps: fees?.aFeeBps ?? 0, bFeeBps: fees?.bFeeBps ?? 0 };
   const effective: SymbolParams = { ...params, enabled: true }, settings: GlobalParams = { ...global, paused: false };

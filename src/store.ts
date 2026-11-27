@@ -93,7 +93,7 @@ export interface Store {
   schemaVersion(): number;
   /** Short IMMEDIATE transaction. The callback must be synchronous: no network or timers inside. */
   tx<T>(operation: () => T): T;
-  stats(): WriteStats;
+  stats(includeSamples?: boolean): WriteStats;
   walBytes(): number;
   /** Call periodically from the owning process, outside any transaction. Synchronous: blocks the caller for at most a few lock waits plus the copy. */
   maintainWal(now?: number): WalMaintenance;
@@ -106,8 +106,14 @@ export interface StoreOptions { busyTimeoutMs?: number; walResetBytes?: number; 
 
 export function openStore(file: string, { busyTimeoutMs = 5000, walResetBytes = WAL_RESET_BYTES, walResetWaitMs = WAL_RESET_WAIT_MS }: StoreOptions = {}): Store {
   const db = new DatabaseSync(file);
-  const stats: WriteStats = { transactions: 0, busy: 0, waitBuckets: Array(WAIT_BUCKETS_MS.length + 1).fill(0), maxWaitMs: 0, maxHoldMs: 0, waits: [], holds: [] };
-  const sample = (list: number[], value: number) => { if (list.length >= SAMPLE_LIMIT) list.splice(0, list.length - SAMPLE_LIMIT + 1); list.push(value); };
+  const stats = { transactions: 0, busy: 0, waitBuckets: Array(WAIT_BUCKETS_MS.length + 1).fill(0), maxWaitMs: 0, maxHoldMs: 0 };
+  const waits = new Float64Array(SAMPLE_LIMIT), holds = new Float64Array(SAMPLE_LIMIT);
+  function ordered(samples: Float64Array): number[] {
+    const count = stats.transactions;
+    if (count <= SAMPLE_LIMIT) return Array.from(samples.subarray(0, count));
+    const next = count % SAMPLE_LIMIT;
+    return [...samples.subarray(next), ...samples.subarray(0, next)];
+  }
   try {
     const mode = (db.prepare('PRAGMA journal_mode=WAL').get() as { journal_mode: string }).journal_mode;
     if (mode !== 'wal') throw new StoreError('journal_mode', `数据库未能进入 WAL 模式：${mode}`);
@@ -121,10 +127,10 @@ export function openStore(file: string, { busyTimeoutMs = 5000, walResetBytes = 
     try { db.exec('BEGIN IMMEDIATE'); }
     catch (error) { if (isBusy(error)) stats.busy++; throw error; }
     const acquired = performance.now(), wait = acquired - requested;
-    stats.transactions++;
+    const slot = stats.transactions++ % SAMPLE_LIMIT;
     const bucket = WAIT_BUCKETS_MS.findIndex(limit => wait < limit);
     stats.waitBuckets[bucket < 0 ? WAIT_BUCKETS_MS.length : bucket]++;
-    stats.maxWaitMs = Math.max(stats.maxWaitMs, wait); sample(stats.waits, wait);
+    stats.maxWaitMs = Math.max(stats.maxWaitMs, wait); waits[slot] = wait;
     try {
       const result = operation();
       if (result && typeof (result as { then?: unknown }).then === 'function') throw new StoreError('async_transaction', '事务回调不能是异步函数');
@@ -135,7 +141,7 @@ export function openStore(file: string, { busyTimeoutMs = 5000, walResetBytes = 
       throw error;
     } finally {
       const hold = performance.now() - acquired;
-      stats.maxHoldMs = Math.max(stats.maxHoldMs, hold); sample(stats.holds, hold);
+      stats.maxHoldMs = Math.max(stats.maxHoldMs, hold); holds[slot] = hold;
     }
   }
 
@@ -165,7 +171,7 @@ export function openStore(file: string, { busyTimeoutMs = 5000, walResetBytes = 
     db, file,
     schemaVersion: () => (db.prepare('SELECT IFNULL(MAX(version), 0) AS version FROM schema_migrations').get() as { version: number }).version,
     tx, walBytes, maintainWal,
-    stats: () => ({ ...stats, waitBuckets: [...stats.waitBuckets], waits: [...stats.waits], holds: [...stats.holds] }),
+    stats: (includeSamples = true) => ({ ...stats, waitBuckets: [...stats.waitBuckets], waits: includeSamples ? ordered(waits) : [], holds: includeSamples ? ordered(holds) : [] }),
     close: () => { if (db.isOpen) db.close(); },
   };
 }

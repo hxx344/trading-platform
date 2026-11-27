@@ -86,7 +86,7 @@ export interface StateView {
   venueNames: Record<VenueId, string>;
 }
 
-export interface SymbolPoint { t: number; mid: number; sellA: number | null; buyA: number | null; median: number | null; sigma: number | null; regime: Regime; estimated: boolean }
+export interface SymbolPoint { gapBefore?: true; t: number; mid: number; sellA: number | null; buyA: number | null; median: number | null; sigma: number | null; regime: Regime; estimated: boolean }
 export interface PositionMark { netUsd: number; pnlBps: number; at: number; estimated: boolean; varSource?: VarPriceSource }
 export interface SymbolView {
   key: string; a: LegInfo & { name: string }; b: LegInfo & { name: string }; ratio: number; custom: boolean; note: string; venue: VenueId; venueName: string;

@@ -42,10 +42,10 @@ test('崩溃兜底：未捕获的异常写一行日志和标记文件后退出�
 test('崩溃兜底：Promise 拒绝的不是 Error 时也记下原值', () => {
   const lines: string[] = [], source = new EventEmitter();
   const remove = installCrashGuard('行情服务', { log: line => lines.push(line), exit: () => undefined, source });
-  source.emit('unhandledRejection', 'plain reason');
+  source.emit('unhandledRejection', 'plain reason https://example.test/private vr-token=example');
   remove();
   assert.equal(source.listenerCount('unhandledRejection'), 0);
-  assert.deepEqual(lines, ['【行情服务异常退出】未处理的 Promise 拒绝：plain reason']);
+  assert.deepEqual(lines, ['【行情服务异常退出】未处理的 Promise 拒绝：plain reason [URL] vr-token=[隐藏]']);
 });
 
 function watchHarness() {
@@ -156,6 +156,14 @@ test('服务器状态：CPU 首读间隔采样、1 秒内复用；数据目录�
   const view = await separate.read();
   assert.deepEqual(view.disks.map(disk => [disk.id, disk.error ?? null]), [['data', '无法读取'], ['root', null]]);
   assert.equal(view.process.loopDelayMs, null);
+});
+
+test('Linux 内存显示可回收页缓存，并在缺失 MemAvailable 时回退', async () => {
+  let info = 'MemAvailable:  7 kB\nSwapTotal: 10 kB\nSwapFree: 0 kB';
+  const host = createHostStatus({ totalmem: () => 10 * 1024, freemem: () => 1024, meminfo: async () => info, wait: async () => {}, loop: null });
+  assert.equal((await host.read()).memory.usedPercent, 30);
+  info = 'MemFree: 1 kB';
+  assert.equal((await host.read()).memory.usedPercent, 90);
 });
 
 test('服务连线汇总：行情、控制面、用户推送、永续行情与心跳各一行，没配置的不列', async () => {

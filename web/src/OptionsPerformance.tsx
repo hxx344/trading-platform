@@ -54,7 +54,7 @@ function GroupRow({ group, sampleSeconds, open, onToggle }: { group: Performance
       <div className="performance-metrics">{metric('开仓权利金净额', group.openPremium)}{metric('开仓手续费', group.openFee)}{metric('平仓手续费', group.closeFee)}{metric('交割手续费', group.deliveryFee)}{metric('已实现净收益', group.netPnl, tone(group.netPnl))}{metric('剩余持仓浮盈亏（未扣费）', group.floatingPnl, tone(group.floatingPnl))}</div>
       <p className="performance-detail-note">{group.status === 'closed' ? `结束于 ${utcMinute(group.closedAt)} UTC · ` : ''}{group.source === 'exchange_closed_positions' ? '收益已按交易所平仓／交割记录核实，包含手续费。' : '根据实际成交逐笔匹配开平仓，手续费按匹配数量分摊。'}{group.eligible ? ' 本组已纳入综合统计。' : ` 本组不纳入综合统计：${group.exclusionReason || '尚未核实到期结束'}。`}</p>
       {group.issues.length ? <p className="pp-warning">{group.issues.join('；')}</p> : null}
-      <h4 className="performance-sample-title">持仓盈亏过程<span>每 {sampleSeconds} 秒采样 · 已扣已知交易费用</span></h4>
+      <h4 className="performance-sample-title">持仓盈亏过程<span>{group.archived ? '历史采样已归档抽稀' : `每 ${sampleSeconds} 秒采样`} · 已扣已知交易费用</span></h4>
       {open ? <div className="pp-chart"><PerformanceChart points={group.samples} sampled={group.sampleCount} value={sampleValue} holding currency={group.currency} describe={point => `${group.id} · ${utcMinute(point.time)} · ${point.terminal ? '结束净收益' : '真实采样'} ${money(point.pnl)}`} /></div> : null}
       <div className="performance-fills">{group.fills.length ? group.fills.map(fill => <div key={fill.execId}><strong>{fill.symbol}</strong><span>{fill.side} · {number(fill.execQty, 4)} BTC × {money(fill.execPrice)}</span><span>手续费 {number(fill.execFee, 6)} {fill.feeCurrency}</span><small>{utcMinute(fill.execTime)} UTC</small></div>) : <p className="muted">逐笔成交历史尚未补齐，已核实的交割收益以交易所记录为准。</p>}</div>
     </div>
@@ -85,7 +85,7 @@ export function PerformancePane({ onExpired, choice, onChoice }: { onExpired: ()
       <div><span>到期组合综合净收益</span><strong className={closed ? tone(series!.totalPnl) : ''}>{closed ? money(series!.totalPnl) : '--'}</strong></div>
       <div><span>纳入统计的到期组合</span><strong>{closed}</strong></div>
       <div><span>到期组合胜率</span><strong>{closed ? `${number(series!.wins / closed * 100, 1)}%` : '--'}</strong></div>
-      <div><span>到期组合采样最大回撤</span><strong>{closed ? money(series!.maxDrawdown) : '--'}</strong></div>
+      <div><span>到期组合采样最大回撤{groups.some(group => group.eligible && group.archived) ? '（含抽稀采样）' : ''}</span><strong>{closed ? money(series!.maxDrawdown) : '--'}</strong></div>
     </div>
     <div className="panel-b">
       <div className="pp-chart">{series ? <PerformanceChart points={series.points} sampled={series.sampledCount} value={seriesValue} holding={false} currency={currency} describe={point => `${point.groupId} · ${utcMinute(point.time)} · ${point.terminal ? '结束净收益' : '真实采样'} ${money(point.pnl)} · 曲线值 ${money(point.cumulative)}`} /> : <div className="empty">等待实盘收益记录</div>}</div>

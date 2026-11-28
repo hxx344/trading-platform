@@ -6,9 +6,10 @@ import { backtestRequest } from '../../src/varlighter/backtest.ts';
 import { pairKey, parsePairKey } from '../../src/varlighter/model.ts';
 import { readCustomPair } from '../../src/varlighter/engine.ts';
 import { DEFAULT_LIVE_EXEC, DEFAULT_LIVE_SETTINGS, LIVE_EXEC_RANGES as SERVER_EXEC_RANGES, LIVE_LIMIT_RANGES as SERVER_LIMIT_RANGES, readLiveExecSettings, readLiveSettings } from '../../src/varlighter/live.ts';
-import { readLeadConfig } from '../../src/varlighter/lead.ts';
+import { readLeadWatcherConfig } from '../../src/varlighter/lead.ts';
 import {
-  DEFAULT_LEAD_FORM, applyCandidate, buildSeriesRows, buildXcorrRows, formFromConfig, formatEventVenue, formatLagMs, lagTone, lagVerdict, leadStartRequest,
+  DEFAULT_LEAD_FORM, applyCandidate, buildAnalyzeSeriesRows, buildAnalyzeXcorrRows, buildBucketRows, catalogSummaryText,
+  formFromConfig, formatDbBytes, formatEventVenue, formatLagMs, lagTone, lagVerdict, leadWatcherRequest,
 } from '../src/varlighter/varlighter-lead-form.ts';
 import {
   EMPTY_PAIR_FORM, backtestBody, bps, bytesPerDay, chartRange, chartRows, comboLabel, comboShort, customPairKey, customPairRequest, directionLabel, directionShort, fundingAnnual, globalForm, globalRequest, parseState,
@@ -536,52 +537,115 @@ test('lead tab route, form validation matches server, candidate fill and chart r
   assert.deepEqual(parseRoute('#/varlighter/lead'), { page: 'varlighter', tab: 'lead', symbol: null });
   assert.equal(varLighterHref('lead'), '#/varlighter/lead');
 
-  const candidate = { symbol: 'NVDAUSDT', baseAsset: 'NVDA', quoteAsset: 'USDT', contractType: 'TRADIFI_PERPETUAL', targets: { lighter: 'NVDA', rh: 'NVDA', entropy: 'NVDA' }, matchCount: 3 };
+  const candidate = {
+    symbol: 'NVDA',
+    kind: 'us_equity',
+    leads: { binance_perp: 'NVDAUSDT', binance_equity: 'NVDA', hl_xyz: 'xyz:NVDA' },
+    targets: { lighter: 'NVDA', rh: 'NVDA', entropy: 'NVDA' },
+    leadCount: 3,
+    targetCount: 3,
+  };
   const filled = applyCandidate(DEFAULT_LEAD_FORM, candidate);
-  assert.equal(filled.binanceSymbol, 'NVDAUSDT');
+  assert.equal(filled.symbol, 'NVDA');
+  assert.equal(filled.binance_perp, 'NVDAUSDT');
+  assert.equal(filled.binance_equity, 'NVDA');
+  assert.equal(filled.hl_xyz, 'xyz:NVDA');
   assert.equal(filled.rh, 'NVDA');
 
-  const req = leadStartRequest({ ...filled, binanceSymbol: ' nvdauSdt ' });
+  const req = leadWatcherRequest({ ...filled, symbol: ' nvda ', binance_perp: ' nvdauSdt ', hl_xyz: ' xyz:NVDA ' });
   assert.ok(req.ok);
-  assert.deepEqual(readLeadConfig(req.value), req.value, '服务端校验接受前端生成的参数');
+  assert.equal(req.value.leads.hl_xyz, 'xyz:NVDA');
+  assert.deepEqual(readLeadWatcherConfig(req.value), req.value, '服务端校验接受前端生成的参数');
 
   const invalid = [
-    [{ binanceSymbol: '' }, 'Binance 合约代码无效（应为 2–32 位大写字母或数字，如 BTCUSDT）'],
-    [{ lighter: '', rh: '', entropy: '' }, '至少选择一个需要对比的 DEX 场所并填写标的代码'],
-    [{ durationSec: '20' }, '测试时长（秒）须在 30 到 1800 之间'],
-    [{ durationSec: '60.5' }, '测试时长（秒）须为整数'],
+    [{ symbol: '' }, '基础标的代码无效（应为 1–24 位大写字母或数字，如 NVDA、BTC）'],
+    [{ binance_perp: '', binance_spot: '', binance_equity: '', hl_xyz: '', coinbase_spot: '', okx_perp: '', bybit_perp: '' }, '至少选择一个参考领先源并填写标的代码'],
+    [{ lighter: '', rh: '', entropy: '' }, '至少选择一个目标 DEX 场所并填写标的代码'],
+    [{ binance_perp: 'bad!' }, 'Binance 合约 代码格式无效'],
     [{ thresholdBps: 'abc' }, '触发阈值（基点）须填数字'],
+    [{ impulseWindowMs: '50' }, '变化窗口（毫秒）须在 100 到 10000 之间'],
+    [{ impulseWindowMs: '500.5' }, '变化窗口（毫秒）须为整数'],
     [{ followRatio: '1.2' }, '跟进判定比例须在 0.2 到 1 之间'],
   ];
   for (const [patch, err] of invalid) {
-    assert.deepEqual(leadStartRequest({ ...filled, ...patch }), { ok: false, error: err });
+    assert.deepEqual(leadWatcherRequest({ ...filled, ...patch }), { ok: false, error: err });
   }
 
   assert.equal(formatLagMs(null), '—');
   assert.equal(formatLagMs(240), '+240 ms');
   assert.equal(formatLagMs(-150), '−150 ms');
   assert.equal(formatLagMs(1250), '+1.25 s');
+  assert.equal(formatDbBytes(null), '—');
+  assert.equal(formatDbBytes(2048), '2.0 KB');
+  assert.equal(catalogSummaryText({
+    loading: false,
+    at: 1000,
+    sources: {
+      binance_perp: { ok: 1000, count: 10, error: null },
+      binance_spot: { ok: 1000, count: 10, error: null },
+      binance_equity: { ok: null, count: 0, error: null },
+      hl_xyz: { ok: null, count: 0, error: 'timeout' },
+      coinbase_spot: { ok: 1000, count: 5, error: null },
+      okx_perp: { ok: 1000, count: 8, error: null },
+      bybit_perp: { ok: 1000, count: 8, error: null },
+    },
+    contracts: { binance_perp: [], binance_spot: [], binance_equity: [], hl_xyz: [], coinbase_spot: [], okx_perp: [], bybit_perp: [] },
+  }), '已连目录 5/6 · 异常 1');
 
-  const session = {
-    id: 'lead-1', status: 'running', config: req.value, startedAt: 1000, finishedAt: null, elapsedMs: 5000, remainingMs: 55000, eventCount: 0, streams: [], events: [],
-    venues: [
-      { venue: 'lighter', name: 'Lighter 主网', symbol: 'NVDA', followed: 0, unfollowed: 0, disconnected: 0, noData: 0, cancelled: 0, pending: 0, followRate: null, bnLeadCount: 0, dexLeadCount: 0, tieCount: 0, bnLeadRate: null, medianMs: null, meanMs: null, p25Ms: null, p75Ms: null, p90Ms: null, p95Ms: null, minMs: null, maxMs: null, xcorr: { peakLagMs: 200, peakCorr: 0.9, zeroCorr: 0.5, samples: 100, points: [{ lagMs: 0, corr: 0.5, samples: 100 }, { lagMs: 200, corr: 0.9, samples: 100 }] }, xcorrReason: null },
+  const analyze = {
+    symbol: 'NVDA',
+    activeLead: 'binance_equity',
+    availableLeads: ['binance_equity', 'binance_perp'],
+    from: 1000,
+    to: 7000,
+    xcorrFrom: 1000,
+    xcorrTo: 7000,
+    xcorrTruncated: false,
+    gridTruncated: false,
+    bucketMs: 300_000,
+    computedMs: 12,
+    eventCount: 4,
+    dataRange: { firstAt: 1000, lastAt: 7000 },
+    leaderboard: [],
+    buckets: [
+      { at: 1000, events: 4, venues: { lighter: { followed: 4, unfollowed: 0, followRate: 1, medianMs: 220 } } },
     ],
-    series: [{ t: 1000, binance: 0, lighter: 0, rh: null, entropy: null }, { t: 1250, binance: 3.1, lighter: 1.2, rh: null, entropy: null }],
+    venues: [
+      { venue: 'lighter', name: 'Lighter 主网', symbol: 'NVDA', followed: 4, unfollowed: 0, disconnected: 0, noData: 0, cancelled: 0, pending: 0, followRate: 1, bnLeadCount: 4, dexLeadCount: 0, tieCount: 0, bnLeadRate: 1, medianMs: 220, meanMs: 220, p25Ms: 210, p75Ms: 230, p90Ms: 240, p95Ms: 240, minMs: 200, maxMs: 240, xcorr: { peakLagMs: 200, peakCorr: 0.9, zeroCorr: 0.5, samples: 100, points: [{ lagMs: 0, corr: 0.5, samples: 100 }, { lagMs: 200, corr: 0.9, samples: 100 }] }, xcorrReason: null },
+    ],
+    events: [],
+    series: [{ t: 1000, values: { binance_equity: 0, binance_perp: 0, lighter: 0 } }, { t: 1250, values: { binance_equity: 4.2, binance_perp: 3.1, lighter: 1.2 } }],
   };
-  assert.deepEqual(buildXcorrRows(session), [{ time: 0, lighter: 0.5, rh: null, entropy: null }, { time: 200, lighter: 0.9, rh: null, entropy: null }]);
-  assert.deepEqual(buildSeriesRows(session), [{ time: 1000, binance: 0, lighter: 0, rh: null, entropy: null }, { time: 1250, binance: 3.1, lighter: 1.2, rh: null, entropy: null }]);
+  assert.deepEqual(buildBucketRows(analyze), [{ time: 1000, lighter: 220, rh: null, entropy: null, events: 4 }]);
+  assert.deepEqual(buildAnalyzeXcorrRows(analyze), [{ time: 0, lighter: 0.5, rh: null, entropy: null }, { time: 200, lighter: 0.9, rh: null, entropy: null }]);
+  assert.deepEqual(buildAnalyzeSeriesRows(analyze), [
+    { time: 1000, binance_perp: 0, binance_spot: null, binance_equity: 0, hl_xyz: null, coinbase_spot: null, okx_perp: null, bybit_perp: null, lighter: 0, rh: null, entropy: null },
+    { time: 1250, binance_perp: 3.1, binance_spot: null, binance_equity: 4.2, hl_xyz: null, coinbase_spot: null, okx_perp: null, bybit_perp: null, lighter: 1.2, rh: null, entropy: null },
+  ]);
 
-  // 补齐 formFromConfig / lagTone / lagVerdict / formatEventVenue 边界覆盖
   assert.deepEqual(formFromConfig({ ...req.value, targets: { lighter: 'NVDA' } }), {
-    binanceSymbol: 'NVDAUSDT', lighter: 'NVDA', rh: '', entropy: '',
-    durationSec: '180', thresholdBps: '3', impulseWindowMs: '1000', followRatio: '0.5', maxWaitMs: '10000', cooldownMs: '2000',
+    symbol: 'NVDA',
+    binance_perp: 'NVDAUSDT',
+    binance_spot: '',
+    binance_equity: 'NVDA',
+    hl_xyz: 'xyz:NVDA',
+    coinbase_spot: '',
+    okx_perp: '',
+    bybit_perp: '',
+    lighter: 'NVDA',
+    rh: '',
+    entropy: '',
+    thresholdBps: '3',
+    impulseWindowMs: '1000',
+    followRatio: '0.5',
+    maxWaitMs: '10000',
+    cooldownMs: '2000',
   });
   assert.deepEqual([lagTone(50), lagTone(-50), lagTone(0), lagTone(null)], ['up', 'down', '', '']);
-  assert.equal(lagVerdict({ name: 'Lighter 主网', followed: 2, medianMs: 120, xcorr: null }), 'Binance 领先约 +120 ms');
-  assert.equal(lagVerdict({ name: 'Entropy', followed: 2, medianMs: -80, xcorr: null }), 'Entropy 反超约 +80 ms');
+  assert.equal(lagVerdict({ name: 'Lighter 主网', followed: 2, medianMs: 120, xcorr: null }, 'Binance 股票'), 'Binance 股票领先约 +120 ms');
+  assert.equal(lagVerdict({ name: 'Entropy', followed: 2, medianMs: -80, xcorr: null }), 'Entropy反超约 +80 ms');
   assert.equal(lagVerdict({ name: 'Lighter RH', followed: 2, medianMs: 10, xcorr: null }), '两边基本同步（±20 ms）');
-  assert.equal(lagVerdict({ name: 'Entropy', followed: 0, medianMs: null, xcorr: { peakLagMs: 200, peakCorr: 0.9, zeroCorr: 0.5, samples: 80, points: [] } }), '互相关显示 Binance 领先 200 ms');
+  assert.equal(lagVerdict({ name: 'Entropy', followed: 0, medianMs: null, xcorr: { peakLagMs: 200, peakCorr: 0.9, zeroCorr: 0.5, samples: 80, points: [] } }, 'HL xyz'), '互相关显示HL xyz领先 200 ms');
   assert.equal(lagVerdict({ name: 'Entropy', followed: 0, medianMs: null, xcorr: null }), '等待足够波动样本');
   assert.deepEqual(formatEventVenue({ status: 'followed', lagMs: 180, maxMoveBps: 3 }), { text: '+180 ms', tone: 'ok' });
   assert.deepEqual(formatEventVenue({ status: 'followed', lagMs: -150, maxMoveBps: 3 }), { text: '−150 ms', tone: 'warn' });

@@ -1,33 +1,94 @@
-// DEX 价差「Binance 领先测速」页签的不依赖 DOM 部分：表单校验、候选填充、延迟格式化与图表行数据。
+// DEX 价差「Binance & 多参考源领先测速」页签不依赖 DOM 的工具函数（校验、候选填充、排行榜与三图数据转换）。
 import type {
+  LeadAnalyzeView,
+  LeadAssetCategory,
   LeadCandidateView,
-  LeadConfig,
+  LeadCatalogStatusView,
   LeadEventVenueView,
   LeadFollowStatus,
-  LeadSessionView,
+  LeadRefSource,
+  LeadSource,
   LeadVenue,
   LeadVenueStatsView,
+  LeadWatcherConfig,
 } from '../../../src/varlighter/views.ts';
 import type { Parsed } from './varlighter-form.ts';
 
+export const LEAD_REF_SOURCES: readonly LeadRefSource[] = [
+  'binance_perp',
+  'binance_spot',
+  'binance_equity',
+  'hl_xyz',
+  'coinbase_spot',
+  'okx_perp',
+  'bybit_perp',
+];
 export const LEAD_VENUES: readonly LeadVenue[] = ['lighter', 'rh', 'entropy'];
+
+export const LEAD_REF_LABELS: Record<LeadRefSource, string> = {
+  binance_perp: 'Binance 合约',
+  binance_spot: 'Binance 现货',
+  binance_equity: 'Binance 股票',
+  hl_xyz: 'Hyperliquid xyz',
+  coinbase_spot: 'Coinbase 现货',
+  okx_perp: 'OKX 永续',
+  bybit_perp: 'Bybit 永续',
+};
+
+export const LEAD_REF_SHORT: Record<LeadRefSource, string> = {
+  binance_perp: 'BN合约',
+  binance_spot: 'BN现货',
+  binance_equity: 'BN美股',
+  hl_xyz: 'HL xyz',
+  coinbase_spot: 'CB现货',
+  okx_perp: 'OKX',
+  bybit_perp: 'Bybit',
+};
+
 export const LEAD_VENUE_LABELS: Record<LeadVenue, string> = {
   lighter: 'Lighter 主网',
   rh: 'Lighter RH',
   entropy: 'Entropy',
 };
+
 export const LEAD_VENUE_SHORT: Record<LeadVenue, string> = {
   lighter: '主网',
   rh: 'RH',
   entropy: 'Entropy',
 };
 
+export const LEAD_SOURCE_LABELS: Record<LeadSource, string> = {
+  ...LEAD_REF_LABELS,
+  ...LEAD_VENUE_LABELS,
+};
+
+export const LEAD_CATEGORY_LABELS: Record<LeadAssetCategory, string> = {
+  us_equity: '美股',
+  crypto: '加密',
+  tradfi: 'TradFi',
+  other: '其他',
+};
+
+export const LEAD_ANALYZE_WINDOWS = [
+  { hours: 1, label: '近 1 小时' },
+  { hours: 6, label: '近 6 小时' },
+  { hours: 24, label: '近 24 小时' },
+  { hours: 72, label: '近 3 天' },
+  { hours: 168, label: '近 7 天' },
+] as const;
+
 export interface LeadForm {
-  binanceSymbol: string;
+  symbol: string;
+  binance_perp: string;
+  binance_spot: string;
+  binance_equity: string;
+  hl_xyz: string;
+  coinbase_spot: string;
+  okx_perp: string;
+  bybit_perp: string;
   lighter: string;
   rh: string;
   entropy: string;
-  durationSec: string;
   thresholdBps: string;
   impulseWindowMs: string;
   followRatio: string;
@@ -36,11 +97,17 @@ export interface LeadForm {
 }
 
 export const DEFAULT_LEAD_FORM: LeadForm = {
-  binanceSymbol: '',
+  symbol: '',
+  binance_perp: '',
+  binance_spot: '',
+  binance_equity: '',
+  hl_xyz: '',
+  coinbase_spot: '',
+  okx_perp: '',
+  bybit_perp: '',
   lighter: '',
   rh: '',
   entropy: '',
-  durationSec: '180',
   thresholdBps: '3',
   impulseWindowMs: '1000',
   followRatio: '0.5',
@@ -48,11 +115,12 @@ export const DEFAULT_LEAD_FORM: LeadForm = {
   cooldownMs: '2000',
 };
 
-const BINANCE_SYMBOL_RE = /^[A-Z0-9]{2,32}$/;
+const WATCHER_SYMBOL_RE = /^[A-Z0-9._-]{1,24}$/;
+const LEAD_REF_SYMBOL_RE = /^[A-Za-z0-9:._-]{1,36}$/;
 const LEG_SYMBOL_RE = /^[A-Za-z0-9._-]{1,24}$/;
 
 interface NumField {
-  key: keyof Pick<LeadForm, 'durationSec' | 'thresholdBps' | 'impulseWindowMs' | 'followRatio' | 'maxWaitMs' | 'cooldownMs'>;
+  key: keyof Pick<LeadForm, 'thresholdBps' | 'impulseWindowMs' | 'followRatio' | 'maxWaitMs' | 'cooldownMs'>;
   label: string;
   min: number;
   max: number;
@@ -60,7 +128,6 @@ interface NumField {
 }
 
 export const LEAD_NUM_FIELDS: readonly NumField[] = [
-  { key: 'durationSec', label: '测试时长（秒）', min: 30, max: 1800, integer: true },
   { key: 'thresholdBps', label: '触发阈值（基点）', min: 0.5, max: 500, integer: false },
   { key: 'impulseWindowMs', label: '变化窗口（毫秒）', min: 100, max: 10_000, integer: true },
   { key: 'followRatio', label: '跟进判定比例', min: 0.2, max: 1.0, integer: false },
@@ -71,20 +138,33 @@ export const LEAD_NUM_FIELDS: readonly NumField[] = [
 export function applyCandidate(form: LeadForm, candidate: LeadCandidateView): LeadForm {
   return {
     ...form,
-    binanceSymbol: candidate.symbol,
+    symbol: candidate.symbol,
+    binance_perp: candidate.leads.binance_perp ?? '',
+    binance_spot: candidate.leads.binance_spot ?? '',
+    binance_equity: candidate.leads.binance_equity ?? '',
+    hl_xyz: candidate.leads.hl_xyz ?? '',
+    coinbase_spot: candidate.leads.coinbase_spot ?? '',
+    okx_perp: candidate.leads.okx_perp ?? '',
+    bybit_perp: candidate.leads.bybit_perp ?? '',
     lighter: candidate.targets.lighter ?? '',
     rh: candidate.targets.rh ?? '',
     entropy: candidate.targets.entropy ?? '',
   };
 }
 
-export function formFromConfig(config: LeadConfig): LeadForm {
+export function formFromConfig(config: LeadWatcherConfig): LeadForm {
   return {
-    binanceSymbol: config.binanceSymbol,
+    symbol: config.symbol,
+    binance_perp: config.leads.binance_perp ?? '',
+    binance_spot: config.leads.binance_spot ?? '',
+    binance_equity: config.leads.binance_equity ?? '',
+    hl_xyz: config.leads.hl_xyz ?? '',
+    coinbase_spot: config.leads.coinbase_spot ?? '',
+    okx_perp: config.leads.okx_perp ?? '',
+    bybit_perp: config.leads.bybit_perp ?? '',
     lighter: config.targets.lighter ?? '',
     rh: config.targets.rh ?? '',
     entropy: config.targets.entropy ?? '',
-    durationSec: String(config.durationSec),
     thresholdBps: String(config.thresholdBps),
     impulseWindowMs: String(config.impulseWindowMs),
     followRatio: String(config.followRatio),
@@ -93,12 +173,24 @@ export function formFromConfig(config: LeadConfig): LeadForm {
   };
 }
 
-/** 校验并生成 `POST /api/varlighter/lead/start` 请求体，规则与服务端 `readLeadConfig` 一致。 */
-export function leadStartRequest(form: LeadForm): Parsed<LeadConfig> {
-  const binanceSymbol = form.binanceSymbol.trim().toUpperCase();
-  if (!BINANCE_SYMBOL_RE.test(binanceSymbol)) {
-    return { ok: false, error: 'Binance 合约代码无效（应为 2–32 位大写字母或数字，如 BTCUSDT）' };
+/** 校验并生成 `POST /api/varlighter/lead/watchers/add` 请求体，规则与服务端 `readLeadWatcherConfig` 一致。 */
+export function leadWatcherRequest(form: LeadForm): Parsed<LeadWatcherConfig> {
+  const symbol = form.symbol.trim().toUpperCase();
+  if (!WATCHER_SYMBOL_RE.test(symbol)) {
+    return { ok: false, error: '基础标的代码无效（应为 1–24 位大写字母或数字，如 NVDA、BTC）' };
   }
+
+  const leads: Partial<Record<LeadRefSource, string>> = {};
+  for (const src of LEAD_REF_SOURCES) {
+    const raw = form[src].trim();
+    if (!raw) continue;
+    if (!LEAD_REF_SYMBOL_RE.test(raw)) return { ok: false, error: `${LEAD_REF_LABELS[src]} 代码格式无效` };
+    leads[src] = src === 'hl_xyz' ? raw : raw.toUpperCase();
+  }
+  if (!Object.keys(leads).length) {
+    return { ok: false, error: '至少选择一个参考领先源并填写标的代码' };
+  }
+
   const targets: Partial<Record<LeadVenue, string>> = {};
   for (const venue of LEAD_VENUES) {
     const raw = form[venue].trim();
@@ -107,7 +199,7 @@ export function leadStartRequest(form: LeadForm): Parsed<LeadConfig> {
     targets[venue] = raw;
   }
   if (!Object.keys(targets).length) {
-    return { ok: false, error: '至少选择一个需要对比的 DEX 场所并填写标的代码' };
+    return { ok: false, error: '至少选择一个目标 DEX 场所并填写标的代码' };
   }
 
   const nums = {} as Record<NumField['key'], number>;
@@ -123,7 +215,8 @@ export function leadStartRequest(form: LeadForm): Parsed<LeadConfig> {
   return {
     ok: true,
     value: {
-      binanceSymbol,
+      symbol,
+      leads,
       targets,
       ...nums,
     },
@@ -132,7 +225,7 @@ export function leadStartRequest(form: LeadForm): Parsed<LeadConfig> {
 
 const finite = (v: number | null | undefined): v is number => typeof v === 'number' && Number.isFinite(v);
 
-/** 延迟可读文本：正值表示 Binance 领先，负值表示目标场所领先。 */
+/** 延迟可读文本：正值表示参考领先源快于目标，负值表示目标更早动。 */
 export function formatLagMs(ms: number | null | undefined): string {
   if (!finite(ms)) return '—';
   const sign = ms > 0 ? '+' : ms < 0 ? '−' : '';
@@ -145,15 +238,15 @@ export function lagTone(ms: number | null | undefined): 'up' | 'down' | '' {
   return ms > 0 ? 'up' : 'down';
 }
 
-export function lagVerdict(venue: Pick<LeadVenueStatsView, 'name' | 'medianMs' | 'followed' | 'xcorr'>): string {
+export function lagVerdict(venue: Pick<LeadVenueStatsView, 'name' | 'medianMs' | 'followed' | 'xcorr'>, leadName = '参考源'): string {
   if (venue.followed > 0 && finite(venue.medianMs)) {
-    if (venue.medianMs > 20) return `Binance 领先约 ${formatLagMs(venue.medianMs)}`;
-    if (venue.medianMs < -20) return `${venue.name} 反超约 ${formatLagMs(Math.abs(venue.medianMs))}`;
+    if (venue.medianMs > 20) return `${leadName}领先约 ${formatLagMs(venue.medianMs)}`;
+    if (venue.medianMs < -20) return `${venue.name}反超约 ${formatLagMs(Math.abs(venue.medianMs))}`;
     return '两边基本同步（±20 ms）';
   }
   if (venue.xcorr) {
-    if (venue.xcorr.peakLagMs > 0) return `互相关显示 Binance 领先 ${venue.xcorr.peakLagMs} ms`;
-    if (venue.xcorr.peakLagMs < 0) return `互相关显示 ${venue.name} 领先 ${Math.abs(venue.xcorr.peakLagMs)} ms`;
+    if (venue.xcorr.peakLagMs > 0) return `互相关显示${leadName}领先 ${venue.xcorr.peakLagMs} ms`;
+    if (venue.xcorr.peakLagMs < 0) return `互相关显示${venue.name}领先 ${Math.abs(venue.xcorr.peakLagMs)} ms`;
     return '互相关峰值在 0 ms（同步）';
   }
   return '等待足够波动样本';
@@ -165,7 +258,7 @@ export const FOLLOW_STATUS_LABELS: Record<LeadFollowStatus, string> = {
   pending: '等待中',
   disconnected: '中途断线',
   no_data: '缺基准价',
-  cancelled: '测试结束',
+  cancelled: '停止结算',
 };
 
 export function formatEventVenue(entry: LeadEventVenueView | undefined): { text: string; tone: 'ok' | 'warn' | 'bad' | 'info' | '' } {
@@ -179,6 +272,39 @@ export function formatEventVenue(entry: LeadEventVenueView | undefined): { text:
   return { text: FOLLOW_STATUS_LABELS[entry.status], tone: 'warn' };
 }
 
+export function formatDbBytes(bytes: number | null): string {
+  if (!finite(bytes) || bytes < 0) return '—';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+export function catalogSummaryText(catalog: LeadCatalogStatusView): string {
+  const loaded = LEAD_REF_SOURCES.filter(s => s !== 'binance_equity' && catalog.sources[s].ok !== null);
+  const failed = LEAD_REF_SOURCES.filter(s => s !== 'binance_equity' && catalog.sources[s].error !== null);
+  if (catalog.loading) return '正在拉取多参考源公开目录…';
+  return `已连目录 ${loaded.length}/6${failed.length ? ` · 异常 ${failed.length}` : ''}`;
+}
+
+export interface BucketChartRow {
+  time: number;
+  lighter: number | null;
+  rh: number | null;
+  entropy: number | null;
+  events: number;
+}
+
+export function buildBucketRows(view: Pick<LeadAnalyzeView, 'buckets'>): BucketChartRow[] {
+  return view.buckets.map(b => ({
+    time: b.at,
+    lighter: b.venues.lighter?.medianMs ?? null,
+    rh: b.venues.rh?.medianMs ?? null,
+    entropy: b.venues.entropy?.medianMs ?? null,
+    events: b.events,
+  }));
+}
+
 export interface XcorrChartRow {
   time: number;
   lighter: number | null;
@@ -186,9 +312,9 @@ export interface XcorrChartRow {
   entropy: number | null;
 }
 
-export function buildXcorrRows(session: LeadSessionView): XcorrChartRow[] {
+export function buildAnalyzeXcorrRows(view: Pick<LeadAnalyzeView, 'venues'>): XcorrChartRow[] {
   const byLag = new Map<number, XcorrChartRow>();
-  for (const venue of session.venues) {
+  for (const venue of view.venues) {
     if (!venue.xcorr) continue;
     for (const pt of venue.xcorr.points) {
       let row = byLag.get(pt.lagMs);
@@ -202,20 +328,32 @@ export function buildXcorrRows(session: LeadSessionView): XcorrChartRow[] {
   return [...byLag.values()].sort((a, b) => a.time - b.time);
 }
 
-export interface LeadSeriesChartRow {
+export interface AnalyzeSeriesChartRow {
   time: number;
-  binance: number | null;
+  binance_perp: number | null;
+  binance_spot: number | null;
+  binance_equity: number | null;
+  hl_xyz: number | null;
+  coinbase_spot: number | null;
+  okx_perp: number | null;
+  bybit_perp: number | null;
   lighter: number | null;
   rh: number | null;
   entropy: number | null;
 }
 
-export function buildSeriesRows(session: LeadSessionView): LeadSeriesChartRow[] {
-  return session.series.map(pt => ({
+export function buildAnalyzeSeriesRows(view: Pick<LeadAnalyzeView, 'series'>): AnalyzeSeriesChartRow[] {
+  return view.series.map(pt => ({
     time: pt.t,
-    binance: pt.binance,
-    lighter: pt.lighter,
-    rh: pt.rh,
-    entropy: pt.entropy,
+    binance_perp: pt.values.binance_perp ?? null,
+    binance_spot: pt.values.binance_spot ?? null,
+    binance_equity: pt.values.binance_equity ?? null,
+    hl_xyz: pt.values.hl_xyz ?? null,
+    coinbase_spot: pt.values.coinbase_spot ?? null,
+    okx_perp: pt.values.okx_perp ?? null,
+    bybit_perp: pt.values.bybit_perp ?? null,
+    lighter: pt.values.lighter ?? null,
+    rh: pt.values.rh ?? null,
+    entropy: pt.values.entropy ?? null,
   }));
 }

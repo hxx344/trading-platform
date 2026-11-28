@@ -15,6 +15,8 @@ import { loadWebApp } from '../src/web-assets.ts';
 import { startDex } from '../src/dex/main.ts';
 import { createDexClient } from '../src/dex/ipc.ts';
 import { openVarLighterStore, VARLIGHTER_FILE } from '../src/varlighter/store.ts';
+import { DEFAULT_LEAD_WATCHER_PARAMS, LEAD_GRID_STEP_MS, type PersistLeadEvent, type PersistLeadGrid } from '../src/varlighter/lead.ts';
+import { LEAD_DB_FILE, openLeadStore } from '../src/varlighter/lead-store.ts';
 import { ENTROPY_COST_SYNC_KEY, accountHashOf } from '../src/varlighter/entropy-cost.ts';
 import { runBacktest } from '../src/varlighter/backtest.ts';
 import { KNOWN_KINDS, REVIEW_KINDS, pairKey, regimeOf, varHourly, type Leg, type LiveVenue, type Sample } from '../src/varlighter/model.ts';
@@ -87,13 +89,14 @@ const liveMid = (market: Market, venue: LiveVenue, price: number, t: number) => 
   const pulse = leadPulseBps(t - lagMs);
   return price * (1 + (item.offset + pulse + 4 * Math.sin(t / 420_000 + phase + item.id)) / 10_000);
 };
-const binanceTopOf = (market: Market) => {
+const leadTopOf = (market: Market, leadShiftMs = 0) => {
   const t = Date.now();
   const base = step(market, Math.floor(t / 60_000) * 60_000).price;
-  const mid = base * (1 + leadPulseBps(t) / 10_000);
+  const mid = base * (1 + leadPulseBps(t + leadShiftMs) / 10_000);
   const spread = half(mid, crypto(market) ? 0.8 : 2);
   return { bid: mid - spread, ask: mid + spread, mid };
 };
+const binanceTopOf = (market: Market) => leadTopOf(market, 0);
 const crypto = (market: Market) => kindOf(market.symbol) === 'crypto';
 const VAR_FUNDING_ANNUAL = (market: Market) => crypto(market) ? 0.1095 : 0.05;
 
@@ -224,6 +227,80 @@ const now = Date.now();
   store.close();
 }
 
+// 预写入领先测速独立数据库（lead.sqlite）：启用常驻标的 NVDA（BN 美股 / HL xyz / BN 合约 -> 三 DEX 场所），并预置 12 小时历史事件与近端 100ms 网格变化点，便于页面立即检验排行与三图。
+{
+  const leadStore = openLeadStore(join(dir, LEAD_DB_FILE));
+  const nvdaConfig = {
+    symbol: 'NVDA',
+    leads: { binance_equity: 'NVDA', hl_xyz: 'xyz:NVDA', binance_perp: 'NVDAUSDT' },
+    targets: { lighter: 'NVDA', rh: 'NVDA', entropy: 'NVDA' },
+    ...DEFAULT_LEAD_WATCHER_PARAMS,
+  };
+  const runStart = now - 12 * 3_600_000;
+  leadStore.upsertWatcher(nvdaConfig, true, runStart);
+  const runId = leadStore.startRun('NVDA', runStart, nvdaConfig);
+  const seedEvents: PersistLeadEvent[] = [];
+  const leadOffsets = [
+    { source: 'binance_equity' as const, shiftMs: 110 },
+    { source: 'hl_xyz' as const, shiftMs: 40 },
+    { source: 'binance_perp' as const, shiftMs: 0 },
+  ];
+  for (let i = 0; i < 12; i++) {
+    const slotBase = now - (12 - i) * 3_300_000;
+    for (let j = 0; j < leadOffsets.length; j++) {
+      const { source, shiftMs } = leadOffsets[j]!;
+      const at = slotBase + j * 45_000;
+      const dir = ((i + j) % 2 === 0 ? 1 : -1) as 1 | -1;
+      const baseMid = 182.1 + i * 0.05;
+      const moveBps = 5.2 + (j % 2) * 0.8;
+      seedEvents.push({
+        symbol: 'NVDA',
+        runId,
+        leadSource: source,
+        at,
+        direction: dir,
+        baseMid,
+        triggerMid: baseMid * (1 + dir * moveBps / 10_000),
+        moveBps,
+        thresholdBps: nvdaConfig.thresholdBps,
+        followBps: nvdaConfig.thresholdBps * nvdaConfig.followRatio,
+        venues: {
+          entropy: { status: 'followed', lagMs: 140 + shiftMs, maxMoveBps: moveBps * 0.9 },
+          lighter: { status: 'followed', lagMs: 220 + shiftMs, maxMoveBps: moveBps * 0.85 },
+          rh: { status: 'followed', lagMs: 420 + shiftMs, maxMoveBps: moveBps * 0.78 },
+        },
+      });
+    }
+  }
+  const seedGrid: PersistLeadGrid[] = [];
+  const gridStart = Math.floor((now - 180_000) / LEAD_GRID_STEP_MS) * LEAD_GRID_STEP_MS;
+  const gridEnd = Math.floor((now - 65_000) / LEAD_GRID_STEP_MS) * LEAD_GRID_STEP_MS;
+  const allSeedSources: Array<{ source: PersistLeadGrid['source']; lagMs: number }> = [
+    { source: 'binance_equity', lagMs: -110 },
+    { source: 'hl_xyz', lagMs: -40 },
+    { source: 'binance_perp', lagMs: 0 },
+    { source: 'entropy', lagMs: 140 },
+    { source: 'lighter', lagMs: 220 },
+    { source: 'rh', lagMs: 420 },
+  ];
+  const lastGridVal = new Map<PersistLeadGrid['source'], string>();
+  for (let t = gridStart; t <= gridEnd; t += LEAD_GRID_STEP_MS) {
+    const gridIdx = Math.floor((t - gridStart) / LEAD_GRID_STEP_MS);
+    for (const { source, lagMs } of allSeedSources) {
+      const pulse = leadPulseBps(t - lagMs);
+      const mid = Number((182.25 * (1 + (pulse + 1.5 * Math.sin(t / 40_000)) / 10_000)).toFixed(4));
+      const key = `${mid}`;
+      if (lastGridVal.get(source) !== key || gridIdx % 300 === 0) {
+        lastGridVal.set(source, key);
+        seedGrid.push({ symbol: 'NVDA', at: t, source, runId, gridIdx, segId: 1, mid });
+      }
+    }
+  }
+  leadStore.flushBatch(seedEvents, seedGrid);
+  leadStore.endRun(runId, gridEnd + LEAD_GRID_STEP_MS);
+  leadStore.close();
+}
+
 /** 替身 WebSocket 的公共部分。 */
 abstract class FakeSocket implements SocketLike {
   readyState = 0;
@@ -241,27 +318,35 @@ abstract class FakeSocket implements SocketLike {
   abstract send(data: string): void;
   close() { this.readyState = 3; clearInterval(this.timer); this.onclose?.({}); }
 }
-// 替身 Binance bookTicker 行情流：每 100ms 检查，一档变动立即推给订阅的单标的。
+// 替身 Binance 行情流（perp bookTicker / spot 无 e 字段 bookTicker / equity @quote）：按领先偏移推送变化。
 class FakeBinance extends FakeSocket {
   private readonly subs = new Set<string>();
+  private readonly mode: 'perp' | 'spot' | 'equity';
   private updateId = 1;
   private lastBid = new Map<string, string>();
-  constructor() { super(100); }
+  constructor(mode: 'perp' | 'spot' | 'equity' = 'perp') { super(50); this.mode = mode; }
   private resolveMarket(streamSym: string): Market | null {
     const base = streamSym.replace(/(USDT|USDC)$/i, '').toUpperCase();
     return bySymbol.get(base) ?? (base === 'ANT' ? bySymbol.get('AAPL') ?? null : null);
   }
   protected tick() {
+    const shiftMs = this.mode === 'equity' ? 110 : this.mode === 'spot' ? -20 : 0;
     for (const stream of this.subs) {
-      const sym = stream.replace(/@bookTicker$/i, '').toUpperCase();
+      const sym = stream.replace(/@(bookTicker|quote)$/i, '').toUpperCase();
       const market = this.resolveMarket(sym);
       if (!market) continue;
-      const top = binanceTopOf(market);
+      const top = leadTopOf(market, shiftMs);
       const b = top.bid.toFixed(4), a = top.ask.toFixed(4);
       if (this.lastBid.get(sym) === b) continue;
       this.lastBid.set(sym, b);
       const now = Date.now();
-      this.push({ e: 'bookTicker', u: ++this.updateId, s: sym, b, B: '5.0', a, A: '5.0', T: now - 5, E: now });
+      if (this.mode === 'equity') {
+        this.push({ e: 'quote', u: ++this.updateId, s: sym, bp: b, bs: '5.0', ap: a, as: '5.0', T: now - 3, E: now });
+      } else if (this.mode === 'spot') {
+        this.push({ u: ++this.updateId, s: sym, b, B: '5.0', a, A: '5.0' });
+      } else {
+        this.push({ e: 'bookTicker', u: ++this.updateId, s: sym, b, B: '5.0', a, A: '5.0', T: now - 5, E: now });
+      }
     }
   }
   send(data: string) {
@@ -271,6 +356,86 @@ class FakeBinance extends FakeSocket {
       this.push({ result: null, id: msg.id });
     } else if (msg.method === 'LIST_SUBSCRIPTIONS') {
       this.push({ result: [...this.subs], id: msg.id });
+    }
+  }
+}
+class FakeCoinbase extends FakeSocket {
+  private readonly subs = new Set<string>();
+  private readonly lastBid = new Map<string, string>();
+  constructor() { super(50); }
+  protected tick() {
+    const ts = new Date().toISOString();
+    for (const pid of this.subs) {
+      const base = pid.split('-')[0] ?? '';
+      const market = bySymbol.get(base);
+      if (!market) continue;
+      const top = leadTopOf(market, 25);
+      const b = top.bid.toFixed(4), a = top.ask.toFixed(4);
+      if (this.lastBid.get(pid) === b) continue;
+      this.lastBid.set(pid, b);
+      this.push({ channel: 'ticker', timestamp: ts, events: [{ tickers: [{ product_id: pid, best_bid: b, best_ask: a }] }] });
+    }
+  }
+  send(data: string) {
+    const msg = JSON.parse(data) as { channel?: string; product_ids?: string[] };
+    if (msg.channel === 'ticker' && Array.isArray(msg.product_ids)) for (const pid of msg.product_ids) this.subs.add(pid);
+  }
+}
+class FakeOkx extends FakeSocket {
+  private readonly subs = new Set<string>();
+  private readonly lastBid = new Map<string, string>();
+  constructor() { super(50); }
+  protected tick() {
+    for (const instId of this.subs) {
+      const base = instId.split('-')[0] ?? '';
+      const market = bySymbol.get(base);
+      if (!market) continue;
+      const top = leadTopOf(market, -10);
+      const b = top.bid.toFixed(4), a = top.ask.toFixed(4);
+      if (this.lastBid.get(instId) === b) continue;
+      this.lastBid.set(instId, b);
+      this.push({ arg: { channel: 'bbo-tbt', instId }, data: [{ bids: [[b, '10']], asks: [[a, '10']], ts: String(Date.now()) }] });
+    }
+  }
+  send(data: string) {
+    if (data === 'ping') { this.onmessage?.({ data: 'pong' }); return; }
+    const msg = JSON.parse(data) as { op?: string; args?: { channel?: string; instId?: string }[] };
+    if (msg.op === 'subscribe' && Array.isArray(msg.args)) {
+      for (const a of msg.args) if (a.instId) this.subs.add(a.instId);
+    }
+  }
+}
+class FakeBybit extends FakeSocket {
+  private readonly subs = new Map<string, number>();
+  private readonly lastBid = new Map<string, string>();
+  constructor() { super(50); }
+  private marketOf(topic: string) {
+    const sym = topic.replace(/^orderbook\.1\./, '');
+    return { sym, market: bySymbol.get(sym.replace(/(USDT|USDC)$/i, '')) ?? null };
+  }
+  protected tick() {
+    for (const [topic, u] of this.subs) {
+      const { sym, market } = this.marketOf(topic);
+      if (!market) continue;
+      const top = leadTopOf(market, -15);
+      const b = top.bid.toFixed(4), a = top.ask.toFixed(4);
+      if (this.lastBid.get(topic) === b) continue;
+      this.lastBid.set(topic, b);
+      this.subs.set(topic, u + 1);
+      this.push({ topic, type: 'delta', ts: Date.now(), data: { s: sym, b: [[b, '10']], a: [[a, '10']], u: u + 1 } });
+    }
+  }
+  send(data: string) {
+    const msg = JSON.parse(data) as { op?: string; args?: string[] };
+    if (msg.op === 'ping') { this.push({ op: 'pong' }); return; }
+    if (msg.op === 'subscribe' && Array.isArray(msg.args)) {
+      for (const topic of msg.args) {
+        const { sym, market } = this.marketOf(topic);
+        this.subs.set(topic, 1);
+        if (!market) continue;
+        const top = leadTopOf(market, -15);
+        this.push({ topic, type: 'snapshot', ts: Date.now(), data: { s: sym, b: [[top.bid.toFixed(4), '10']], a: [[top.ask.toFixed(4), '10']], u: 1 } });
+      }
     }
   }
 }
@@ -333,7 +498,7 @@ class FakeEntropy extends FakeSocket {
   private readonly subscriptions = new Set<string>();
   private lastSlowAt = 0;
   private readonly lastBbo = new Map<string, string>();
-  constructor() { super(100); }
+  constructor() { super(50); }
   protected tick() {
     const now = Date.now();
     const sendSlow = now - this.lastSlowAt >= 1_000;
@@ -341,14 +506,15 @@ class FakeEntropy extends FakeSocket {
     for (const key of this.subscriptions) {
       const [type, coin] = key.split('|') as [string, string], found = entropyMarket(coin);
       if (!found) continue;
-      const top = topOf(found, 'entropy');
+      const top = coin.startsWith('xyz:') ? leadTopOf(found, 40) : topOf(found, 'entropy');
+      const midPx = 'price' in top ? top.price : top.mid;
       if (type === 'bbo') {
         const px = top.bid.toFixed(3);
         if (this.lastBbo.get(coin) === px) continue;
         this.lastBbo.set(coin, px);
         this.push({ channel: 'bbo', data: { coin, time: now, bbo: [{ px, sz: '50', n: 3 }, { px: top.ask.toFixed(3), sz: '50', n: 2 }] } });
       }
-      if (sendSlow && type === 'activeAssetCtx') this.push({ channel: 'activeAssetCtx', data: { coin, ctx: { markPx: top.price.toFixed(3), oraclePx: (top.price * 0.9998).toFixed(3), funding: '0.0000125', openInterest: '1000' } } });
+      if (sendSlow && type === 'activeAssetCtx') this.push({ channel: 'activeAssetCtx', data: { coin, ctx: { markPx: midPx.toFixed(3), oraclePx: (midPx * 0.9998).toFixed(3), funding: '0.0000125', openInterest: '1000' } } });
       if (sendSlow && type === 'l2Book') this.push({ channel: 'l2Book', data: l2Book(coin) });
     }
   }
@@ -360,12 +526,18 @@ class FakeEntropy extends FakeSocket {
     if (message.method === 'post' && message.request) this.push({ channel: 'post', data: { id: message.id, response: { type: 'info', payload: { type: 'l2Book', data: l2Book(message.request.payload.coin) } } } });
   }
 }
-const entropyMarket = (coin: string) => coin.startsWith('io:') && bySymbol.get(coin.slice(3)) && venueItem(bySymbol.get(coin.slice(3))!, 'entropy') ? bySymbol.get(coin.slice(3))! : null;
+const entropyMarket = (coin: string) => {
+  const sym = coin.startsWith('io:') || coin.startsWith('xyz:') ? coin.split(':').slice(1).join(':') : '';
+  const market = sym ? bySymbol.get(sym) : undefined;
+  return market && venueItem(market, 'entropy') ? market : null;
+};
 function l2Book(coin: string) {
   const found = entropyMarket(coin);
   if (!found) return null;
-  const top = topOf(found, 'entropy'), size = (40_000 / top.price).toFixed(2);
-  const levels = (side: 1 | -1, from: number) => [0, 1, 2, 3, 4].map(level => ({ px: (from + side * half(top.price, level * 1.5)).toFixed(3), sz: size, n: 2 }));
+  const top = coin.startsWith('xyz:') ? leadTopOf(found, 40) : topOf(found, 'entropy');
+  const mid = 'price' in top ? top.price : top.mid;
+  const size = (40_000 / mid).toFixed(2);
+  const levels = (side: 1 | -1, from: number) => [0, 1, 2, 3, 4].map(level => ({ px: (from + side * half(mid, level * 1.5)).toFixed(3), sz: size, n: 2 }));
   return { coin, time: Date.now(), levels: [levels(-1, top.bid), levels(1, top.ask)] };
 }
 
@@ -387,6 +559,47 @@ const fetchImpl = async (input: string | URL | Request, init?: RequestInit): Pro
         status: 'TRADING',
       })),
     });
+  }
+  if (url.includes('data-api.binance.vision/api/v3/ticker/bookTicker')) {
+    return Response.json(MARKETS.filter(m => crypto(m)).map(m => {
+      const top = leadTopOf(m, -20);
+      return { symbol: `${m.symbol}USDT`, bidPrice: top.bid.toFixed(4), bidQty: '5', askPrice: top.ask.toFixed(4), askQty: '5' };
+    }));
+  }
+  if (url.includes('okx.com/api/v5/public/instruments')) {
+    return Response.json({
+      code: '0',
+      data: MARKETS.filter(m => m.symbol !== 'SPCX' && m.symbol !== 'OPENAI').map(m => ({
+        instType: 'SWAP',
+        state: 'live',
+        settleCcy: 'USDT',
+        instId: `${m.symbol}-USDT-SWAP`,
+      })),
+    });
+  }
+  if (url.includes('bybit.com/v5/market/instruments-info')) {
+    return Response.json({
+      retCode: 0,
+      result: {
+        list: MARKETS.filter(m => crypto(m)).map(m => ({
+          symbol: `${m.symbol}USDT`,
+          baseCoin: m.symbol,
+          quoteCoin: 'USDT',
+          contractType: 'LinearPerpetual',
+          status: 'Trading',
+        })),
+      },
+    });
+  }
+  if (url.includes('exchange.coinbase.com/products')) {
+    return Response.json(MARKETS.filter(m => crypto(m)).map(m => ({
+      id: `${m.symbol}-USD`,
+      base_currency: m.symbol,
+      quote_currency: 'USD',
+      status: 'online',
+      trading_disabled: false,
+      cancel_only: false,
+    })));
   }
   if (url.includes('/api/v1/account')) {
     const rh = venueOfUrl(url) === 'rh';
@@ -410,7 +623,14 @@ const fetchImpl = async (input: string | URL | Request, init?: RequestInit): Pro
     return Response.json({ code: 200, pnl: Array.from({ length: 7 }, (_, i) => ({ timestamp: Math.floor((tNow - (6 - i) * 86_400_000) / 1000), trade_pnl: (i === 0 ? 1.2 : (i - 2) * 0.85).toFixed(2) })) });
   }
   if (url.includes('hyperliquid.xyz/info') && typeof init?.body === 'string') {
-    const req = JSON.parse(init.body) as { type?: string };
+    const req = JSON.parse(init.body) as { type?: string; dex?: string };
+    if (req.type === 'metaAndAssetCtxs' && req.dex === 'xyz') {
+      const listed = onVenue('entropy');
+      return Response.json([
+        { universe: listed.map(({ market }) => ({ name: `xyz:${market.symbol}`, szDecimals: market.price > 100 ? 2 : 1, maxLeverage: 10, deployerFeeScale: '1.0', growthMode: 'enabled' })), collateralToken: 0 },
+        listed.map(({ market }) => { const mid = leadTopOf(market, 40).mid; return { markPx: mid.toFixed(3), oraclePx: (mid * 0.9998).toFixed(3), funding: '0.0000125', openInterest: '1000' }; }),
+      ]);
+    }
     if (req.type === 'userAbstraction') return Response.json('unifiedAccount');
     if (req.type === 'spotClearinghouseState') {
       return Response.json({ balances: [{ coin: 'USDC', token: 0, total: '512.40', hold: '32.30' }, { coin: 'HYPE', token: 150, total: '0.02', hold: '0' }] });
@@ -467,7 +687,16 @@ const fetchImpl = async (input: string | URL | Request, init?: RequestInit): Pro
 
 // 与安装后的拓扑一样：DEX 价差服务在本机套接字上（Windows 用命名管道），执行服务只转发（docs/dexspread.md 11.10）。
 const socket = process.platform === 'win32' ? `\\\\.\\pipe\\tp-dex-preview-${process.pid}` : join(dir, 'dex.sock');
-const dex = startDex({ socket, stateDir: dir, build: 'development', options: { fetchImpl: fetchImpl as typeof fetch, accounts: () => ({ accounts: PREVIEW_ACCOUNTS, problem: null }), lighterAuth: async venue => venue === 'lighter' ? 'preview-lighter-token' : null, connect: url => url.includes('binance.com') ? new FakeBinance() : venueOfUrl(url) === 'entropy' ? new FakeEntropy() : new FakeLighter(venueOfUrl(url)) } });
+const connectMockSocket = (url: string): SocketLike => {
+  if (url.includes('nbstream.binance.com')) return new FakeBinance('equity');
+  if (url.includes('stream.binance.com')) return new FakeBinance('spot');
+  if (url.includes('binance.com')) return new FakeBinance('perp');
+  if (url.includes('coinbase.com')) return new FakeCoinbase();
+  if (url.includes('okx.com')) return new FakeOkx();
+  if (url.includes('bybit.com')) return new FakeBybit();
+  return venueOfUrl(url) === 'entropy' ? new FakeEntropy() : new FakeLighter(venueOfUrl(url));
+};
+const dex = startDex({ socket, stateDir: dir, build: 'development', options: { fetchImpl: fetchImpl as typeof fetch, accounts: () => ({ accounts: PREVIEW_ACCOUNTS, problem: null }), lighterAuth: async venue => venue === 'lighter' ? 'preview-lighter-token' : null, connect: connectMockSocket } });
 await dex.ready;
 const client = createDexClient(socket);
 await client.pushToken({ seq: Date.now(), token: '', problem: '' });

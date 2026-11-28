@@ -17,6 +17,7 @@ test('api：只读预览与反查 POST 路由超时不误报实盘未知，空�
     '/api/crossex/open-capacity',
     '/api/read-token/lookup',
     '/api/varlighter/backtest',
+    '/api/varlighter/lead/analyze',
     '/api/monitor/perpetual/price-history',
     '/api/monitor/perpetual/depth',
     '/api/monitor/perpetual/exit',

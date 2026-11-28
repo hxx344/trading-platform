@@ -4,6 +4,7 @@
 // 有 Var 腿的配对跟着每分钟一次的 Var 报价采样（样本时刻 = Var 报价时刻，另一腿回看那一刻的行情流）；两腿都是行情流的配对
 // 由本机每秒检查一次，启用或有持仓的每 5 秒、其余每 20 秒采一条（样本时刻 = 本机采样时刻）。
 import { createHash } from 'node:crypto';
+import { dirname, join } from 'node:path';
 import { anySignal } from '../any-signal.mjs';
 import { TOKEN_QUOTE_CONCURRENCY, TOKEN_QUOTE_MAX_AGE_MS, TOKEN_QUOTE_PHASE_MS, type TokenQuote, type VarQuoter } from './varquote.ts';
 import { Worker } from 'node:worker_threads';
@@ -12,6 +13,7 @@ import type { ReplayJob } from './replay-worker.ts';
 import { DEPTH_MAX_GAP_MS, HyperliquidStream, LighterStream, MAX_DEPTH_MARKETS, depthAt, fetchEntropyMarkets, fetchRhMarkets, fetchVarListings,
   type Connect, type DepthSnapshot, type FetchLike, type LiveStream, type TopPoint } from './feeds.ts';
 import { createLeadTester } from './lead-streams.ts';
+import { LEAD_DB_FILE } from './lead-store.ts';
 import { ACCOUNT_HISTORY_LIMIT, ACCOUNT_HISTORY_WINDOW_MS, COLLATERAL_ASSET, fetchAccount, fetchAccountHistory, type AccountFunding, type AccountHistorySnapshot, type AccountSnapshot, type AccountTrade } from './accounts.ts';
 import { KEY_VENUES, configuredVenues, type DexAccounts, type DexAccountsSource, type KeyVenue } from '../dex/keys.ts';
 import { ASSET_KINDS, COMBOS, DEFAULT_COMBOS, KIND_NAMES, LEG_SYMBOL, LIVE_VENUES, RATIO_MAX, RATIO_MIN, REGIME_NAMES, SAMPLE_FIELDS, SAMPLE_FORMAT, VENUE_IDS, VENUE_NAMES,
@@ -102,7 +104,7 @@ export { COOLDOWN_KEY, SETTINGS_KEY };
 /** v0.107.0 把保存为 null 的默认 Entropy 手续费一次性升级为 0.2 基点（不覆盖已有自定义值或用户之后主动清空的选择）。 */
 export const ENTROPY_FEE_DEFAULT_MIGRATED_KEY = 'entropy_fee_default_02';
 
-export interface EngineOptions { store: VarLighterStore; fetchImpl?: FetchLike; connect?: Connect; now?: () => number; /** 单调时钟（领先测速用；默认随 custom now 或 performance.now()）。 */ monoNow?: () => number; log?: (line: string) => void; /** Var token 询价；不给就只用公开报价。 */ quoter?: VarQuoter; /** 实盘场所账户（docs/dexspread.md 第 12 节）；不给就是没有配置。 */ accounts?: DexAccountsSource;
+export interface EngineOptions { store: VarLighterStore; /** 领先测速独立数据库路径（默认与 store 同目录 lead.sqlite）。 */ leadStoreFile?: string; fetchImpl?: FetchLike; connect?: Connect; now?: () => number; /** 单调时钟（领先测速用；默认随 custom now 或 performance.now()）。 */ monoNow?: () => number; log?: (line: string) => void; /** Var token 询价；不给就只用公开报价。 */ quoter?: VarQuoter; /** 实盘场所账户（docs/dexspread.md 第 12 节）；不给就是没有配置。 */ accounts?: DexAccountsSource;
   /** 页面录入的实盘凭据（第 13 节）；不给就没有实盘。 */ liveKeys?: LiveKeysStore;
   /** 下单连接器（测试里换成替身）。 */ traders?: (venue: KeyVenue, keys: LiveKeys) => VenueTrader;
   /** Lighter 签名器缺什么（测试里换成 null）。 */ signerProblem?: () => string | null;
@@ -184,7 +186,7 @@ interface VenueRuntime {
 }
 interface DepthEntry { leg: LegInfo; at: number | null; error: string | null }
 
-export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now: customNow, monoNow: customMonoNow, log = () => {}, quoter, accounts: envAccounts = () => ({ accounts: {}, problem: null }), liveKeys, traders, signerProblem = lighterSignerProblem, lighterSigner, lighterAuth }: EngineOptions) {
+export function createVarLighterEngine({ store, leadStoreFile, fetchImpl = fetch, connect, now: customNow, monoNow: customMonoNow, log = () => {}, quoter, accounts: envAccounts = () => ({ accounts: {}, problem: null }), liveKeys, traders, signerProblem = lighterSignerProblem, lighterSigner, lighterAuth }: EngineOptions) {
   const now = customNow ?? Date.now;
   const monoNow = customMonoNow ?? (customNow ?? (() => performance.now()));
   /** 账户标识的来源：页面录入的凭据优先，没录的场所用安装时录入的账户（keys.env）。页面凭据文件读不懂时按有问题处理。 */
@@ -366,7 +368,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now:
     markets: () => live.get('entropy')!.markets,
   });
   const leadTester = createLeadTester({
-    store,
+    leadStoreFile: leadStoreFile ?? (store.file === ':memory:' ? ':memory:' : join(dirname(store.file), LEAD_DB_FILE)),
     fetchImpl,
     connect: open,
     now,
@@ -1891,9 +1893,11 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now:
       entropyCost: (from?: unknown, to?: unknown, limit?: unknown) => entropyCost.view(from, to, limit),
       entropyCostSync: () => entropyCost.sync(true),
       lead: () => leadTester.view(),
-      leadStart: (body: unknown) => leadTester.start(body),
-      leadStop: (body: unknown) => leadTester.stop(body),
-      leadClear: () => leadTester.clearHistory(),
+      leadAddWatcher: (body: unknown) => leadTester.addWatcher(body),
+      leadToggleWatcher: (body: unknown) => leadTester.toggleWatcher(body),
+      leadRemoveWatcher: (body: unknown) => leadTester.removeWatcher(body),
+      leadAnalyze: (body: unknown) => leadTester.analyze(body),
+      leadClear: (body: unknown) => leadTester.clearData(body),
       leadRefreshCatalog: () => leadTester.refreshCatalog() },
     /**
      * 后台循环：连上用到的行情流（一档、标记价、资金费与启用配对的盘口都走行情流）并在后台每 10 分钟取各场所目录，然后每分钟拉 Var 报价（连同询价），

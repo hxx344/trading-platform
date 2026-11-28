@@ -1,32 +1,81 @@
-// DEX 价差子模块「Binance 领先测速」纯算法、目录匹配与参数校验：
-// 使用同机单调时钟（monoMs）计算 Binance 永续合约相对 Lighter 主网 / Lighter RH / Entropy 的领先延迟，
-// 提供「同门槛跃动跟随统计」与「100ms 网格 500ms 重叠收益率互相关」两套口径。无网络 I/O 与存储依赖。
-import { LEG_SYMBOL, SYMBOL_ALIASES, type MarketSpec } from './model.ts';
+// DEX 价差子模块「Binance & 多参考源领先测速」纯算法、目录解析与多源匹配、参数校验（R2）：
+// - 支持最多 7 个免 Key 领先参考源（Binance 合约/现货/股票、Hyperliquid xyz、Coinbase 现货、OKX/Bybit 永续）与 3 个 DEX 目标场所；
+// - 使用同机单调时钟（monoMs）判定同门槛跃动跟随与 100ms 网格 500ms 收益率互相关；
+// - 提供常驻 30 分钟有界滑动窗口（LeadTracker）及稀疏网格变化点 / 已结算事件落盘回调，并与离线 Worker 共用统计学纯函数。
+import { kindOf, LEG_SYMBOL, SYMBOL_ALIASES, type MarketSpec } from './model.ts';
 import { ParamsError } from './strategy.ts';
 import type {
+  LeadAssetCategory,
   LeadCandidateView,
-  LeadConfig,
-  LeadContractView,
   LeadEventVenueView,
-  LeadEventView,
   LeadFollowStatus,
-  LeadSeriesPoint,
-  LeadSessionView,
+  LeadRefCatalogEntry,
+  LeadRefSource,
   LeadSource,
   LeadStreamView,
   LeadVenue,
   LeadVenueStatsView,
+  LeadWatcherConfig,
+  LeadWatcherRecentRow,
+  LeadWatcherView,
   LeadXcorrPoint,
   LeadXcorrView,
 } from './views.ts';
 
+export const LEAD_REF_SOURCES: readonly LeadRefSource[] = [
+  'binance_perp',
+  'binance_spot',
+  'binance_equity',
+  'hl_xyz',
+  'coinbase_spot',
+  'okx_perp',
+  'bybit_perp',
+];
 export const LEAD_VENUES: readonly LeadVenue[] = ['lighter', 'rh', 'entropy'];
-export const LEAD_VENUE_NAMES: Record<LeadVenue, string> = { lighter: 'Lighter 主网', rh: 'Lighter RH', entropy: 'Entropy' };
-export const LEAD_SOURCES: readonly LeadSource[] = ['binance', ...LEAD_VENUES];
-export const LEAD_SOURCE_NAMES: Record<LeadSource, string> = { binance: 'Binance 永续', ...LEAD_VENUE_NAMES };
+export const LEAD_SOURCES: readonly LeadSource[] = [...LEAD_REF_SOURCES, ...LEAD_VENUES];
 
-export const DEFAULT_LEAD_CONFIG: Omit<LeadConfig, 'binanceSymbol' | 'targets'> = {
-  durationSec: 180,
+export const LEAD_REF_NAMES: Record<LeadRefSource, string> = {
+  binance_perp: 'Binance 合约',
+  binance_spot: 'Binance 现货',
+  binance_equity: 'Binance 股票',
+  hl_xyz: 'Hyperliquid xyz',
+  coinbase_spot: 'Coinbase 现货',
+  okx_perp: 'OKX 永续',
+  bybit_perp: 'Bybit 永续',
+};
+export const LEAD_VENUE_NAMES: Record<LeadVenue, string> = {
+  lighter: 'Lighter 主网',
+  rh: 'Lighter RH',
+  entropy: 'Entropy',
+};
+export const LEAD_SOURCE_NAMES: Record<LeadSource, string> = {
+  ...LEAD_REF_NAMES,
+  ...LEAD_VENUE_NAMES,
+};
+
+export const LEAD_SOURCE_CODES: Record<LeadSource, number> = {
+  binance_perp: 0,
+  binance_spot: 1,
+  binance_equity: 2,
+  hl_xyz: 3,
+  coinbase_spot: 4,
+  okx_perp: 5,
+  bybit_perp: 6,
+  lighter: 7,
+  rh: 8,
+  entropy: 9,
+};
+export const LEAD_CODE_TO_SOURCE: Record<number, LeadSource> = Object.fromEntries(
+  Object.entries(LEAD_SOURCE_CODES).map(([source, code]) => [code, source as LeadSource]),
+);
+
+export const LEAD_MAX_WATCHERS = 3;
+export const LEAD_RETENTION_DAYS = 7;
+export const LEAD_RECENT_WINDOW_MS = 30 * 60_000;
+export const LEAD_XCORR_MAX_WINDOW_MS = 6 * 3_600_000;
+export const LEAD_GRID_ANCHOR_MS = 30_000;
+
+export const DEFAULT_LEAD_WATCHER_PARAMS: Omit<LeadWatcherConfig, 'symbol' | 'leads' | 'targets'> = {
   thresholdBps: 3,
   impulseWindowMs: 1_000,
   followRatio: 0.5,
@@ -35,7 +84,6 @@ export const DEFAULT_LEAD_CONFIG: Omit<LeadConfig, 'binanceSymbol' | 'targets'> 
 };
 
 export const LEAD_LIMITS = {
-  durationSec: [30, 1800] as const,
   thresholdBps: [0.5, 500] as const,
   impulseWindowMs: [100, 10_000] as const,
   followRatio: [0.2, 1.0] as const,
@@ -51,15 +99,11 @@ export const LEAD_XCORR_MIN_SAMPLES = 50;
 export const LEAD_PRE_WINDOW_MS = 1_500;
 export const LEAD_BASE_STALE_MS = 60_000;
 export const LEAD_BASIS_MAX_GAP_PCT = 0.05;
-export const LEAD_SERIES_WINDOW_MS = 60_000;
-export const LEAD_SERIES_STRIDE = 2; // 2 * 100ms = 200 ms
+export const LEAD_SERIES_POINTS_MAX = 300;
 export const LEAD_MAX_EVENTS_VIEW = 100;
-export const LEAD_HISTORY_MAX = 20;
-const MAX_GRID_CELLS = 18_050; // 30 分钟上限（1800s / 0.1s）留余量
+const LEAD_GRID_ANCHOR_STEPS = LEAD_GRID_ANCHOR_MS / LEAD_GRID_STEP_MS;
 const MAX_TICKS_PER_STREAM = 8_000;
-const MAX_LAGS_PER_VENUE = 4_000;
-
-export type BinanceContract = LeadContractView;
+const MAX_RECENT_SETTLED = 2_000;
 
 export interface QuoteTick {
   monoMs: number;
@@ -68,6 +112,37 @@ export interface QuoteTick {
   ask: number;
   mid: number;
   exchangeMs: number | null;
+}
+
+export interface PersistLeadEvent {
+  symbol: string;
+  runId: number;
+  leadSource: LeadRefSource;
+  at: number;
+  direction: 1 | -1;
+  baseMid: number;
+  triggerMid: number;
+  moveBps: number;
+  thresholdBps: number;
+  followBps: number;
+  venues: Partial<Record<LeadVenue, LeadEventVenueView>>;
+}
+
+export interface PersistLeadGrid {
+  symbol: string;
+  at: number;
+  source: LeadSource;
+  runId: number;
+  gridIdx: number;
+  segId: number;
+  mid: number | null;
+}
+
+export interface LeadAnalyzeRequest {
+  symbol: string;
+  leadSource: LeadRefSource | null;
+  from: number;
+  to: number;
 }
 
 const isObject = (value: unknown): value is Record<string, unknown> =>
@@ -94,22 +169,44 @@ function readNumber(value: unknown, min: number, max: number, name: string, inte
   return value as number;
 }
 
-const BINANCE_SYMBOL_RE = /^[A-Z0-9]{2,32}$/;
+export const WATCHER_SYMBOL_RE = /^[A-Z0-9._-]{1,24}$/;
+export const LEAD_REF_SYMBOL_RE = /^[A-Za-z0-9:._-]{1,36}$/;
 const STABLE_QUOTES = new Set(['USDT', 'USDC']);
 
-/** 校验并规整测速启动参数。 */
-export function readLeadConfig(raw: unknown): LeadConfig {
+export function normalizeLeadRefSymbol(source: LeadRefSource, raw: string): string {
+  const trimmed = raw.trim();
+  return source === 'hl_xyz' ? trimmed : trimmed.toUpperCase();
+}
+
+/** 校验并规整常驻测速标的（支持 7 Lead 源与 3 DEX 目标，无持续时长上限）。 */
+export function readLeadWatcherConfig(raw: unknown): LeadWatcherConfig {
   if (!isObject(raw)) return fail('测速参数须为对象');
-  const allowed = ['binanceSymbol', 'targets', 'durationSec', 'thresholdBps', 'impulseWindowMs', 'followRatio', 'maxWaitMs', 'cooldownMs'];
+  const allowed = ['symbol', 'leads', 'targets', 'thresholdBps', 'impulseWindowMs', 'followRatio', 'maxWaitMs', 'cooldownMs'];
   const unknown = Object.keys(raw).find(key => !allowed.includes(key));
   if (unknown) return fail(`测速参数包含未知字段 ${unknown.slice(0, 40)}`);
 
-  const symRaw = typeof raw.binanceSymbol === 'string' ? raw.binanceSymbol.trim().toUpperCase() : '';
-  if (!BINANCE_SYMBOL_RE.test(symRaw)) return fail('Binance 合约代码无效（应为 2–32 位大写字母或数字，如 BTCUSDT）');
+  const symbol = typeof raw.symbol === 'string' ? raw.symbol.trim().toUpperCase() : '';
+  if (!WATCHER_SYMBOL_RE.test(symbol)) return fail('基础标的代码无效（应为 1–24 位大写字母或数字，如 NVDA、BTC）');
 
-  if (!isObject(raw.targets)) return fail('目标场所映射无效');
+  if (!isObject(raw.leads)) return fail('参考领先源映射无效');
+  const unknownLead = Object.keys(raw.leads).find(key => !(LEAD_REF_SOURCES as readonly string[]).includes(key));
+  if (unknownLead) return fail(`包含不支持的领先源 ${unknownLead.slice(0, 24)}`);
+
+  const leads: Partial<Record<LeadRefSource, string>> = {};
+  for (const src of LEAD_REF_SOURCES) {
+    const val = raw.leads[src];
+    if (val === undefined || val === null) continue;
+    if (typeof val !== 'string') return fail(`${LEAD_REF_NAMES[src]} 代码须为文本`);
+    const trimmed = val.trim();
+    if (!trimmed) continue;
+    if (!LEAD_REF_SYMBOL_RE.test(trimmed)) return fail(`${LEAD_REF_NAMES[src]} 代码格式无效`);
+    leads[src] = normalizeLeadRefSymbol(src, trimmed);
+  }
+  if (!Object.keys(leads).length) return fail('至少选择一个参考领先源并填写标的代码');
+
+  if (!isObject(raw.targets)) return fail('目标 DEX 场所映射无效');
   const unknownVenue = Object.keys(raw.targets).find(key => !(LEAD_VENUES as readonly string[]).includes(key));
-  if (unknownVenue) return fail(`包含不支持的对比场所 ${unknownVenue.slice(0, 24)}`);
+  if (unknownVenue) return fail(`包含不支持的目标场所 ${unknownVenue.slice(0, 24)}`);
 
   const targets: Partial<Record<LeadVenue, string>> = {};
   for (const venue of LEAD_VENUES) {
@@ -121,15 +218,15 @@ export function readLeadConfig(raw: unknown): LeadConfig {
     if (!LEG_SYMBOL.test(trimmed)) return fail(`${LEAD_VENUE_NAMES[venue]} 代码无效`);
     targets[venue] = trimmed;
   }
-  if (!Object.keys(targets).length) return fail('至少选择一个需要对比的 DEX 场所并填写标的代码');
+  if (!Object.keys(targets).length) return fail('至少选择一个目标 DEX 场所并填写标的代码');
 
-  const pick = <K extends keyof typeof DEFAULT_LEAD_CONFIG>(key: K) =>
-    raw[key] === undefined ? DEFAULT_LEAD_CONFIG[key] : raw[key];
+  const pick = <K extends keyof typeof DEFAULT_LEAD_WATCHER_PARAMS>(key: K) =>
+    raw[key] === undefined ? DEFAULT_LEAD_WATCHER_PARAMS[key] : raw[key];
 
   return {
-    binanceSymbol: symRaw,
+    symbol,
+    leads,
     targets,
-    durationSec: readNumber(pick('durationSec'), ...LEAD_LIMITS.durationSec, '测试时长（秒）', true),
     thresholdBps: readNumber(pick('thresholdBps'), ...LEAD_LIMITS.thresholdBps, '触发阈值（基点）', false),
     impulseWindowMs: readNumber(pick('impulseWindowMs'), ...LEAD_LIMITS.impulseWindowMs, '变化窗口（毫秒）', true),
     followRatio: readNumber(pick('followRatio'), ...LEAD_LIMITS.followRatio, '跟进判定比例', false),
@@ -138,34 +235,186 @@ export function readLeadConfig(raw: unknown): LeadConfig {
   };
 }
 
-/** 解析 Binance `GET /fapi/v1/exchangeInfo` 返回的活跃 U 本位永续合约（含 TradFi 永续）。 */
-export function parseBinanceExchangeInfo(raw: unknown): BinanceContract[] {
+/** 校验离线分析请求 `{ symbol, leadSource?, hours?, from?, to? }`（跨度 1 分钟 – 7 天）。 */
+export function readLeadAnalyzeRequest(raw: unknown, nowMs: number): LeadAnalyzeRequest {
+  if (!isObject(raw)) return fail('分析查询参数须为对象');
+  const allowed = ['symbol', 'leadSource', 'hours', 'from', 'to'];
+  const unknown = Object.keys(raw).find(key => !allowed.includes(key));
+  if (unknown) return fail(`分析查询包含未知字段 ${unknown.slice(0, 40)}`);
+
+  const symbol = typeof raw.symbol === 'string' ? raw.symbol.trim().toUpperCase() : '';
+  if (!WATCHER_SYMBOL_RE.test(symbol)) return fail('分析标的代码无效');
+
+  let leadSource: LeadRefSource | null = null;
+  if (raw.leadSource !== undefined && raw.leadSource !== null && raw.leadSource !== '') {
+    if (typeof raw.leadSource !== 'string' || !(LEAD_REF_SOURCES as readonly string[]).includes(raw.leadSource)) {
+      return fail('指定的主参考领先源无效');
+    }
+    leadSource = raw.leadSource as LeadRefSource;
+  }
+
+  const maxSpan = LEAD_RETENTION_DAYS * 86_400_000;
+  let from: number;
+  let to: number;
+  if (raw.from !== undefined || raw.to !== undefined) {
+    if (typeof raw.from !== 'number' || typeof raw.to !== 'number' || !Number.isFinite(raw.from) || !Number.isFinite(raw.to)) {
+      return fail('起止时间戳须为有效毫秒数');
+    }
+    from = Math.floor(raw.from);
+    to = Math.floor(raw.to);
+    if (from < 0 || to <= from || to - from < 60_000 || to - from > maxSpan) {
+      return fail(`查询时间跨度须在 1 分钟到 ${LEAD_RETENTION_DAYS} 天之间`);
+    }
+  } else {
+    const hours = raw.hours === undefined ? 6 : readNumber(raw.hours, 1, LEAD_RETENTION_DAYS * 24, '查询小时数', false);
+    to = nowMs;
+    from = Math.max(0, Math.round(to - hours * 3_600_000));
+  }
+  return { symbol, leadSource, from, to };
+}
+
+/** 校验 watcher 停启/删除的请求体 `{ symbol, enabled?, updatedAt }`。 */
+export function readLeadWatcherMutation(raw: unknown, requireEnabled: boolean): { symbol: string; enabled: boolean; updatedAt: number } {
+  if (!isObject(raw)) return fail('请求格式须为对象');
+  const symbol = typeof raw.symbol === 'string' ? raw.symbol.trim().toUpperCase() : '';
+  if (!WATCHER_SYMBOL_RE.test(symbol)) return fail('标的代码无效');
+  if (typeof raw.updatedAt !== 'number' || !Number.isSafeInteger(raw.updatedAt) || raw.updatedAt < 0) {
+    return fail('缺少有效的状态版本号 updatedAt');
+  }
+  let enabled = false;
+  if (requireEnabled) {
+    if (typeof raw.enabled !== 'boolean') return fail('缺少有效的启停标识 enabled');
+    enabled = raw.enabled;
+  }
+  return { symbol, enabled, updatedAt: raw.updatedAt };
+}
+
+// ---- 多领先源公开目录解析 ----
+
+/** Binance USDⓈ-M 永续 `GET /fapi/v1/exchangeInfo`。 */
+export function parseBinanceExchangeInfo(raw: unknown): LeadRefCatalogEntry[] {
   if (!isObject(raw) || !Array.isArray(raw.symbols)) throw new Error('Binance 合约目录格式无效');
-  const seen = new Map<string, BinanceContract>();
+  const seen = new Map<string, LeadRefCatalogEntry>();
   for (const item of raw.symbols) {
     if (!isObject(item)) continue;
     if (item.status !== 'TRADING') continue;
     if (item.contractType !== 'PERPETUAL' && item.contractType !== 'TRADIFI_PERPETUAL') continue;
-    const quoteAsset = typeof item.quoteAsset === 'string' ? item.quoteAsset : '';
-    const marginAsset = typeof item.marginAsset === 'string' ? item.marginAsset : '';
+    const quoteAsset = typeof item.quoteAsset === 'string' ? item.quoteAsset.toUpperCase() : '';
+    const marginAsset = typeof item.marginAsset === 'string' ? item.marginAsset.toUpperCase() : '';
     if (!STABLE_QUOTES.has(quoteAsset) || marginAsset !== quoteAsset) continue;
     const symbol = typeof item.symbol === 'string' ? item.symbol.trim().toUpperCase() : '';
     const baseAsset = typeof item.baseAsset === 'string' ? item.baseAsset.trim().toUpperCase() : '';
-    if (!BINANCE_SYMBOL_RE.test(symbol) || !baseAsset || !LEG_SYMBOL.test(baseAsset)) continue;
-    seen.set(symbol, {
-      symbol,
-      baseAsset,
-      quoteAsset,
-      contractType: item.contractType,
-    });
+    if (!symbol || !baseAsset || !LEAD_REF_SYMBOL_RE.test(symbol) || !WATCHER_SYMBOL_RE.test(baseAsset)) continue;
+    seen.set(symbol, { symbol, baseAsset, quoteAsset, contractType: item.contractType });
   }
   return [...seen.values()].sort((a, b) => a.symbol.localeCompare(b.symbol));
 }
 
-const LEAD_ALIAS_GROUPS: readonly (readonly string[])[] = [
+/** Binance 现货免 Key 轻量盘口快照 `GET /api/v3/ticker/bookTicker`。 */
+export function parseBinanceSpotTickers(raw: unknown): LeadRefCatalogEntry[] {
+  if (!Array.isArray(raw)) throw new Error('Binance 现货目录格式无效');
+  const seen = new Map<string, LeadRefCatalogEntry>();
+  for (const item of raw) {
+    if (!isObject(item)) continue;
+    const symbol = typeof item.symbol === 'string' ? item.symbol.trim().toUpperCase() : '';
+    if (!symbol || !/^[A-Z0-9]{4,32}$/.test(symbol)) continue;
+    const bid = Number(item.bidPrice), ask = Number(item.askPrice);
+    if (!(bid > 0 && ask >= bid)) continue;
+    const quoteAsset = symbol.endsWith('USDT') ? 'USDT' : symbol.endsWith('USDC') ? 'USDC' : '';
+    if (!quoteAsset) continue;
+    const baseAsset = symbol.slice(0, -quoteAsset.length);
+    if (!WATCHER_SYMBOL_RE.test(baseAsset)) continue;
+    seen.set(symbol, { symbol, baseAsset, quoteAsset });
+  }
+  return [...seen.values()].sort((a, b) => a.symbol.localeCompare(b.symbol));
+}
+
+/** Hyperliquid `dex: 'xyz'` `POST /info {"type":"metaAndAssetCtxs","dex":"xyz"}`。 */
+export function parseHyperliquidXyzCatalog(raw: unknown): LeadRefCatalogEntry[] {
+  if (!Array.isArray(raw) || !isObject(raw[0]) || !Array.isArray(raw[0].universe)) {
+    throw new Error('Hyperliquid xyz 目录格式无效');
+  }
+  const seen = new Map<string, LeadRefCatalogEntry>();
+  for (const item of raw[0].universe) {
+    if (!isObject(item) || typeof item.name !== 'string') continue;
+    if (item.isDelisted === true) continue;
+    const rawName = item.name.trim();
+    if (!rawName || !LEAD_REF_SYMBOL_RE.test(rawName)) continue;
+    const coin = rawName.includes(':') ? rawName : `xyz:${rawName}`;
+    const baseAsset = coin.split(':').at(-1)!.toUpperCase();
+    if (!WATCHER_SYMBOL_RE.test(baseAsset)) continue;
+    seen.set(coin, { symbol: coin, baseAsset, quoteAsset: 'USDC', contractType: 'HIP3' });
+  }
+  return [...seen.values()].sort((a, b) => a.symbol.localeCompare(b.symbol));
+}
+
+/** OKX 永续 `GET /api/v5/public/instruments?instType=SWAP`。 */
+export function parseOkxSwapCatalog(raw: unknown): LeadRefCatalogEntry[] {
+  if (!isObject(raw) || !Array.isArray(raw.data)) throw new Error('OKX 永续目录格式无效');
+  const seen = new Map<string, LeadRefCatalogEntry>();
+  for (const item of raw.data) {
+    if (!isObject(item)) continue;
+    if (item.instType !== 'SWAP' || item.state !== 'live') continue;
+    const settle = typeof item.settleCcy === 'string' ? item.settleCcy.toUpperCase() : '';
+    if (!STABLE_QUOTES.has(settle)) continue;
+    const instId = typeof item.instId === 'string' ? item.instId.trim().toUpperCase() : '';
+    const baseAsset = instId.split('-')[0] ?? '';
+    if (!instId || !WATCHER_SYMBOL_RE.test(baseAsset) || !LEAD_REF_SYMBOL_RE.test(instId)) continue;
+    seen.set(instId, { symbol: instId, baseAsset, quoteAsset: settle, contractType: 'SWAP' });
+  }
+  return [...seen.values()].sort((a, b) => a.symbol.localeCompare(b.symbol));
+}
+
+/** Bybit 线型永续 `GET /v5/market/instruments-info?category=linear&limit=1000`。 */
+export function parseBybitLinearCatalog(raw: unknown): LeadRefCatalogEntry[] {
+  if (!isObject(raw) || !isObject(raw.result) || !Array.isArray(raw.result.list)) {
+    throw new Error('Bybit 永续目录格式无效');
+  }
+  const seen = new Map<string, LeadRefCatalogEntry>();
+  for (const item of raw.result.list) {
+    if (!isObject(item)) continue;
+    if (item.status !== 'Trading' || item.contractType !== 'LinearPerpetual') continue;
+    const quoteAsset = typeof item.quoteCoin === 'string' ? item.quoteCoin.toUpperCase() : '';
+    if (!STABLE_QUOTES.has(quoteAsset)) continue;
+    const symbol = typeof item.symbol === 'string' ? item.symbol.trim().toUpperCase() : '';
+    const baseAsset = typeof item.baseCoin === 'string' ? item.baseCoin.trim().toUpperCase() : '';
+    if (!symbol || !WATCHER_SYMBOL_RE.test(baseAsset) || !LEAD_REF_SYMBOL_RE.test(symbol)) continue;
+    seen.set(symbol, { symbol, baseAsset, quoteAsset, contractType: 'LinearPerpetual' });
+  }
+  return [...seen.values()].sort((a, b) => a.symbol.localeCompare(b.symbol));
+}
+
+/** Coinbase 美元现货 `GET /products`。 */
+export function parseCoinbaseSpotCatalog(raw: unknown): LeadRefCatalogEntry[] {
+  const list = Array.isArray(raw) ? raw : isObject(raw) && Array.isArray(raw.products) ? raw.products : null;
+  if (!list) throw new Error('Coinbase 现货目录格式无效');
+  const seen = new Map<string, LeadRefCatalogEntry>();
+  for (const item of list) {
+    if (!isObject(item)) continue;
+    if (item.trading_disabled === true || item.cancel_only === true) continue;
+    if (typeof item.status === 'string' && item.status !== 'online') continue;
+    const quoteAsset = String(item.quote_currency ?? item.quote_currency_id ?? '').toUpperCase();
+    if (quoteAsset !== 'USD' && quoteAsset !== 'USDC') continue;
+    const baseAsset = String(item.base_currency ?? item.base_currency_id ?? '').trim().toUpperCase();
+    const id = String(item.id ?? item.product_id ?? '').trim().toUpperCase();
+    if (!id || !WATCHER_SYMBOL_RE.test(baseAsset) || !LEAD_REF_SYMBOL_RE.test(id)) continue;
+    // 优先 USD 计价，不覆盖已有的 -USD
+    const existing = seen.get(baseAsset);
+    if (!existing || (existing.quoteAsset !== 'USD' && quoteAsset === 'USD')) {
+      seen.set(baseAsset, { symbol: id, baseAsset, quoteAsset });
+    }
+  }
+  return [...seen.values()].sort((a, b) => a.symbol.localeCompare(b.symbol));
+}
+
+// ---- 别名组、候选构建与标的归类 ----
+
+export const LEAD_ALIAS_GROUPS: readonly (readonly string[])[] = [
   ...SYMBOL_ALIASES,
   ['ANT', 'ANTHROPIC', 'ANTH'],
   ['OPENAI', 'OAI'],
+  ['XAU', 'GOLD'],
+  ['XAG', 'SILVER'],
 ];
 
 function aliasCandidates(base: string): string[] {
@@ -178,66 +427,149 @@ function aliasCandidates(base: string): string[] {
   return candidates;
 }
 
-/** 按优先级将单个 Binance 永续合约自动匹配到 Lighter 主网 / Lighter RH / Entropy 标的代码。 */
-export function matchDexTargets(
-  contract: BinanceContract,
-  dexMarkets: Record<LeadVenue, readonly MarketSpec[]>,
-): Partial<Record<LeadVenue, string>> {
-  const base = contract.baseAsset.toUpperCase();
-  const aliases = aliasCandidates(base).filter(item => item !== base);
-  const scaleVariants: string[] = [];
-  if (base.startsWith('1000') && base.length > 4) scaleVariants.push(base.slice(4));
-  else scaleVariants.push(`1000${base}`);
-
-  const targets: Partial<Record<LeadVenue, string>> = {};
-  for (const venue of LEAD_VENUES) {
-    const markets = dexMarkets[venue] ?? [];
-    const byUpper = new Map<string, string>();
-    for (const m of markets) {
-      const upper = m.symbol.toUpperCase();
-      if (!byUpper.has(upper)) byUpper.set(upper, m.symbol);
+function canonicalBase(rawBase: string): string {
+  const upper = rawBase.toUpperCase();
+  const plain = upper.startsWith('1000') && upper.length > 4 ? upper.slice(4) : upper;
+  for (const group of LEAD_ALIAS_GROUPS) {
+    if (group.includes(plain)) {
+      // 同组中用优先主标识去重（如 ANTHROPIC/ANTH 归于组首或常见名）
+      if (group[0] === 'ANT' || group[0] === 'ANTHROPIC') return 'ANTHROPIC';
+      if (group[0] === 'OPENAI') return 'OPENAI';
+      if (group[0] === 'XAU') return 'XAU';
+      if (group[0] === 'XAG') return 'XAG';
+      return group[0]!;
     }
-    const exact = byUpper.get(base);
-    if (exact) {
-      targets[venue] = exact;
-      continue;
-    }
-    let matched: string | undefined;
-    for (const alias of aliases) {
-      matched = byUpper.get(alias);
-      if (matched) break;
-    }
-    if (!matched) {
-      for (const scaled of scaleVariants) {
-        matched = byUpper.get(scaled);
-        if (matched) break;
-      }
-    }
-    if (matched) targets[venue] = matched;
   }
-  return targets;
+  return plain;
 }
 
-/** 构建至少命中 1 个目标 DEX 场所的候选清单，TradFi 永续及匹配场所多者优先。 */
+function lookupWithVariants(base: string, map: ReadonlyMap<string, string>): string | undefined {
+  const exact = map.get(base);
+  if (exact) return exact;
+  for (const alias of aliasCandidates(base)) {
+    const hit = map.get(alias);
+    if (hit) return hit;
+  }
+  const scaled = base.startsWith('1000') && base.length > 4 ? base.slice(4) : `1000${base}`;
+  return map.get(scaled);
+}
+
+function indexRefCatalog(entries: readonly LeadRefCatalogEntry[]): Map<string, string> {
+  const map = new Map<string, string>();
+  // 优先保留 USDT / USD 计价，再备选 USDC
+  for (const item of entries) {
+    const base = item.baseAsset.toUpperCase();
+    const existing = map.get(base);
+    if (!existing || (item.quoteAsset === 'USDT' || item.quoteAsset === 'USD')) {
+      map.set(base, item.symbol);
+    }
+  }
+  return map;
+}
+
+function classifyLeadAsset(base: string, perpType?: string): LeadAssetCategory {
+  const raw = kindOf(base);
+  const alt = base.startsWith('1000') && base.length > 4 ? kindOf(base.slice(4)) : kindOf(`1000${base}`);
+  const k = raw !== 'other' ? raw : alt;
+  if (k === 'equity' || k === 'etf') return 'us_equity';
+  if (k === 'crypto') return 'crypto';
+  if (k === 'metal' || k === 'commodity' || perpType === 'TRADIFI_PERPETUAL') return 'tradfi';
+  return 'other';
+}
+
+/**
+ * 构建支持 7 个 Lead 源 + 3 个 DEX 目标的候选清单：
+ * 以 DEX 已上架市场为主锚，为每个标的一次配齐多条领先通道与目标 DEX。
+ */
 export function buildLeadCandidates(
-  binance: readonly BinanceContract[],
+  contracts: Record<LeadRefSource, readonly LeadRefCatalogEntry[]>,
   dexMarkets: Record<LeadVenue, readonly MarketSpec[]>,
 ): LeadCandidateView[] {
-  const rows: LeadCandidateView[] = [];
-  for (const contract of binance) {
-    const targets = matchDexTargets(contract, dexMarkets);
-    const matchCount = Object.keys(targets).length;
-    if (!matchCount) continue;
-    rows.push({ ...contract, targets, matchCount });
+  const dexMaps: Record<LeadVenue, Map<string, string>> = {
+    lighter: new Map(),
+    rh: new Map(),
+    entropy: new Map(),
+  };
+  const allBases = new Map<string, string>();
+
+  for (const venue of LEAD_VENUES) {
+    for (const m of dexMarkets[venue] ?? []) {
+      const upper = m.symbol.toUpperCase();
+      if (!dexMaps[venue].has(upper)) dexMaps[venue].set(upper, m.symbol);
+      const canon = canonicalBase(upper);
+      const prev = allBases.get(canon);
+      if (!prev || (upper.startsWith('1000') && !prev.startsWith('1000'))) {
+        allBases.set(canon, upper);
+      }
+    }
   }
+
+  const refMaps: Record<Exclude<LeadRefSource, 'binance_equity'>, Map<string, string>> = {
+    binance_perp: indexRefCatalog(contracts.binance_perp),
+    binance_spot: indexRefCatalog(contracts.binance_spot),
+    hl_xyz: indexRefCatalog(contracts.hl_xyz),
+    coinbase_spot: indexRefCatalog(contracts.coinbase_spot),
+    okx_perp: indexRefCatalog(contracts.okx_perp),
+    bybit_perp: indexRefCatalog(contracts.bybit_perp),
+  };
+
+  const perpTypes = new Map<string, string>();
+  for (const c of contracts.binance_perp) {
+    if (c.contractType) perpTypes.set(c.baseAsset.toUpperCase(), c.contractType);
+  }
+
+  const rows: LeadCandidateView[] = [];
+  const seenCanon = new Set<string>();
+
+  for (const [canon, preferredSymbol] of allBases) {
+    if (seenCanon.has(canon)) continue;
+    seenCanon.add(canon);
+
+    const targets: Partial<Record<LeadVenue, string>> = {};
+    for (const venue of LEAD_VENUES) {
+      const hit = lookupWithVariants(preferredSymbol, dexMaps[venue]);
+      if (hit) targets[venue] = hit;
+    }
+    const targetCount = Object.keys(targets).length;
+    if (!targetCount) continue;
+
+    const leads: Partial<Record<LeadRefSource, string>> = {};
+    for (const src of ['binance_perp', 'binance_spot', 'hl_xyz', 'coinbase_spot', 'okx_perp', 'bybit_perp'] as const) {
+      const hit = lookupWithVariants(preferredSymbol, refMaps[src]);
+      if (hit) leads[src] = hit;
+    }
+
+    const perpBase = contracts.binance_perp.find(c => c.symbol === leads.binance_perp)?.contractType;
+    const category = classifyLeadAsset(preferredSymbol, perpBase ?? perpTypes.get(preferredSymbol));
+    // 美股与美股 ETF 免 Key 自动补充 Binance 股票 @quote 实时通道
+    if (category === 'us_equity' && WATCHER_SYMBOL_RE.test(preferredSymbol)) {
+      leads.binance_equity = preferredSymbol;
+    }
+
+    const leadCount = Object.keys(leads).length;
+    if (!leadCount) continue;
+
+    rows.push({
+      symbol: preferredSymbol,
+      kind: category,
+      leads,
+      targets,
+      leadCount,
+      targetCount,
+    });
+  }
+
+  const catRank: Record<LeadAssetCategory, number> = { us_equity: 3, crypto: 2, tradfi: 1, other: 0 };
   return rows.sort((a, b) =>
-    b.matchCount - a.matchCount
-    || Number(b.contractType === 'TRADIFI_PERPETUAL') - Number(a.contractType === 'TRADIFI_PERPETUAL')
-    || Number(b.quoteAsset === 'USDT') - Number(a.quoteAsset === 'USDT')
+    b.targetCount - a.targetCount
+    || b.leadCount - a.leadCount
+    || catRank[b.kind] - catRank[a.kind]
     || a.symbol.localeCompare(b.symbol));
 }
 
-function quantile(sorted: readonly number[], p: number): number | null {
+// ---- 共享数学与统计学纯函数（内存滑窗与离线 Worker 同口径） ----
+
+export function quantile(sorted: readonly number[], p: number): number | null {
   if (!sorted.length) return null;
   if (sorted.length === 1) return sorted[0]!;
   const pos = (sorted.length - 1) * p;
@@ -246,11 +578,213 @@ function quantile(sorted: readonly number[], p: number): number | null {
   return sorted[lo]! * (1 - weight) + sorted[hi]! * weight;
 }
 
-function median(values: readonly number[]): number | null {
+export function median(values: readonly number[]): number | null {
   if (!values.length) return null;
   const sorted = [...values].sort((a, b) => a - b);
   return quantile(sorted, 0.5);
 }
+
+export interface GridReturnSeries {
+  minIdx: number;
+  values: Float64Array;
+  count: number;
+}
+
+/** 从连续网格细胞构造按 `idx - minIdx` 对齐的 500ms 收益率数组（仅同一 `segId` 且连续无缺口生效）。 */
+export function buildReturnSeriesFromMap(
+  cells: ReadonlyMap<number, { mid: number; segId: number }>,
+): GridReturnSeries {
+  const h = LEAD_RETURN_HORIZON_STEPS;
+  if (cells.size < LEAD_XCORR_MIN_SAMPLES + h) return { minIdx: 0, values: new Float64Array(0), count: 0 };
+  let firstIdx = Infinity;
+  let lastIdx = -Infinity;
+  for (const idx of cells.keys()) {
+    if (idx < firstIdx) firstIdx = idx;
+    if (idx > lastIdx) lastIdx = idx;
+  }
+  const startIdx = firstIdx + h;
+  if (lastIdx < startIdx) return { minIdx: 0, values: new Float64Array(0), count: 0 };
+  const values = new Float64Array(lastIdx - startIdx + 1);
+  values.fill(Number.NaN);
+  let count = 0;
+  for (const [idx, cur] of cells) {
+    if (idx < startIdx) continue;
+    const prev = cells.get(idx - h);
+    if (!prev || prev.segId !== cur.segId || !(prev.mid > 0) || !(cur.mid > 0)) continue;
+    let continuous = true;
+    for (let step = 1; step < h; step++) {
+      const midCell = cells.get(idx - step);
+      if (!midCell || midCell.segId !== cur.segId) { continuous = false; break; }
+    }
+    if (!continuous) continue;
+    values[idx - startIdx] = (cur.mid - prev.mid) / prev.mid;
+    count++;
+  }
+  return { minIdx: startIdx, values, count };
+}
+
+/** 从已对齐的连续中间价与段标识定长数组构造 500ms 收益率数组（离线 Worker 专用，零哈希查找）。 */
+export function buildReturnSeriesFromDenseArrays(
+  minGridIdx: number,
+  mids: Float64Array,
+  segIds: Int32Array,
+): GridReturnSeries {
+  const h = LEAD_RETURN_HORIZON_STEPS;
+  if (mids.length < LEAD_XCORR_MIN_SAMPLES + h) return { minIdx: 0, values: new Float64Array(0), count: 0 };
+  const values = new Float64Array(mids.length - h);
+  values.fill(Number.NaN);
+  let count = 0;
+  for (let i = h; i < mids.length; i++) {
+    const curMid = mids[i]!;
+    const prevMid = mids[i - h]!;
+    const seg = segIds[i]!;
+    if (!(curMid > 0) || !(prevMid > 0) || seg <= 0 || segIds[i - h] !== seg) continue;
+    let continuous = true;
+    for (let step = 1; step < h; step++) {
+      if (segIds[i - step] !== seg || !(mids[i - step]! > 0)) { continuous = false; break; }
+    }
+    if (!continuous) continue;
+    values[i - h] = (curMid - prevMid) / prevMid;
+    count++;
+  }
+  return { minIdx: minGridIdx + h, values, count };
+}
+
+/** 扫描 `[-1000ms .. +3000ms]` 滞后上的 500ms 收益率 Pearson 互相关（正滞后表示 X 领先 Y）。 */
+export function computeXcorrFromReturns(
+  xSeries: GridReturnSeries,
+  ySeries: GridReturnSeries,
+  xName: string,
+  yName: string,
+): { xcorr: LeadXcorrView | null; reason: string | null } {
+  if (xSeries.count < LEAD_XCORR_MIN_SAMPLES) {
+    return { xcorr: null, reason: `${xName} 连续在线采样不足 5 秒` };
+  }
+  if (ySeries.count < LEAD_XCORR_MIN_SAMPLES) {
+    return { xcorr: null, reason: `${yName} 连续在线采样不足 5 秒` };
+  }
+
+  const minLagSteps = Math.round(LEAD_XCORR_MIN_LAG_MS / LEAD_GRID_STEP_MS);
+  const maxLagSteps = Math.round(LEAD_XCORR_MAX_LAG_MS / LEAD_GRID_STEP_MS);
+  const xArr = xSeries.values;
+  const yArr = ySeries.values;
+
+  const points: LeadXcorrPoint[] = [];
+  let bestPoint: LeadXcorrPoint | null = null;
+  let zeroCorr: number | null = null;
+  let zeroSamples = 0;
+  let anyPairEnough = false;
+  let maxVar = 0;
+
+  for (let k = minLagSteps; k <= maxLagSteps; k++) {
+    let n = 0;
+    let sumX = 0, sumY = 0, sumXX = 0, sumYY = 0, sumXY = 0;
+    const offset = xSeries.minIdx + k - ySeries.minIdx;
+    const lo = Math.max(0, -offset);
+    const hi = Math.min(xArr.length, yArr.length - offset);
+    for (let i = lo; i < hi; i++) {
+      const x = xArr[i]!;
+      const y = yArr[i + offset]!;
+      if (Number.isNaN(x) || Number.isNaN(y)) continue;
+      n++;
+      sumX += x;
+      sumY += y;
+      sumXX += x * x;
+      sumYY += y * y;
+      sumXY += x * y;
+    }
+    const lagMs = k * LEAD_GRID_STEP_MS;
+    if (n < LEAD_XCORR_MIN_SAMPLES) continue;
+    anyPairEnough = true;
+    const varX = sumXX - (sumX * sumX) / n;
+    const varY = sumYY - (sumY * sumY) / n;
+    maxVar = Math.max(maxVar, varX, varY);
+    if (varX <= 1e-12 || varY <= 1e-12) continue;
+    const corr = Math.max(-1, Math.min(1, (sumXY - (sumX * sumY) / n) / Math.sqrt(varX * varY)));
+    const point: LeadXcorrPoint = { lagMs, corr: Number(corr.toFixed(4)), samples: n };
+    points.push(point);
+    if (lagMs === 0) { zeroCorr = point.corr; zeroSamples = n; }
+    if (!bestPoint || point.corr > bestPoint.corr || (point.corr === bestPoint.corr && Math.abs(point.lagMs) < Math.abs(bestPoint.lagMs))) {
+      bestPoint = point;
+    }
+  }
+
+  if (!anyPairEnough) return { xcorr: null, reason: '双方重叠在线采样不足 5 秒' };
+  if (!bestPoint) return { xcorr: null, reason: maxVar <= 1e-12 ? '价格尚未出现波动' : '双方有效波动不足' };
+  return {
+    xcorr: {
+      peakLagMs: bestPoint.lagMs,
+      peakCorr: bestPoint.corr,
+      zeroCorr,
+      samples: zeroSamples || bestPoint.samples,
+      points,
+    },
+    reason: null,
+  };
+}
+
+export interface VenueStatAccum {
+  followedLags: number[];
+  unfollowed: number;
+  disconnected: number;
+  noData: number;
+  cancelled: number;
+  pending: number;
+}
+
+export function summarizeVenueStats(
+  venue: LeadVenue,
+  symbol: string,
+  acc: VenueStatAccum,
+  xcorr: LeadXcorrView | null,
+  xcorrReason: string | null,
+): LeadVenueStatsView {
+  const sorted = [...acc.followedLags].sort((a, b) => a - b);
+  const followed = sorted.length;
+  const resolved = followed + acc.unfollowed;
+  let bnLeadCount = 0;
+  let dexLeadCount = 0;
+  let tieCount = 0;
+  let sum = 0;
+  for (const lag of sorted) {
+    sum += lag;
+    if (lag > 0) bnLeadCount++;
+    else if (lag < 0) dexLeadCount++;
+    else tieCount++;
+  }
+  const q = (p: number) => {
+    const val = quantile(sorted, p);
+    return val !== null ? Math.round(val) : null;
+  };
+  return {
+    venue,
+    name: LEAD_VENUE_NAMES[venue],
+    symbol,
+    followed,
+    unfollowed: acc.unfollowed,
+    disconnected: acc.disconnected,
+    noData: acc.noData,
+    cancelled: acc.cancelled,
+    pending: acc.pending,
+    followRate: resolved > 0 ? Number((followed / resolved).toFixed(4)) : null,
+    bnLeadCount,
+    dexLeadCount,
+    tieCount,
+    bnLeadRate: followed > 0 ? Number((bnLeadCount / followed).toFixed(4)) : null,
+    medianMs: q(0.5),
+    meanMs: followed > 0 ? Math.round(sum / followed) : null,
+    p25Ms: q(0.25),
+    p75Ms: q(0.75),
+    p90Ms: q(0.9),
+    p95Ms: q(0.95),
+    minMs: sorted.length ? sorted[0]! : null,
+    maxMs: sorted.length ? sorted.at(-1)! : null,
+    xcorr,
+    xcorrReason,
+  };
+}
+
+// ---- 常驻多源追踪器 ----
 
 interface StreamTrackerState {
   symbol: string;
@@ -264,7 +798,9 @@ interface StreamTrackerState {
   recentTickMonos: number[];
   exchangeLags: number[];
   ticks: QuoteTick[];
-  gridCells: Map<number, { mid: number; segId: number }>;
+  lastEmittedMid: number | null;
+  lastEmittedSegId: number;
+  lastEmittedGridIdx: number;
 }
 
 interface EventVenueState {
@@ -278,6 +814,7 @@ interface EventVenueState {
 
 interface InternalEvent {
   id: number;
+  leadSource: LeadRefSource;
   wallMs: number;
   triggerMono: number;
   bnCrossMono: number;
@@ -287,18 +824,13 @@ interface InternalEvent {
   triggerMid: number;
   moveBps: number;
   venues: Partial<Record<LeadVenue, EventVenueState>>;
+  emitted: boolean;
 }
 
-interface VenueStatsInternal {
-  followedLags: number[];
-  unfollowed: number;
-  disconnected: number;
-  noData: number;
-  cancelled: number;
-  pending: number;
-  bnLeadCount: number;
-  dexLeadCount: number;
-  tieCount: number;
+interface SettledRecentEvent {
+  monoMs: number;
+  leadSource: LeadRefSource;
+  venues: Partial<Record<LeadVenue, LeadEventVenueView>>;
 }
 
 function upperBound(ticks: readonly QuoteTick[], monoMs: number): number {
@@ -318,39 +850,60 @@ function lastAtOrBefore(ticks: readonly QuoteTick[], monoMs: number, minMono: nu
   return tick.monoMs >= minMono ? { tick, nextIdx: hi } : null;
 }
 
+const isRefSource = (source: LeadSource): source is LeadRefSource =>
+  (LEAD_REF_SOURCES as readonly string[]).includes(source);
+
+export interface LeadTrackerOptions {
+  symbol: string;
+  runId: number;
+  config: LeadWatcherConfig;
+  startedAt: number;
+  startMono: number;
+  onSettled?: (event: PersistLeadEvent) => void;
+  onGridPoint?: (point: PersistLeadGrid) => void;
+}
+
 /**
- * 实时追踪一次测速会话的所有行情流、同门槛跃动事件、100ms 互相关及近 60 秒相对涨跌幅曲线。
+ * 单个常驻标的的多领先源实时追踪器：
+ * - 各自计算最多 7 个 Lead 源相对最多 3 个 DEX 目标场所的同门槛跃动跟随；
+ * - 内存中只留近 30 分钟滑窗统计（长跑数周内存恒定有界）；
+ * - 将已结算事件与稀疏 100ms 网格变化点（含 30s 心跳锚点与断线 NULL 哨兵）回调给批量刷盘控制器。
  */
 export class LeadTracker {
-  readonly id: string;
-  readonly config: LeadConfig;
+  readonly symbol: string;
+  readonly runId: number;
+  readonly config: LeadWatcherConfig;
   readonly startedAt: number;
   readonly startMono: number;
+  readonly activeLeads: readonly LeadRefSource[];
   readonly activeVenues: readonly LeadVenue[];
 
-  private finishedAt: number | null = null;
-  private finishedMono: number | null = null;
-  private finishedReason: 'completed' | 'manual' | 'shutdown' | null = null;
-  private lastTriggerMono = -Infinity;
-  private nextEventId = 0;
+  private finished = false;
   private gridOriginMono: number | null = null;
+  private gridOriginWall: number | null = null;
   private lastGridIndex = -1;
-  private gridRevision = 0;
-  private xcorrCache: Partial<Record<LeadVenue, { revision: number; result: { xcorr: LeadXcorrView | null; reason: string | null } }>> = {};
+  private nextEventId = 0;
 
   private readonly streams: Record<LeadSource, StreamTrackerState>;
-  private readonly events: InternalEvent[] = [];
+  private readonly lastTriggerMono: Partial<Record<LeadRefSource, number>> = {};
   private readonly pendingEvents = new Set<InternalEvent>();
-  private readonly venueStats: Partial<Record<LeadVenue, VenueStatsInternal>> = {};
+  private readonly recentSettled: SettledRecentEvent[] = [];
+  private readonly onSettled?: (event: PersistLeadEvent) => void;
+  private readonly onGridPoint?: (point: PersistLeadGrid) => void;
 
-  constructor(id: string, config: LeadConfig, startedAt: number, startMono: number) {
-    this.id = id;
-    this.config = config;
-    this.startedAt = startedAt;
-    this.startMono = startMono;
-    this.activeVenues = LEAD_VENUES.filter(v => Boolean(config.targets[v]));
-    const mk = (symbol: string): StreamTrackerState => ({
-      symbol,
+  constructor(options: LeadTrackerOptions) {
+    this.symbol = options.symbol;
+    this.runId = options.runId;
+    this.config = options.config;
+    this.startedAt = options.startedAt;
+    this.startMono = options.startMono;
+    this.onSettled = options.onSettled;
+    this.onGridPoint = options.onGridPoint;
+    this.activeLeads = LEAD_REF_SOURCES.filter(src => Boolean(options.config.leads[src]));
+    this.activeVenues = LEAD_VENUES.filter(v => Boolean(options.config.targets[v]));
+
+    const mk = (sym: string): StreamTrackerState => ({
+      symbol: sym,
       connected: false,
       lastError: null,
       reconnects: 0,
@@ -361,75 +914,84 @@ export class LeadTracker {
       recentTickMonos: [],
       exchangeLags: [],
       ticks: [],
-      gridCells: new Map(),
+      lastEmittedMid: null,
+      lastEmittedSegId: 0,
+      lastEmittedGridIdx: -1,
     });
     this.streams = {
-      binance: mk(config.binanceSymbol),
-      lighter: mk(config.targets.lighter ?? ''),
-      rh: mk(config.targets.rh ?? ''),
-      entropy: mk(config.targets.entropy ?? ''),
+      binance_perp: mk(options.config.leads.binance_perp ?? ''),
+      binance_spot: mk(options.config.leads.binance_spot ?? ''),
+      binance_equity: mk(options.config.leads.binance_equity ?? ''),
+      hl_xyz: mk(options.config.leads.hl_xyz ?? ''),
+      coinbase_spot: mk(options.config.leads.coinbase_spot ?? ''),
+      okx_perp: mk(options.config.leads.okx_perp ?? ''),
+      bybit_perp: mk(options.config.leads.bybit_perp ?? ''),
+      lighter: mk(options.config.targets.lighter ?? ''),
+      rh: mk(options.config.targets.rh ?? ''),
+      entropy: mk(options.config.targets.entropy ?? ''),
     };
-    for (const venue of this.activeVenues) {
-      this.venueStats[venue] = {
-        followedLags: [],
-        unfollowed: 0,
-        disconnected: 0,
-        noData: 0,
-        cancelled: 0,
-        pending: 0,
-        bnLeadCount: 0,
-        dexLeadCount: 0,
-        tieCount: 0,
-      };
-    }
+  }
+
+  private ensureOrigin(monoMs: number, wallMs: number): void {
+    if (this.gridOriginMono !== null) return;
+    const remainder = monoMs >= 0 ? monoMs % LEAD_GRID_STEP_MS : 0;
+    this.gridOriginMono = monoMs - remainder;
+    this.gridOriginWall = Math.round(wallMs - remainder);
   }
 
   private gridIndex(monoMs: number): number {
-    if (this.gridOriginMono === null) this.gridOriginMono = Math.floor(monoMs / LEAD_GRID_STEP_MS) * LEAD_GRID_STEP_MS;
-    return Math.max(0, Math.floor((monoMs - this.gridOriginMono) / LEAD_GRID_STEP_MS));
+    return Math.max(0, Math.floor((monoMs - this.gridOriginMono!) / LEAD_GRID_STEP_MS));
   }
 
-  private pruneGrid(latestIdx: number): void {
-    const cutoff = latestIdx - MAX_GRID_CELLS;
-    if (cutoff < 0) return;
+  private cellWallMs(idx: number): number {
+    return this.gridOriginWall! + idx * LEAD_GRID_STEP_MS;
+  }
+
+  private isSourceActive(source: LeadSource): boolean {
+    return isRefSource(source) ? Boolean(this.config.leads[source]) : Boolean(this.config.targets[source]);
+  }
+
+  private emitGrid(source: LeadSource, idx: number, segId: number, mid: number | null, force = false): void {
+    const stream = this.streams[source];
+    if (mid === null) {
+      stream.lastEmittedMid = null;
+      stream.lastEmittedSegId = segId;
+      stream.lastEmittedGridIdx = idx;
+      this.onGridPoint?.({ symbol: this.symbol, at: this.cellWallMs(idx), source, runId: this.runId, gridIdx: idx, segId, mid: null });
+      return;
+    }
+    const anchorDue = stream.lastEmittedGridIdx < 0 || idx - stream.lastEmittedGridIdx >= LEAD_GRID_ANCHOR_STEPS;
+    if (!force && stream.lastEmittedMid === mid && stream.lastEmittedSegId === segId && !anchorDue) return;
+    stream.lastEmittedMid = mid;
+    stream.lastEmittedSegId = segId;
+    stream.lastEmittedGridIdx = idx;
+    this.onGridPoint?.({ symbol: this.symbol, at: this.cellWallMs(idx), source, runId: this.runId, gridIdx: idx, segId, mid });
+  }
+
+  /** 将所有在线流的 30s 心跳锚点推进到 `targetIdx`（不跨断线或超过 60s 静默）。 */
+  private advanceAnchors(targetIdx: number): void {
+    if (this.gridOriginMono === null || targetIdx <= this.lastGridIndex) return;
+    const stepBase = Math.max(this.lastGridIndex + 1, targetIdx - LEAD_GRID_ANCHOR_STEPS * 2);
     for (const source of LEAD_SOURCES) {
-      const cells = this.streams[source].gridCells;
-      for (const idx of cells.keys()) {
-        if (idx < cutoff) cells.delete(idx);
-        else break;
-      }
+      if (!this.isSourceActive(source)) continue;
+      const stream = this.streams[source];
+      if (!stream.connected || stream.segmentStart === null || !stream.lastTick) continue;
+      if (stream.lastTick.monoMs < stream.segmentStart) continue;
+      const nextAnchorIdx = stream.lastEmittedGridIdx < 0
+        ? targetIdx
+        : stream.lastEmittedGridIdx + LEAD_GRID_ANCHOR_STEPS;
+      if (nextAnchorIdx > targetIdx) continue;
+      const emitIdx = Math.max(stepBase, nextAnchorIdx);
+      const cellMono = this.gridOriginMono + emitIdx * LEAD_GRID_STEP_MS;
+      // 最后锚点停在 30s，配合 Worker 侧 30s 最大连续填充上限，确保静默期总外推严格不超过 LEAD_BASE_STALE_MS (60s)。
+      if (cellMono - stream.lastTick.monoMs > LEAD_BASE_STALE_MS - LEAD_GRID_ANCHOR_MS) continue;
+      this.emitGrid(source, emitIdx, stream.segId, stream.lastTick.mid, true);
     }
+    this.lastGridIndex = targetIdx;
   }
 
-  /** 将所有流上的当前有效报价补齐到当前时刻的 100ms 网格（不跨断线或超过 60s 静默）。 */
-  private fillGridUpTo(targetIdx: number, monoMs: number): void {
-    if (this.gridOriginMono === null) return;
-    const startIdx = Math.max(0, this.lastGridIndex + 1, targetIdx - MAX_GRID_CELLS);
-    if (startIdx <= targetIdx) {
-      for (let idx = startIdx; idx <= targetIdx; idx++) {
-        const cellMono = this.gridOriginMono + idx * LEAD_GRID_STEP_MS;
-        for (const source of LEAD_SOURCES) {
-          if (source !== 'binance' && !this.config.targets[source]) continue;
-          const stream = this.streams[source];
-          if (!stream.connected || stream.segmentStart === null || !stream.lastTick) continue;
-          if (stream.lastTick.monoMs < stream.segmentStart) continue;
-          if (cellMono - stream.lastTick.monoMs > LEAD_BASE_STALE_MS) continue;
-          stream.gridCells.set(idx, { mid: stream.lastTick.mid, segId: stream.segId });
-          this.gridRevision++;
-        }
-      }
-      this.lastGridIndex = targetIdx;
-      this.pruneGrid(targetIdx);
-    }
-    void monoMs;
-  }
-
-  setConnected(source: LeadSource, connected: boolean, monoMs: number, error: string | null = null, reconnects?: number): void {
-    if (this.finishedAt !== null) return;
-    // 状态切换前把已有在线流补齐到当前网格边界，使断线区间自然留空。
-    if (this.gridOriginMono !== null) {
-      this.fillGridUpTo(this.gridIndex(monoMs), monoMs);
-    }
+  setConnected(source: LeadSource, connected: boolean, monoMs: number, wallMs = Date.now(), error: string | null = null, reconnects?: number): void {
+    if (this.finished || !this.isSourceActive(source)) return;
     const stream = this.streams[source];
     if (reconnects !== undefined) stream.reconnects = reconnects;
     if (connected) {
@@ -440,72 +1002,115 @@ export class LeadTracker {
         stream.segId++;
         stream.segmentStart = monoMs;
       }
-    } else {
-      stream.connected = false;
-      if (error !== null) stream.lastError = error;
-      if (stream.segmentStart !== null) {
-        stream.segmentStart = null;
-        stream.segId++;
+      return;
+    }
+
+    const hadLiveSegment = stream.connected && stream.segmentStart !== null && stream.lastTick !== null && this.gridOriginMono !== null;
+    if (hadLiveSegment) {
+      const idx = this.gridIndex(monoMs);
+      this.advanceAnchors(Math.max(0, idx - 1));
+    }
+    stream.connected = false;
+    if (error !== null) stream.lastError = error;
+    if (stream.segmentStart !== null) {
+      stream.segmentStart = null;
+      stream.segId++;
+    }
+    if (hadLiveSegment) {
+      const idx = this.gridIndex(monoMs);
+      this.emitGrid(source, idx, stream.segId, null, true);
+    }
+
+    if (isRefSource(source)) {
+      // 主导源断线，仅清理它已有的待判定事件（其余等待源继续照常跑）
+      for (const ev of [...this.pendingEvents]) {
+        if (ev.leadSource !== source) continue;
+        for (const venue of this.activeVenues) {
+          const vs = ev.venues[venue];
+          if (vs && vs.status === 'pending') vs.status = 'disconnected';
+        }
+        this.settleEvent(ev, monoMs);
       }
-      if (source !== 'binance') {
-        for (const ev of this.pendingEvents) {
-          const vs = ev.venues[source];
-          if (vs && vs.status === 'pending') {
-            this.transitionVenue(source, vs, 'disconnected');
-          }
-          this.checkEventSettled(ev);
+    } else {
+      for (const ev of [...this.pendingEvents]) {
+        const vs = ev.venues[source];
+        if (vs && vs.status === 'pending') {
+          vs.status = 'disconnected';
+          this.checkEventSettled(ev, monoMs);
         }
       }
     }
+    void wallMs;
   }
 
-  private transitionVenue(venue: LeadVenue, state: EventVenueState, nextStatus: LeadFollowStatus, lagMs?: number, followMono?: number): void {
-    const stats = this.venueStats[venue];
-    if (!stats) return;
-    if (state.status === 'pending') stats.pending = Math.max(0, stats.pending - 1);
-    state.status = nextStatus;
-    if (followMono !== undefined) state.followMono = followMono;
-    if (lagMs !== undefined) {
-      state.lagMs = lagMs;
-      if (stats.followedLags.length < MAX_LAGS_PER_VENUE) stats.followedLags.push(lagMs);
-      if (lagMs > 0) stats.bnLeadCount++;
-      else if (lagMs < 0) stats.dexLeadCount++;
-      else stats.tieCount++;
-    } else if (nextStatus === 'unfollowed') stats.unfollowed++;
-    else if (nextStatus === 'disconnected') stats.disconnected++;
-    else if (nextStatus === 'no_data') stats.noData++;
-    else if (nextStatus === 'cancelled') stats.cancelled++;
+  private settleEvent(ev: InternalEvent, monoMs: number): void {
+    this.pendingEvents.delete(ev);
+    if (ev.emitted) return;
+    ev.emitted = true;
+
+    const venueViews: Partial<Record<LeadVenue, LeadEventVenueView>> = {};
+    for (const venue of this.activeVenues) {
+      const vs = ev.venues[venue]!;
+      venueViews[venue] = {
+        status: vs.status,
+        lagMs: vs.lagMs,
+        maxMoveBps: vs.maxMoveBps === null ? null : Number(vs.maxMoveBps.toFixed(2)),
+      };
+    }
+
+    this.recentSettled.push({ monoMs, leadSource: ev.leadSource, venues: venueViews });
+    this.pruneRecent(monoMs);
+
+    this.onSettled?.({
+      symbol: this.symbol,
+      runId: this.runId,
+      leadSource: ev.leadSource,
+      at: ev.wallMs,
+      direction: ev.direction,
+      baseMid: ev.baseMid,
+      triggerMid: ev.triggerMid,
+      moveBps: Number(ev.moveBps.toFixed(2)),
+      thresholdBps: this.config.thresholdBps,
+      followBps: this.config.thresholdBps * this.config.followRatio,
+      venues: venueViews,
+    });
   }
 
-  private checkEventSettled(ev: InternalEvent): void {
+  private checkEventSettled(ev: InternalEvent, monoMs: number): void {
     for (const venue of this.activeVenues) {
       if (ev.venues[venue]?.status === 'pending') return;
     }
-    this.pendingEvents.delete(ev);
+    this.settleEvent(ev, monoMs);
   }
 
-  /** 推进待判定事件的超时，供定时 loop 与新报价到达时调用。 */
-  tickTimeouts(monoMs: number): void {
-    if (this.finishedAt !== null) return;
-    const gIdx = this.gridOriginMono !== null ? this.gridIndex(monoMs) : -1;
-    if (gIdx >= 0) this.fillGridUpTo(gIdx, monoMs);
-
-    for (const ev of [...this.pendingEvents]) {
-      const deadline = ev.triggerMono + this.config.maxWaitMs;
-      if (monoMs < deadline) continue;
-      for (const venue of this.activeVenues) {
-        const vs = ev.venues[venue];
-        if (vs && vs.status === 'pending') this.transitionVenue(venue, vs, 'unfollowed');
-      }
-      this.checkEventSettled(ev);
+  private pruneRecent(monoMs: number): void {
+    const cutoff = monoMs - LEAD_RECENT_WINDOW_MS;
+    while (this.recentSettled.length && (this.recentSettled.length > MAX_RECENT_SETTLED || this.recentSettled[0]!.monoMs < cutoff)) {
+      this.recentSettled.shift();
     }
   }
 
-  onTick(source: LeadSource, tick: QuoteTick): void {
-    if (this.finishedAt !== null) return;
-    if (!(tick.bid > 0 && tick.ask >= tick.bid && tick.mid > 0)) return;
-    if (source !== 'binance' && !this.config.targets[source]) return;
+  /** 推进待判定事件超时、清理 30m 滑窗旧事件并维持 30s 稀疏心跳锚点。 */
+  tickTimeouts(monoMs: number): void {
+    if (this.finished) return;
+    if (this.gridOriginMono !== null) this.advanceAnchors(this.gridIndex(monoMs));
 
+    for (const ev of [...this.pendingEvents]) {
+      if (monoMs < ev.triggerMono + this.config.maxWaitMs) continue;
+      for (const venue of this.activeVenues) {
+        const vs = ev.venues[venue];
+        if (vs && vs.status === 'pending') vs.status = 'unfollowed';
+      }
+      this.checkEventSettled(ev, monoMs);
+    }
+    this.pruneRecent(monoMs);
+  }
+
+  onTick(source: LeadSource, tick: QuoteTick): void {
+    if (this.finished || !this.isSourceActive(source)) return;
+    if (!(tick.bid > 0 && tick.ask >= tick.bid && tick.mid > 0)) return;
+
+    this.ensureOrigin(tick.monoMs, tick.wallMs);
     const stream = this.streams[source];
     if (!stream.connected) {
       stream.connected = true;
@@ -517,9 +1122,8 @@ export class LeadTracker {
       if (stream.segmentStart === null) stream.segmentStart = tick.monoMs;
     }
 
-    // 补全此前时刻的网格再更新当前报价与网格点。
     const gIdx = this.gridIndex(tick.monoMs);
-    this.fillGridUpTo(gIdx, tick.monoMs);
+    this.advanceAnchors(gIdx);
 
     stream.ticksCount++;
     stream.lastTick = tick;
@@ -541,32 +1145,28 @@ export class LeadTracker {
       stream.ticks.shift();
     }
 
-    // 更新当前 100ms 网格点。
-    stream.gridCells.set(gIdx, { mid: tick.mid, segId: stream.segId });
-    this.gridRevision++;
+    this.emitGrid(source, gIdx, stream.segId, tick.mid, false);
     this.lastGridIndex = Math.max(this.lastGridIndex, gIdx);
-    this.pruneGrid(gIdx);
 
-    // 清理已超时事件。
     this.tickTimeouts(tick.monoMs);
 
-    if (source !== 'binance') {
+    if (!isRefSource(source)) {
       this.updatePendingForVenue(source, tick);
       return;
     }
 
-    this.evaluateBinanceImpulse(tick);
+    this.evaluateImpulse(source, tick);
   }
 
-  /** 对静默但仍在线的一档做心跳保活（刷新有效期与网格连续性，不计入报价变更频次）。 */
+  /** 对静默但仍在线的一档做心跳保活（刷新有效期与稀疏锚点，不虚增价变计数）。 */
   confirmAlive(source: LeadSource, monoMs: number, wallMs: number): void {
-    if (this.finishedAt !== null) return;
-    if (source !== 'binance' && !this.config.targets[source]) return;
+    if (this.finished || !this.isSourceActive(source)) return;
     const stream = this.streams[source];
     if (!stream.connected || stream.segmentStart === null || !stream.lastTick) return;
     if (stream.lastTick.monoMs < stream.segmentStart || monoMs <= stream.lastTick.monoMs) return;
+    this.ensureOrigin(monoMs, wallMs);
     const gIdx = this.gridIndex(monoMs);
-    this.fillGridUpTo(gIdx, monoMs);
+    this.advanceAnchors(gIdx);
     const refreshed: QuoteTick = { ...stream.lastTick, monoMs, wallMs };
     stream.lastTick = refreshed;
     stream.ticks.push(refreshed);
@@ -577,10 +1177,8 @@ export class LeadTracker {
     while (stream.ticks.length > MAX_TICKS_PER_STREAM) {
       stream.ticks.shift();
     }
-    stream.gridCells.set(gIdx, { mid: refreshed.mid, segId: stream.segId });
-    this.gridRevision++;
+    this.emitGrid(source, gIdx, stream.segId, refreshed.mid, false);
     this.lastGridIndex = Math.max(this.lastGridIndex, gIdx);
-    this.pruneGrid(gIdx);
   }
 
   private updatePendingForVenue(venue: LeadVenue, tick: QuoteTick): void {
@@ -589,27 +1187,30 @@ export class LeadTracker {
       const vs = ev.venues[venue];
       if (!vs || vs.status !== 'pending' || vs.baseMid === null) continue;
       if (tick.monoMs > ev.triggerMono + this.config.maxWaitMs) {
-        this.transitionVenue(venue, vs, 'unfollowed');
-        this.checkEventSettled(ev);
+        vs.status = 'unfollowed';
+        this.checkEventSettled(ev, tick.monoMs);
         continue;
       }
       if (tick.monoMs < ev.preStartMono) continue;
       const move = ev.direction * ((tick.mid - vs.baseMid) / vs.baseMid) * 10_000;
       if (vs.maxMoveBps === null || move > vs.maxMoveBps) vs.maxMoveBps = move;
       if (move >= followBps) {
-        const lagMs = Math.round(tick.monoMs - ev.bnCrossMono);
-        this.transitionVenue(venue, vs, 'followed', lagMs, tick.monoMs);
-        this.checkEventSettled(ev);
+        vs.status = 'followed';
+        vs.followMono = tick.monoMs;
+        vs.lagMs = Math.round(tick.monoMs - ev.bnCrossMono);
+        this.checkEventSettled(ev, tick.monoMs);
       }
     }
   }
 
-  private evaluateBinanceImpulse(tick: QuoteTick): void {
-    const bn = this.streams.binance;
-    if (tick.monoMs - this.lastTriggerMono < this.config.cooldownMs) return;
+  private evaluateImpulse(leadSource: LeadRefSource, tick: QuoteTick): void {
+    const lead = this.streams[leadSource];
+    const prevTrigger = this.lastTriggerMono[leadSource] ?? -Infinity;
+    if (tick.monoMs - prevTrigger < this.config.cooldownMs) return;
+
     const hardFloorMono = Math.max(
-      bn.segmentStart ?? -Infinity,
-      Number.isFinite(this.lastTriggerMono) ? this.lastTriggerMono : -Infinity,
+      lead.segmentStart ?? -Infinity,
+      Number.isFinite(prevTrigger) ? prevTrigger : -Infinity,
     );
     const windowStartMono = Math.max(tick.monoMs - this.config.impulseWindowMs, hardFloorMono);
 
@@ -617,8 +1218,8 @@ export class LeadTracker {
     let bestMove = 0;
     let bestIdx = -1;
     let sawWindowBoundary = false;
-    for (let i = bn.ticks.length - 1; i >= 0; i--) {
-      const candidate = bn.ticks[i]!;
+    for (let i = lead.ticks.length - 1; i >= 0; i--) {
+      const candidate = lead.ticks[i]!;
       if (candidate.monoMs < hardFloorMono) break;
       const isCarry = candidate.monoMs < windowStartMono;
       if (isCarry && (sawWindowBoundary || tick.monoMs - candidate.monoMs > LEAD_BASE_STALE_MS)) break;
@@ -636,10 +1237,9 @@ export class LeadTracker {
     const direction: 1 | -1 = bestMove > 0 ? 1 : -1;
     const followBps = this.config.thresholdBps * this.config.followRatio;
 
-    // 1. 找到 Binance 同向变动达到 followBps 的首个时刻（同门槛对齐）。
     let bnCrossMono = tick.monoMs;
-    for (let i = bestIdx; i < bn.ticks.length; i++) {
-      const pt = bn.ticks[i]!;
+    for (let i = bestIdx; i < lead.ticks.length; i++) {
+      const pt = lead.ticks[i]!;
       const signedMove = direction * ((pt.mid - bestBase.mid) / bestBase.mid) * 10_000;
       if (signedMove >= followBps) {
         bnCrossMono = pt.monoMs;
@@ -647,20 +1247,17 @@ export class LeadTracker {
       }
     }
 
-    // 2. 确定公共静默起点 preStartMono（向前回看最多 1500ms，不越过断线或上一事件）。
     const preFloor = Math.max(bnCrossMono - LEAD_PRE_WINDOW_MS, hardFloorMono);
     let preStartMono = bestBase.monoMs;
     if (bestBase.monoMs <= preFloor) {
-      // 静默后单跳：Binance 在 [preFloor, bnCrossMono) 内未波动，直接以 preFloor 截断，避免回看数秒旧噪音。
       preStartMono = preFloor;
     } else {
       for (let i = bestIdx - 1; i >= 0; i--) {
-        const pt = bn.ticks[i]!;
+        const pt = lead.ticks[i]!;
         if (pt.monoMs < hardFloorMono) break;
         const drift = Math.abs((pt.mid - bestBase.mid) / bestBase.mid) * 10_000;
         if (drift >= 0.25 * followBps) break;
         if (pt.monoMs < preFloor) {
-          // 紧邻窗口前的平稳报价落在 60s 有效期内，延续到 preFloor，以免窗口前缀内点差微调丢失 DEX 提前抢跑。
           if (tick.monoMs - pt.monoMs <= LEAD_BASE_STALE_MS) preStartMono = preFloor;
           break;
         }
@@ -668,9 +1265,10 @@ export class LeadTracker {
       }
     }
 
-    this.lastTriggerMono = tick.monoMs;
+    this.lastTriggerMono[leadSource] = tick.monoMs;
     const ev: InternalEvent = {
       id: ++this.nextEventId,
+      leadSource,
       wallMs: tick.wallMs,
       triggerMono: tick.monoMs,
       bnCrossMono,
@@ -680,15 +1278,13 @@ export class LeadTracker {
       triggerMid: tick.mid,
       moveBps: bestMove,
       venues: {},
+      emitted: false,
     };
 
     for (const venue of this.activeVenues) {
       const target = this.streams[venue];
-      const stats = this.venueStats[venue]!;
       if (!target.connected || target.segmentStart === null) {
-        const vs: EventVenueState = { status: 'no_data', baseMid: null, baseMono: null, followMono: null, lagMs: null, maxMoveBps: null };
-        ev.venues[venue] = vs;
-        stats.noData++;
+        ev.venues[venue] = { status: 'no_data', baseMid: null, baseMono: null, followMono: null, lagMs: null, maxMoveBps: null };
         continue;
       }
       const minBaseMono = Math.max(preStartMono - LEAD_BASE_STALE_MS, target.segmentStart);
@@ -698,7 +1294,6 @@ export class LeadTracker {
       if (!chosen) {
         chosen = baseAtBest;
       } else if (baseAtBest && baseAtBest.tick.monoMs > chosen.tick.monoMs) {
-        // 若 (preStartMono, bestBase.monoMs] 内目标场所仅往收敛方向移动而未同向抢跑，刷新为更贴近起爆前的稳态点。
         let preLed = false;
         for (let i = chosen.nextIdx; i < baseAtBest.nextIdx; i++) {
           const pt = target.ticks[i]!;
@@ -708,13 +1303,10 @@ export class LeadTracker {
         if (!preLed) chosen = baseAtBest;
       }
       if (!chosen) {
-        const vs: EventVenueState = { status: 'no_data', baseMid: null, baseMono: null, followMono: null, lagMs: null, maxMoveBps: null };
-        ev.venues[venue] = vs;
-        stats.noData++;
+        ev.venues[venue] = { status: 'no_data', baseMid: null, baseMono: null, followMono: null, lagMs: null, maxMoveBps: null };
         continue;
       }
       const baseTick = chosen.tick;
-
       const vs: EventVenueState = {
         status: 'pending',
         baseMid: baseTick.mid,
@@ -723,9 +1315,6 @@ export class LeadTracker {
         lagMs: null,
         maxMoveBps: 0,
       };
-      stats.pending++;
-
-      // 自 baseTick 之后顺扫至当前触发时刻，检测目标场所是否提前抢跑或同步跟进。
       for (let i = chosen.nextIdx; i < target.ticks.length; i++) {
         const pt = target.ticks[i]!;
         if (pt.monoMs > tick.monoMs) break;
@@ -733,206 +1322,63 @@ export class LeadTracker {
         const move = direction * ((pt.mid - baseTick.mid) / baseTick.mid) * 10_000;
         if (vs.maxMoveBps === null || move > vs.maxMoveBps) vs.maxMoveBps = move;
         if (move >= followBps) {
-          const lagMs = Math.round(pt.monoMs - bnCrossMono);
-          this.transitionVenue(venue, vs, 'followed', lagMs, pt.monoMs);
+          vs.status = 'followed';
+          vs.followMono = pt.monoMs;
+          vs.lagMs = Math.round(pt.monoMs - bnCrossMono);
           break;
         }
       }
       ev.venues[venue] = vs;
     }
 
-    this.events.push(ev);
-    if (this.events.length > LEAD_MAX_EVENTS_VIEW) this.events.shift();
     if (this.activeVenues.some(v => ev.venues[v]?.status === 'pending')) {
       this.pendingEvents.add(ev);
+    } else {
+      this.settleEvent(ev, tick.monoMs);
     }
   }
 
-  /** 结束本次测试：所有在途 pending 事件标为 cancelled（不计分母）。 */
-  finalize(wallMs: number, monoMs: number, reason: 'completed' | 'manual' | 'shutdown'): void {
-    if (this.finishedAt !== null) return;
+  /** 暂停或停服时结算在途事件并写入所有在线流的断线哨兵（`mid: null`）。 */
+  finalize(wallMs: number, monoMs: number): void {
+    if (this.finished) return;
     this.tickTimeouts(monoMs);
-    this.finishedAt = wallMs;
-    this.finishedMono = monoMs;
-    this.finishedReason = reason;
+    this.finished = true;
     for (const ev of [...this.pendingEvents]) {
       for (const venue of this.activeVenues) {
         const vs = ev.venues[venue];
-        if (vs && vs.status === 'pending') this.transitionVenue(venue, vs, 'cancelled');
+        if (vs && vs.status === 'pending') vs.status = 'cancelled';
       }
-      this.pendingEvents.delete(ev);
+      this.settleEvent(ev, monoMs);
     }
-  }
-
-  /** 抽取按连续网格下标对齐的 500ms 收益率定长数组（缺失为 NaN），兼顾断线保护与线性扫描性能。 */
-  private buildReturnSeries(cells: ReadonlyMap<number, { mid: number; segId: number }>): { minIdx: number; values: Float64Array; count: number } {
-    const h = LEAD_RETURN_HORIZON_STEPS;
-    if (cells.size < LEAD_XCORR_MIN_SAMPLES + h) return { minIdx: 0, values: new Float64Array(0), count: 0 };
-    let firstIdx = Infinity;
-    let lastIdx = -Infinity;
-    for (const idx of cells.keys()) {
-      if (idx < firstIdx) firstIdx = idx;
-      if (idx > lastIdx) lastIdx = idx;
-    }
-    const startIdx = firstIdx + h;
-    if (lastIdx < startIdx) return { minIdx: 0, values: new Float64Array(0), count: 0 };
-    const values = new Float64Array(lastIdx - startIdx + 1);
-    values.fill(Number.NaN);
-    let count = 0;
-    for (const [idx, cur] of cells) {
-      if (idx < startIdx) continue;
-      const prev = cells.get(idx - h);
-      if (!prev || prev.segId !== cur.segId || !(prev.mid > 0) || !(cur.mid > 0)) continue;
-      let continuous = true;
-      for (let step = 1; step < h; step++) {
-        const midCell = cells.get(idx - step);
-        if (!midCell || midCell.segId !== cur.segId) { continuous = false; break; }
-      }
-      if (!continuous) continue;
-      values[idx - startIdx] = (cur.mid - prev.mid) / prev.mid;
-      count++;
-    }
-    return { minIdx: startIdx, values, count };
-  }
-
-  /** 计算指定 DEX 场所相对 Binance 的 100ms 网格 500ms 重叠收益率互相关曲线，按网格修订版本缓存。 */
-  private computeXcorr(venue: LeadVenue, bnSeries: { minIdx: number; values: Float64Array; count: number }): { xcorr: LeadXcorrView | null; reason: string | null } {
-    const cached = this.xcorrCache[venue];
-    if (cached && cached.revision === this.gridRevision) return cached.result;
-
-    const save = (result: { xcorr: LeadXcorrView | null; reason: string | null }) => {
-      this.xcorrCache[venue] = { revision: this.gridRevision, result };
-      return result;
-    };
-
-    const bn = this.streams.binance.gridCells;
-    const dex = this.streams[venue].gridCells;
-    if (bn.size < LEAD_XCORR_MIN_SAMPLES + LEAD_RETURN_HORIZON_STEPS || dex.size < LEAD_XCORR_MIN_SAMPLES + LEAD_RETURN_HORIZON_STEPS) {
-      return save({ xcorr: null, reason: '双方连续在线采样不足 5 秒' });
-    }
-    if (bnSeries.count < LEAD_XCORR_MIN_SAMPLES) {
-      return save({ xcorr: null, reason: 'Binance 连续在线采样不足 5 秒' });
-    }
-    const dexSeries = this.buildReturnSeries(dex);
-    if (dexSeries.count < LEAD_XCORR_MIN_SAMPLES) {
-      return save({ xcorr: null, reason: `${LEAD_VENUE_NAMES[venue]} 连续在线采样不足 5 秒` });
-    }
-
-    const minLagSteps = Math.round(LEAD_XCORR_MIN_LAG_MS / LEAD_GRID_STEP_MS);
-    const maxLagSteps = Math.round(LEAD_XCORR_MAX_LAG_MS / LEAD_GRID_STEP_MS);
-    const bnArr = bnSeries.values;
-    const dexArr = dexSeries.values;
-
-    const points: LeadXcorrPoint[] = [];
-    let bestPoint: LeadXcorrPoint | null = null;
-    let zeroCorr: number | null = null;
-    let zeroSamples = 0;
-    let anyPairEnough = false;
-    let maxVar = 0;
-
-    for (let k = minLagSteps; k <= maxLagSteps; k++) {
-      let n = 0;
-      let sumX = 0, sumY = 0, sumXX = 0, sumYY = 0, sumXY = 0;
-      const offset = bnSeries.minIdx + k - dexSeries.minIdx;
-      const lo = Math.max(0, -offset);
-      const hi = Math.min(bnArr.length, dexArr.length - offset);
-      for (let i = lo; i < hi; i++) {
-        const x = bnArr[i]!;
-        const y = dexArr[i + offset]!;
-        if (Number.isNaN(x) || Number.isNaN(y)) continue;
-        n++;
-        sumX += x;
-        sumY += y;
-        sumXX += x * x;
-        sumYY += y * y;
-        sumXY += x * y;
-      }
-      const lagMs = k * LEAD_GRID_STEP_MS;
-      if (n < LEAD_XCORR_MIN_SAMPLES) continue;
-      anyPairEnough = true;
-      const varX = sumXX - (sumX * sumX) / n;
-      const varY = sumYY - (sumY * sumY) / n;
-      maxVar = Math.max(maxVar, varX, varY);
-      if (varX <= 1e-12 || varY <= 1e-12) continue;
-      const corr = Math.max(-1, Math.min(1, (sumXY - (sumX * sumY) / n) / Math.sqrt(varX * varY)));
-      const point: LeadXcorrPoint = { lagMs, corr: Number(corr.toFixed(4)), samples: n };
-      points.push(point);
-      if (lagMs === 0) { zeroCorr = point.corr; zeroSamples = n; }
-      if (!bestPoint || point.corr > bestPoint.corr || (point.corr === bestPoint.corr && Math.abs(point.lagMs) < Math.abs(bestPoint.lagMs))) {
-        bestPoint = point;
-      }
-    }
-
-    if (!anyPairEnough) return save({ xcorr: null, reason: '双方重叠在线采样不足 5 秒' });
-    if (!bestPoint) return save({ xcorr: null, reason: maxVar <= 1e-12 ? '价格尚未出现波动' : '双方有效波动不足' });
-    return save({
-      xcorr: {
-        peakLagMs: bestPoint.lagMs,
-        peakCorr: bestPoint.corr,
-        zeroCorr,
-        samples: zeroSamples || bestPoint.samples,
-        points,
-      },
-      reason: null,
-    });
-  }
-
-  private buildSeries(currentMono: number, currentWall: number): LeadSeriesPoint[] {
-    if (this.gridOriginMono === null) return [];
-    const endIdx = this.gridIndex(currentMono);
-    const windowSteps = Math.ceil(LEAD_SERIES_WINDOW_MS / LEAD_GRID_STEP_MS);
-    const rawStart = Math.max(0, endIdx - windowSteps);
-    const span = Math.floor((endIdx - rawStart) / LEAD_SERIES_STRIDE) * LEAD_SERIES_STRIDE;
-    const startIdx = endIdx - span;
-
-    const bases: Partial<Record<LeadSource, number>> = {};
-    for (let idx = startIdx; idx <= endIdx; idx += LEAD_SERIES_STRIDE) {
+    if (this.gridOriginMono !== null) {
+      const idx = this.gridIndex(monoMs);
       for (const source of LEAD_SOURCES) {
-        if (bases[source] !== undefined) continue;
-        const cell = this.streams[source].gridCells.get(idx);
-        if (cell && cell.mid > 0) bases[source] = cell.mid;
+        if (!this.isSourceActive(source)) continue;
+        const stream = this.streams[source];
+        if (stream.connected && stream.segmentStart !== null && stream.lastTick) {
+          stream.segId++;
+          this.emitGrid(source, idx, stream.segId, null, true);
+        }
+        stream.connected = false;
+        stream.segmentStart = null;
       }
     }
-    if (bases.binance === undefined && this.activeVenues.every(v => bases[v] === undefined)) return [];
-
-    const rows: LeadSeriesPoint[] = [];
-    for (let idx = startIdx; idx <= endIdx; idx += LEAD_SERIES_STRIDE) {
-      const cellMono = this.gridOriginMono + idx * LEAD_GRID_STEP_MS;
-      const wallT = Math.round(currentWall - (currentMono - cellMono));
-      const rel = (source: LeadSource): number | null => {
-        const base = bases[source];
-        const cell = this.streams[source].gridCells.get(idx);
-        if (!base || !cell || !(cell.mid > 0)) return null;
-        return Number((((cell.mid - base) / base) * 10_000).toFixed(2));
-      };
-      rows.push({
-        t: wallT,
-        binance: rel('binance'),
-        lighter: this.config.targets.lighter ? rel('lighter') : null,
-        rh: this.config.targets.rh ? rel('rh') : null,
-        entropy: this.config.targets.entropy ? rel('entropy') : null,
-      });
-    }
-    return rows;
+    void wallMs;
   }
 
-  view(wallMs: number, monoMs: number): LeadSessionView {
-    const refWall = this.finishedAt ?? wallMs;
-    const refMono = this.finishedMono ?? monoMs;
-    if (this.finishedAt === null) this.tickTimeouts(monoMs);
+  watcherView(meta: { enabled: boolean; status: 'running' | 'waiting_catalog' | 'paused'; createdAt: number; updatedAt: number }, wallMs: number, monoMs: number): LeadWatcherView {
+    if (!this.finished) this.tickTimeouts(monoMs);
+    const refMid = this.streams[this.activeLeads[0]!]?.lastTick?.mid ?? null;
+    const rateWindowSec = Math.max(1, Math.min(10, Math.max(1, (monoMs - this.startMono) / 1000)));
 
-    const elapsedMs = Math.max(0, Math.min(this.config.durationSec * 1_000, Math.round(refMono - this.startMono)));
-    const remainingMs = this.finishedAt !== null ? 0 : Math.max(0, this.config.durationSec * 1_000 - elapsedMs);
-    const bnMid = this.streams.binance.lastTick?.mid ?? null;
-
-    const streamView = (source: LeadSource): LeadStreamView => {
+    const activeSources: LeadSource[] = [...this.activeLeads, ...this.activeVenues];
+    const streams: LeadStreamView[] = activeSources.map(source => {
       const s = this.streams[source];
       const tick = s.lastTick;
       const spreadBps = tick && tick.mid > 0 ? Number((((tick.ask - tick.bid) / tick.mid) * 10_000).toFixed(2)) : null;
-      const rateWindowSec = Math.max(1, Math.min(10, Math.max(1, (refMono - this.startMono) / 1000)));
-      const recentCount = s.recentTickMonos.filter(t => refMono - t <= 10_000).length;
-      const basisBps = source !== 'binance' && tick && bnMid && Math.abs(tick.mid / bnMid - 1) <= LEAD_BASIS_MAX_GAP_PCT
-        ? Number((((tick.mid - bnMid) / bnMid) * 10_000).toFixed(2))
+      const recentCount = s.recentTickMonos.filter(t => monoMs - t <= 10_000).length;
+      const basisBps = !isRefSource(source) && tick && refMid && Math.abs(tick.mid / refMid - 1) <= LEAD_BASIS_MAX_GAP_PCT
+        ? Number((((tick.mid - refMid) / refMid) * 10_000).toFixed(2))
         : null;
       return {
         source,
@@ -951,81 +1397,72 @@ export class LeadTracker {
         exchangeLagMs: median(s.exchangeLags) !== null ? Math.round(median(s.exchangeLags)!) : null,
         basisBps,
       };
-    };
-
-    const streams: LeadStreamView[] = [streamView('binance'), ...this.activeVenues.map(v => streamView(v))];
-    const bnSeries = this.activeVenues.some(v => !this.xcorrCache[v] || this.xcorrCache[v]!.revision !== this.gridRevision)
-      ? this.buildReturnSeries(this.streams.binance.gridCells)
-      : { minIdx: 0, values: new Float64Array(0), count: 0 };
-    const venues: LeadVenueStatsView[] = this.activeVenues.map(venue => {
-      const st = this.venueStats[venue]!;
-      const sorted = [...st.followedLags].sort((a, b) => a - b);
-      const followed = sorted.length;
-      const resolved = followed + st.unfollowed;
-      const sum = sorted.reduce((acc, v) => acc + v, 0);
-      const { xcorr, reason } = this.computeXcorr(venue, bnSeries);
-      return {
-        venue,
-        name: LEAD_VENUE_NAMES[venue],
-        symbol: this.config.targets[venue]!,
-        followed,
-        unfollowed: st.unfollowed,
-        disconnected: st.disconnected,
-        noData: st.noData,
-        cancelled: st.cancelled,
-        pending: st.pending,
-        followRate: resolved > 0 ? Number((followed / resolved).toFixed(4)) : null,
-        bnLeadCount: st.bnLeadCount,
-        dexLeadCount: st.dexLeadCount,
-        tieCount: st.tieCount,
-        bnLeadRate: followed > 0 ? Number((st.bnLeadCount / followed).toFixed(4)) : null,
-        medianMs: quantile(sorted, 0.5) !== null ? Math.round(quantile(sorted, 0.5)!) : null,
-        meanMs: followed > 0 ? Math.round(sum / followed) : null,
-        p25Ms: quantile(sorted, 0.25) !== null ? Math.round(quantile(sorted, 0.25)!) : null,
-        p75Ms: quantile(sorted, 0.75) !== null ? Math.round(quantile(sorted, 0.75)!) : null,
-        p90Ms: quantile(sorted, 0.90) !== null ? Math.round(quantile(sorted, 0.90)!) : null,
-        p95Ms: quantile(sorted, 0.95) !== null ? Math.round(quantile(sorted, 0.95)!) : null,
-        minMs: sorted.length ? sorted[0]! : null,
-        maxMs: sorted.length ? sorted.at(-1)! : null,
-        xcorr,
-        xcorrReason: reason,
-      };
     });
 
-    const events: LeadEventView[] = [...this.events].reverse().map(ev => {
-      const venueViews: Partial<Record<LeadVenue, LeadEventVenueView>> = {};
+    const byLead = new Map<LeadRefSource, { events: number; lags: Record<LeadVenue, number[]>; unfollowed: Record<LeadVenue, number>; bnLead: Record<LeadVenue, number> }>();
+    for (const src of this.activeLeads) {
+      byLead.set(src, {
+        events: 0,
+        lags: { lighter: [], rh: [], entropy: [] },
+        unfollowed: { lighter: 0, rh: 0, entropy: 0 },
+        bnLead: { lighter: 0, rh: 0, entropy: 0 },
+      });
+    }
+    for (const ev of this.recentSettled) {
+      const rec = byLead.get(ev.leadSource);
+      if (!rec) continue;
+      rec.events++;
       for (const venue of this.activeVenues) {
-        const vs = ev.venues[venue]!;
-        venueViews[venue] = {
-          status: vs.status,
-          lagMs: vs.lagMs,
-          maxMoveBps: vs.maxMoveBps === null ? null : Number(vs.maxMoveBps.toFixed(2)),
+        const cell = ev.venues[venue];
+        if (!cell) continue;
+        if (cell.status === 'followed' && cell.lagMs !== null) {
+          rec.lags[venue].push(cell.lagMs);
+          if (cell.lagMs > 0) rec.bnLead[venue]++;
+        } else if (cell.status === 'unfollowed') {
+          rec.unfollowed[venue]++;
+        }
+      }
+    }
+
+    const recentSummary: LeadWatcherRecentRow[] = this.activeLeads.map(leadSource => {
+      const rec = byLead.get(leadSource)!;
+      const venues: LeadWatcherRecentRow['venues'] = {};
+      for (const venue of this.activeVenues) {
+        const lags = rec.lags[venue];
+        const unfollowed = rec.unfollowed[venue];
+        const followed = lags.length;
+        const resolved = followed + unfollowed;
+        const m = median(lags);
+        venues[venue] = {
+          followed,
+          unfollowed,
+          followRate: resolved > 0 ? Number((followed / resolved).toFixed(4)) : null,
+          medianMs: m !== null ? Math.round(m) : null,
+          bnLeadRate: followed > 0 ? Number((rec.bnLead[venue] / followed).toFixed(4)) : null,
         };
       }
       return {
-        id: ev.id,
-        at: ev.wallMs,
-        direction: ev.direction === 1 ? 'up' : 'down',
-        baseMid: ev.baseMid,
-        triggerMid: ev.triggerMid,
-        moveBps: Number(ev.moveBps.toFixed(2)),
-        venues: venueViews,
+        leadSource,
+        name: LEAD_REF_NAMES[leadSource],
+        symbol: this.config.leads[leadSource]!,
+        events: rec.events,
+        venues,
       };
     });
 
     return {
-      id: this.id,
-      status: this.finishedAt === null ? 'running' : this.finishedReason === 'completed' ? 'completed' : 'stopped',
+      symbol: this.symbol,
       config: this.config,
+      enabled: meta.enabled,
+      status: meta.status,
+      createdAt: meta.createdAt,
+      updatedAt: meta.updatedAt,
       startedAt: this.startedAt,
-      finishedAt: this.finishedAt,
-      elapsedMs,
-      remainingMs,
-      eventCount: this.nextEventId,
+      runId: this.runId,
+      recentWindowSec: Math.round(LEAD_RECENT_WINDOW_MS / 1_000),
+      recentEventCount: this.recentSettled.length,
       streams,
-      venues,
-      events,
-      series: this.buildSeries(refMono, refWall),
+      recentSummary,
     };
   }
 }

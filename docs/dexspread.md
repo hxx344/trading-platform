@@ -959,3 +959,52 @@ v0.113.0 之后复查实盘链路，剩下四类问题：
 - **页面接口**：`GET lead`、`POST lead/start`、`POST lead/stop`、`POST lead/clear`、`POST lead/catalog`（经既有 `src/http.ts` `/api/varlighter/*` 与 `src/dex/protocol.ts` 路由转发）。
 - **本地验证**：最终通过 `pnpm check`、`pnpm build:web`、`node deploy/component-digests.mjs .`（执行面/控制面/行情面零新增依赖），定向回归 `test/dex-lead.test.ts`、`web/test/varlighter-form.test.mjs`、`test/varlighter.test.ts`、`test/dex-service.test.ts`、`test/lighter-book-top.test.ts`、`test/workspace-nav.test.ts`、`test/web-css.test.ts` 全量通过；独立只读两轮 R2 审查与 `scripts/dev-varlighter.ts --port 4745` 本地替身双端（`1280×900` 与 `390×844`）浏览器验收通过。
 - **未运行**：真实公网 Binance / Lighter / Entropy Live WS/REST 联调（本机网络/地区限制且不作为本批变更目标）、全仓与 Linux CI 交由 GitHub Actions Ubuntu CI 执行。
+
+## 22. Binance & 多参考源领先测速常驻化与离线分析（v0.117.0，R2，回滚版本 v0.116.1）
+
+### 22.1 升级范围与 R2 隔离边界
+
+在 v0.115.0 按需单会话基础上，将 `#/varlighter/lead` 升级为**多参考领先源常驻监测（最多 3 个标的、7 天数据落盘）+ 独立只读 Worker 线程离线分析**：
+
+- **物理库隔离与懒打开**：使用独立 SQLite 文件 `lead.sqlite`（`src/varlighter/lead-store.ts`，`LEAD_DB_FILE`），与 `varlighter.sqlite` 及 `executor.sqlite` 彻底隔离；仅在历史 `lead.sqlite` 已存在或首次访问测速接口时打开（`ensureLeadStore`），并在 `openLeadStore` 与 `ensureLeadStore` 异常路径显式关闭失败句柄不泄漏。库文件损坏或不可写仅令 `/lead*` 接口返回 `503 storage_unavailable` 或保留写错提示，不阻塞 `openVarLighter` 及 DEX 价差采样/交易主循环。
+- **跨进程协议零改动**：沿用 `/api/varlighter/*` 通配转发；不修改 `src/http.ts`、`src/dex/protocol.ts`、`src/dex/ipc.ts`、`src/read-token.ts` 与既有 `varlighter.sqlite` 表结构，`deploy/component-digests.mjs` 执行面、控制面与行情面均保持零新增导入。
+
+### 22.2 七大免 Key 领先参考源与目标适配（`src/varlighter/lead.ts`、`lead-streams.ts`）
+
+- **领先参考源（`LEAD_REF_SOURCES`）**：
+  - `binance_perp`：Binance USDⓈ-M 永续（`fapi/v1/exchangeInfo`；WS `fstream.binance.com/public/ws` `<sym>@bookTicker`）
+  - `binance_spot`：Binance 现货（`data-api.binance.vision/api/v3/ticker/bookTicker`；WS `stream.binance.com:9443/ws` `<sym>@bookTicker`，兼容省略 `e` 字段的现货精简推送）
+  - `binance_equity`：Binance 美股 / ETF 公开引号通道（`kindOf` 归类为 `equity`/`etf` 时自动配对大写代码；WS `nbstream.binance.com/equity/ws` `<SYM>@quote` 解析 `bp`/`ap`）
+  - `hl_xyz`：Hyperliquid HIP-3 `xyz` 美股/TradFi（`POST /info { type: 'metaAndAssetCtxs', dex: 'xyz' }`；WS `bbo` + 建连/45s `l2Book`）
+  - `coinbase_spot`：Coinbase Advanced Trade 美元现货（`api.exchange.coinbase.com/products`，优先 `USD`；WS `advanced-trade-ws.coinbase.com` 订阅 `ticker` + `heartbeats`）
+  - `okx_perp`：OKX V5 永续（`/api/v5/public/instruments?instType=SWAP`；WS `ws.okx.com:8443/ws/v5/public` `bbo-tbt` 逐笔一档 + 20s 文本 `'ping'`/`'pong'` 保活）
+  - `bybit_perp`：Bybit V5 线性永续（`/v5/market/instruments-info?category=linear&limit=1000`；WS `stream.bybit.com/v5/public/linear` `orderbook.1.<SYM>`，支持 `snapshot`、`u === 1` 重置及单边 `delta` 删档置空）
+- **去重与类别归并**：`canonicalBase` 统一别名组与前导 `1000` 缩尺，双 DEX 分别挂牌 `1000PEPE` 与 `PEPE` 时只产出一行去重候选，并兼顾 `PEPE`/`1000PEPE` 的资产类别识别。
+
+### 22.3 独立库结构、常驻控制与边界保护
+
+- **四表结构与索引（`src/varlighter/lead-store.ts`）**：
+  - `lead_watchers`：保存最多 `LEAD_MAX_WATCHERS = 3` 个常驻配置及 `updated_at`（L202 乐观锁）；
+  - `lead_runs`：记录每次运行区间，`startRun` 事务内自动闭合遗留 `ended_at IS NULL` 的历史运行记录；
+  - `lead_events`：已结算多源跃动跟随事件，建有 `(symbol, at)`、`(symbol, lead_source, at)`、`(at)` 与 `lead_events_run(run_id)` 索引；
+  - `lead_grid`：`PRIMARY KEY (symbol, at, source, run_id, grid_idx) WITHOUT ROWID`，建有 `lead_grid_at(at)` 与 `lead_grid_run(run_id)` 索引，仅存价变点、30s 心跳锚点与断线 `mid = NULL` 哨兵（递增 `seg_id`）。
+- **常驻生命周期与写错隔离**：
+  - 重启恢复在 DEX 市场目录同步前保持 `waiting_catalog`，目录就绪后由 `syncWaitingWatchers` 自动拉起连接；`removeWatcher` 先校验并原子删除 `lead_watchers` 再停流，避免 409 冲突误停在连流；`close()` 释放定时器、中止在途请求、终止在途 Worker、收口当前 runs 并置空句柄，此后公开接口统一返回 `503 unavailable`。
+  - `startRun` / `endRun` / `flushBatch` / `pruneBatch` 的异常仅写入 `lastWriteError`（不混用 `storageError`），防止每 30s 刷新的只读 `summary()` 掩盖写库失败；`startRuntime` 失败按标的进入 `30s` 冷却（并配 60s 日志节流）避免每秒刷屏报错。
+  - **内存与存储上限**：每流 tick 保留 `<= 8,000`、30m 滑窗保留 `<= 2,000` 条（`recentEventCount === recentSettled.length`）、待刷盘缓冲上限 `2,000` 事件 / `20,000` 网格点，每 1 秒攒批落盘、每 5 分钟按 `500` 条批量清理超过 `7` 天的旧数据与无引用旧 `lead_runs`。
+
+### 22.4 只读离线分析 Worker 与页面接口
+
+- **Worker 执行契约（`src/varlighter/lead-worker.ts`、`lead-streams.ts`）**：
+  - `POST lead/analyze` 调用前先执行 `flushNow()`（L054）确保刚结算样本立即可查；
+  - 仅放行 1 个并发分析 Worker（并发返 `429 lead_analyze_busy`），以 `{ workerData, env: {}, execArgv: [] }` 启动（L211），Worker 内以 `{ readOnly: true }` 与 `PRAGMA query_only=ON; BEGIN` 查询；
+  - 超时设为 `ANALYZE_TIMEOUT_MS = 7,500 ms`（`504 analyze_timeout`，严格低于 10s DEX IPC 读超时）。
+- **无损重建与统计口径**：
+  - 全查询跨度（1 小时–7 天）统计事件、时段均值桶与各源横向对比排行榜（`leaderboard` 含对三 DEX 综合中位延迟及 `500 ms` 收益率互相关得出的 `vsBinancePerpMs` / `vsBinancePerpCorr`）；
+  - 稀疏网格只读取末端最多 6 小时（超 6 小时置 `xcorrTruncated = true`），严格按 `(source, run_id)`、`ended_at` 与 `seg_id`/`mid === null` 断线哨兵重建，且 `LeadTracker` 30s 最后锚点与 Worker `MAX_STALE_SLOTS = 300`（30s）配合确保静默总外推严格 `<= 60s`；相对涨跌幅走势图自动收敛至实际有效起止区间均匀抽取 `<= 300` 点；前端 `web/src/api.ts` 将 `POST /api/varlighter/lead/analyze` 纳入 `query` 只读白名单，避免超时被误报成未知写入。
+- **路由清单**：`GET lead`、`POST lead/watchers/add`、`POST lead/watchers/toggle`、`POST lead/watchers/remove`、`POST lead/analyze`、`POST lead/clear`、`POST lead/catalog`。
+
+### 22.5 本版验证与未运行项
+
+- **已运行**：`pnpm check`（TypeScript 服务端与前端）、`pnpm build:web`、`node deploy/component-digests.mjs .`（组件指纹零泄漏，临时文件已清理）、8 组目标测试（`test/dex-lead.test.ts`、`web/test/varlighter-form.test.mjs`、`web/test/api.test.mjs`、`test/varlighter.test.ts`、`test/dex-service.test.ts`、`test/lighter-book-top.test.ts`、`test/workspace-nav.test.ts`、`test/web-css.test.ts`，120 项全通过）、两轮独立只读 R2 审查与修复闭环，以及基于 `node scripts/dev-varlighter.ts --port 4746` 的 `1280×900` / `390×844` 双视口浏览器验收。
+- **未运行**：真实公网各参考源/交易所生产端点联调（本地不做实盘/公网压测），以及完整 Ubuntu Linux CI（交由 GitHub Actions 执行）。

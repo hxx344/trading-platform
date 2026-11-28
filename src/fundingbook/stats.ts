@@ -55,12 +55,18 @@ export interface RiskModel {
 /** 一个标的至少要有这么多个小时收益才进风险模型（7 天）。 */
 export const MIN_RETURNS = 168;
 
-function hourlyReturns(points: readonly PricePoint[], from: number, now: number): Map<number, number> {
-  const sorted = points.filter(point => point.time > from && point.time <= now && point.close > 0).sort((a, b) => a.time - b.time);
+/** 第一个窗口内收益所需的前一个整点收盘价。 */
+export const riskAnchor = (now: number, volDays: number): number => Math.floor(now / HOUR) * HOUR - volDays * DAY;
+
+function hourlyReturns(points: readonly PricePoint[], anchor: number, now: number): Map<number, number> {
+  const closes = new Map<number, number>();
+  for (const { time, close } of points) {
+    if (time >= anchor && time <= now && time % HOUR === 0 && Number.isFinite(close) && close > 0) closes.set(time, Math.log(close));
+  }
   const returns = new Map<number, number>();
-  for (let index = 1; index < sorted.length; index++) {
-    const previous = sorted[index - 1], current = sorted[index];
-    if (current.time - previous.time === HOUR) returns.set(current.time, Math.log(current.close / previous.close));
+  for (const [end, close] of closes) {
+    const previous = closes.get(end - HOUR);
+    if (previous !== undefined) returns.set(end, close - previous);
   }
   return returns;
 }
@@ -71,8 +77,8 @@ function hourlyReturns(points: readonly PricePoint[], from: number, now: number)
  * 不足 MIN_RETURNS 的标的不进模型。
  */
 export function riskModel(series: ReadonlyMap<string, readonly PricePoint[]>, now: number, volDays: number): RiskModel {
-  const from = now - volDays * DAY;
-  let entries = [...series].map(([base, points]) => ({ base, returns: hourlyReturns(points, from, now) })).filter(entry => entry.returns.size >= MIN_RETURNS);
+  const anchor = riskAnchor(now, volDays);
+  let entries = [...series].map(([base, points]) => ({ base, returns: hourlyReturns(points, anchor, now) })).filter(entry => entry.returns.size >= MIN_RETURNS);
   let common: number[] = [];
   for (;;) {
     common = entries.length ? [...entries[0].returns.keys()].filter(time => entries.every(entry => entry.returns.has(time))) : [];

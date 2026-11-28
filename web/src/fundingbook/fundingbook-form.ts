@@ -13,7 +13,7 @@ export const fundingBookHref = (tab: FundingBookTab): string => tab === 'overvie
 
 export function parseState(raw: unknown): StateView {
   const value = raw as Partial<StateView> | null;
-  if (!value || typeof value !== 'object' || !value.settings || !Array.isArray(value.legs) || !Array.isArray(value.rounds) || !Array.isArray(value.venues) || !value.collect || !Array.isArray(value.collect.errors)) throw new Error('应答格式不对');
+  if (!value || typeof value !== 'object' || !value.settings || !value.recovery || !Array.isArray(value.legs) || !Array.isArray(value.rounds) || !Array.isArray(value.venues) || !value.collect || !Array.isArray(value.collect.errors)) throw new Error('应答格式不对');
   return value as StateView;
 }
 
@@ -52,9 +52,9 @@ export function stepText(step: PlanStep): string {
 
 /** 页面现在该提示什么：没有行情、没启用、回补中、规划失败。没有要提示的为 null。 */
 export function notice(state: Pick<StateView, 'running' | 'settings' | 'collect' | 'roundError' | 'round'>): { tone: 'info' | 'warning' | 'error'; text: string } | null {
+  if (state.roundError) return { tone: 'error', text: `本轮规划不可用。${state.roundError}` };
   if (!state.settings.enabled) return { tone: 'info', text: '模块还没有启用。在「设置」页签核对账户、标的与参数后打开「启用」，之后只采集公开行情、求解并记模拟盘，不读账户、不下单。' };
   if (!state.running) return { tone: 'warning', text: '合约价差监控没有运行，本模块不采集也不规划。到「行情监控」页打开合约价差后自动继续。' };
-  if (state.roundError) return { tone: 'error', text: `上一次规划没有完成：${state.roundError}` };
   if (!state.round && state.collect.total > 0 && state.collect.done < state.collect.total) return { tone: 'info', text: `正在回补资金费与价格历史：${state.collect.done} / ${state.collect.total} 条序列已补齐，补齐后开始第一轮规划。` };
   return null;
 }
@@ -127,5 +127,5 @@ export function settingsChanged(form: SettingsForm, settings: Settings): boolean
   const request = settingsRequest(form);
   return !request.ok || JSON.stringify(settingsForm(request.body)) !== JSON.stringify(settingsForm(settings));
 }
-export const resetConfirmText = (state: Pick<StateView, 'settings' | 'rounds'>): string =>
-  `重置模拟盘：清掉全部模拟持仓、现金与 ${state.rounds.length} 轮规划记录，按本金 ${usd(state.settings.capital)} 重新开始。已回补的行情历史保留。确定吗？`;
+export const resetConfirmText = (state: Pick<StateView, 'settings' | 'rounds' | 'recovery'>): string =>
+  `确认后删除${state.recovery.book ? '原始账本、' : ''}全部模拟持仓、现金和规划记录（最近 ${state.rounds.length} 轮可见）。${state.recovery.settings ? '恢复参数后才能重新规划。' : `下一轮规划按本金 ${usd(state.settings.capital)} 重新开始。`}已回补的行情历史保留。`;

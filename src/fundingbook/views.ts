@@ -56,11 +56,14 @@ export interface StateView {
   venues: typeof VENUE_SPECS;
   collect: CollectView;
   roundError: string | null;
+  /** 仅异常的持久记录需要显式恢复。参数不可读时 settings 是供编辑的初值。 */
+  recovery: { settings: string | null; book: string | null };
   solving: boolean;
   lastRoundAt: number | null;
   nextRoundAt: number | null;
   legs: LegView[];
   risk: RiskView | null;
+  /** 本轮不可用时为 null。最后成功规划仍可从 rounds 按 id 读取。 */
   round: RoundView | null;
   rounds: ({ id: number; at: number } & RoundSummary)[];
   book: BookView | null;

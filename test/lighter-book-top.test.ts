@@ -2,7 +2,7 @@
 // 行情都是假的：WebSocket 由测试替换，不连任何外部服务。
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { BOOK_TOP_SILENT_MS, LighterStream, type SocketLike } from '../src/varlighter/feeds.ts';
+import { BOOK_TOP_SILENT_MS, LighterStream, TOP_MAX_AGE_MS, type SocketLike } from '../src/varlighter/feeds.ts';
 
 const T0 = Date.parse('2026-11-23T15:00:00Z');
 
@@ -257,5 +257,62 @@ test('market_stats 没报过的市场：盘口作废后没有一档可用，不�
     assert.deepEqual(h.top(2), [49.9, 50.1]);
     h.book('subscribed', { code: 0, bids: [h.level('99.96')], asks: [h.level('100.04')], nonce: 9 });
     assert.deepEqual(h.top(), [99.96, 100.04], '新快照到了再用盘口的');
+  } finally { h.stream.close(); }
+});
+
+test('同价盘口恢复以本次深度为一档确认；重放 stats 和标记价变化不能给盘口一档续期', () => {
+  const h = harness(), stats = { 1: { best_bid_price: '99', best_ask_price: '101' } };
+  const book = (bid: string, ask: string) => h.book('subscribed', { nonce: 1, bids: [h.level(bid)], asks: [h.level(ask)] });
+  try {
+    h.stats('subscribed', stats);
+    book('100', '100.5');
+    h.state.clock += 40_000;
+    h.book('update', { bids: [], asks: [], begin_nonce: 5, nonce: 6 });
+    assert.equal(h.stream.topAt(1, h.state.clock)?.at, T0);
+    h.tops.length = 0;
+    h.state.clock += 1_000; book('99', '101');
+    const recoveredAt = h.state.clock;
+    assert.deepEqual([h.stream.depth(1)?.at, h.stream.topAt(1, recoveredAt)?.at, h.tops], [recoveredAt, recoveredAt, []]);
+    assert.equal(h.stream.topAt(1, recoveredAt - 1)?.at, T0);
+    h.state.clock += 12_000;
+    h.stats('subscribed', stats);
+    h.stats('update', { 1: { mark_price: '100.01' } });
+    const current = h.stream.topAt(1, h.state.clock)!;
+    assert.deepEqual([h.stream.depth(1)?.at, current.at, current.mark, h.tops], [recoveredAt, recoveredAt, 100.01, []]);
+    const metaAt = h.state.clock;
+    const events = (h.stream as unknown as { top: Map<number, unknown[]> }).top.get(1)!;
+    const eventCount = events.length;
+    for (let n = 1; n <= 20; n++) {
+      h.state.clock += 5;
+      h.book('update', { bids: [h.level('99', String(n))], asks: [], begin_nonce: n, nonce: n + 1 });
+    }
+    assert.equal(h.stream.topAt(1, metaAt + 37)?.at, metaAt + 35, '回看只采信目标时刻之前已收到的同价深度');
+    assert.deepEqual([h.stream.topAt(1, h.state.clock)?.at, h.tops], [h.state.clock, []]);
+    assert.equal(events.length, eventCount, '同价增量只保留确认时刻');
+    const bookAt = h.state.clock;
+    h.state.clock += TOP_MAX_AGE_MS + 1; h.stats('subscribed', stats);
+    assert.deepEqual([h.stream.topAt(1, h.state.clock)?.at, h.stream.depth(1)?.at, h.tops], [h.state.clock, bookAt, []], '盘口一档过期后采用有效的 stats 报价；深度仍按自己的接收时间');
+    h.stats('update', { 1: { best_bid_price: '98' } });
+    assert.match(h.stream.depthError(1)!, /没有跟上一档/, '切到 stats 后仍检查深度错位');
+  } finally { h.stream.close(); }
+});
+
+test('失效后无可用 stats 时保存断档前的一档，直到收到新快照才结束空窗', () => {
+  const h = harness();
+  try {
+    h.stats('subscribed', { 1: { best_bid_price: '99', best_ask_price: '101' } });
+    h.state.clock += 78_000;
+    h.book('subscribed', { nonce: 1, bids: [h.level('100.5')], asks: [h.level('100.6')] });
+    const validAt = h.state.clock;
+    h.state.clock += 2_000;
+    h.book('update', { bids: [], asks: [], begin_nonce: 9, nonce: 10 });
+    const lostAt = h.state.clock;
+    assert.deepEqual(h.top(1, validAt), [100.5, 100.6], '迟到报价可对齐断档前的样本');
+    assert.equal(h.top(1, lostAt), null);
+    h.state.clock += 1_000;
+    h.book('subscribed', { nonce: 11, bids: [h.level('100.7')], asks: [h.level('100.8')] });
+    assert.equal(h.top(1, lostAt + 999), null, '新快照不会回填过去的空窗');
+    assert.deepEqual(h.top(), [100.7, 100.8]);
+    assert.deepEqual(h.top(1, validAt), [100.5, 100.6]);
   } finally { h.stream.close(); }
 });

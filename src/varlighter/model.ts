@@ -413,24 +413,16 @@ export const bothLive = (key: string): boolean => { const parsed = parsePairKey(
 export type SizeBucket = '1k' | '100k';
 /** 名义金额对应的报价档：不超过 1000 美元用 1k 档，更大用 100k 档（偏保守）。 */
 export const bucketOf = (notional: number): SizeBucket => notional <= 1000 ? '1k' : '100k';
-/** 按数量折算的市值与名义金额相差不超过这个比例时，沿用名义金额的档位。 */
-export const BUCKET_DRIFT = 0.2;
-/**
- * 按实际数量取价的一条腿（持仓平仓与止损、Var 精确询价后的对冲腿）用哪一档：市值在名义金额 ±20% 以内沿用名义金额的档位，
- * 超出才按市值取档。1000 美元的仓正好在分档线上，价格涨一分钱市值就过线；不留这段余量，它的平仓与止损会按 10 万美元的盘口冲击算。
- */
-export const sizeBucket = (usd: number, notionalUsd: number): SizeBucket =>
-  bucketOf(Math.abs(usd - notionalUsd) <= notionalUsd * BUCKET_DRIFT ? notionalUsd : usd);
 
 /**
- * 可成交价差。prices 里 B 腿的价已乘过乘数（折成 A 的单位），持仓数量按 A 的单位算；B 腿实际数量 = 数量 × 乘数，
- * 实际价格 = 折算价 ÷ 乘数。乘数为 1 时两者相同。
+ * 可成交价差。prices 里 B 腿的价已乘过乘数，折成 A 的单位。B 腿原生价格 = 折算价 ÷ 乘数；
+ * 模拟对冲按 A 数量 × 乘数，实盘按 B 腿实际成交数量取价。
  */
 export interface Spread {
   /** 两边中间价的基差（基点，相对折算后的 B 中间价）：A 贵为正。 */ mid: number;
   /** 卖 A、买 B 的可成交价差（基点）。 */ sellA: number;
   /** 买 A、卖 B 的可成交价差（基点）。 */ buyA: number;
-  /** 有腿降档、使用历史盘口，或所需金额超出公开档位时为估算。 */ estimated: boolean;
+  /** 按公开档插值、降档、使用历史盘口或超出已知深度时为估算。 */ estimated: boolean;
   prices: { aBid: number; aAsk: number; bBid: number; bAsk: number; bMid: number };
   /** Var 成交价来源，0 表示公开一档。精确询价另带折算成 A 的实际数量。 */
   varSource?: VarPriceSource; varQtyA?: number;
@@ -448,33 +440,75 @@ function combineSpread(a: LegPrice, b: LegPrice, ratio: number): Spread {
     estimated: a.estimated || b.estimated, prices: { aBid: a.bid, aAsk: a.ask, bBid, bAsk, bMid } };
 }
 type Bucket = SizeBucket | '0';
-export type VarPriceSource = 'token' | Bucket;
+type PublicPriceSource = Bucket | 'interpolated' | 'mixed';
+export type VarPriceSource = 'token' | PublicPriceSource;
 
-function publicLeg(sample: Sample, side: Side, bucket: SizeBucket, bid: number, ask: number, closing: boolean): (LegPrice & { bucket: Bucket }) | null {
+type BookSide = 'Bid' | 'Ask';
+/** 将对齐时刻该侧的 VWAP 冲击平移到选用的一档。 */
+function quoteAtTop(sample: Sample, side: Side, bookSide: BookSide, bucket: Bucket, top: number): number | null {
+  const price = sample[`${side}${bookSide}${bucket}`];
+  if (price == null) return null;
+  const aligned = sample[`${side}${bookSide}0`];
+  const filled = bookSide === 'Bid' ? top - Math.max(0, aligned - price) : top + Math.max(0, price - aligned);
+  return filled > 0 && Number.isFinite(filled) ? filled : null;
+}
+
+function publicLeg(sample: Sample, side: Side, bucket: SizeBucket, bid: number, ask: number): (LegPrice & { bucket: Bucket }) | null {
   let used: Bucket = bucket;
-  if (sample[`${side}Bid${used}`] === null || sample[`${side}Ask${used}`] === null) {
-    if (bucket === '100k' && !closing) return null;
-    used = sample[`${side}Bid1k`] !== null && sample[`${side}Ask1k`] !== null ? '1k' : '0';
+  if (sample[`${side}Bid${used}`] == null || sample[`${side}Ask${used}`] == null) {
+    if (bucket === '100k') return null;
+    used = '0';
   }
-  // 对手腿盘口的冲击沿用对齐时刻，整体平移到选用的一档；历史报价的平移量为零。
-  const filledBid = bid - Math.max(0, sample[`${side}Bid0`] - sample[`${side}Bid${used}`]!);
-  const filledAsk = ask + Math.max(0, sample[`${side}Ask${used}`]! - sample[`${side}Ask0`]);
-  if (!(filledBid > 0 && filledAsk >= filledBid)) return null;
+  const filledBid = quoteAtTop(sample, side, 'Bid', used, bid), filledAsk = quoteAtTop(sample, side, 'Ask', used, ask);
+  if (filledBid === null || filledAsk === null || filledAsk < filledBid) return null;
   return { bid: filledBid, ask: filledAsk, mid: (bid + ask) / 2, estimated: used !== bucket, bucket: used };
 }
 
 /** 指定公共档位的可成交价差。开仓信号只看对齐样本，大档缺价时不能用小档发现信号。 */
 export function spreadOf(sample: Sample, bucket: SizeBucket): Spread | null {
-  const a = publicLeg(sample, 'a', bucket, sample.aBid0, sample.aAsk0, false);
-  const b = publicLeg(sample, 'b', bucket, sample.bBid0, sample.bAsk0, false);
+  const a = publicLeg(sample, 'a', bucket, sample.aBid0, sample.aAsk0);
+  const b = publicLeg(sample, 'b', bucket, sample.bBid0, sample.bAsk0);
   return a && b ? combineSpread(a, b, sample.ratio) : null;
 }
 
-export interface QuoteTarget { notionalUsd: number; qty?: number; ratio?: number; symbol?: string }
-/** Var 原生合约数量。新单按标记价取四位有效数字；持仓只用可精确表示的实际数量（B 腿为 A 数量乘乘数）。 */
+/** 买卖两侧的深度相互独立，一侧缺档不能改变另一侧的成交价。 */
+function sizedPrice(sample: Sample, side: Side, bookSide: BookSide, top: number, usd: number, target: QuoteTarget): { price: number; bucket: PublicPriceSource; estimated: boolean } | null {
+  const small = quoteAtTop(sample, side, bookSide, '1k', top);
+  const lowerUsd = small === null ? 0 : 1_000, lowerPrice = small ?? top;
+  if (usd <= lowerUsd) return { price: lowerPrice, bucket: '1k', estimated: false };
+  const large = quoteAtTop(sample, side, bookSide, '100k', top);
+  if (large === null) {
+    // 旧样本只有小档时，持仓仍可估值；小额 Var 询价对冲沿用原有两成余量，明确标估算。
+    const smallHedge = usd <= 1_000 || (small !== null && target.notionalUsd <= 1_000 && usd <= 1.2 * target.notionalUsd);
+    return target.qty !== undefined || smallHedge ? { price: lowerPrice, bucket: small === null ? '0' : '1k', estimated: true } : null;
+  }
+  if (usd >= 100_000) {
+    if (usd > 100_000 && target.qty === undefined) return null;
+    return { price: large, bucket: '100k', estimated: usd > 100_000 };
+  }
+  const weight = (usd - lowerUsd) / (100_000 - lowerUsd);
+  return { price: lowerPrice + weight * (large - lowerPrice), estimated: true, bucket: 'interpolated' };
+}
+
+function sizedPublicLeg(sample: Sample, side: Side, bid: number, ask: number, usd: number, target: QuoteTarget): (LegPrice & { bucket: PublicPriceSource }) | null {
+  if (!(usd > 0 && Number.isFinite(usd))) return null;
+  const buy = sizedPrice(sample, side, 'Ask', ask, usd, target), sell = sizedPrice(sample, side, 'Bid', bid, usd, target);
+  if (!sell || !buy || buy.price < sell.price) return null;
+  return { bid: sell.price, ask: buy.price, mid: (bid + ask) / 2, estimated: sell.estimated || buy.estimated,
+    bucket: sell.bucket === buy.bucket ? sell.bucket : 'mixed' };
+}
+
+export interface QuoteTarget { notionalUsd: number; qty?: number; bQty?: number; ratio?: number; symbol?: string }
+/** 实盘 B 腿按该所步长成交；历史与回测仓没有单列 B 数量，用配对乘数还原。 */
+function nativeQty(target: QuoteTarget, side: Side, ratio: number, hedgeQtyA?: number): number | undefined {
+  const qtyA = target.qty ?? hedgeQtyA;
+  if (qtyA === undefined || side === 'a') return qtyA;
+  return target.bQty ?? qtyA * ratio;
+}
+/** Var 原生合约数量。新单按标记价取四位有效数字，持仓只用可精确表示的实际数量。 */
 export function varQuoteQty(target: QuoteTarget, side: Side, ratio: number, mark: number | null): string | null {
   const held = target.qty !== undefined;
-  const raw = held ? target.qty! * (side === 'a' ? 1 : ratio) : target.notionalUsd / (mark ?? 0);
+  const raw = nativeQty(target, side, ratio) ?? target.notionalUsd / (mark ?? 0);
   if (!(raw > 0 && raw < 1e12)) return null;
   const rounded = held ? raw : Number(raw.toPrecision(4));
   if (rounded >= 1e12) return null;
@@ -519,10 +553,11 @@ function fillLeg(sample: Sample, side: Side, venue: VenueId, target: QuoteTarget
       missingTop = true;
     }
   }
-  const qtyA = target.qty ?? hedgeQtyA;
-  const usd = qtyA === undefined ? target.notionalUsd : qtyA * (side === 'a' ? 1 : sample.ratio) * ((bid + ask) / 2);
-  const level = publicLeg(sample, side, sizeBucket(usd, target.notionalUsd), bid, ask, closing);
-  return level && { ...level, at, estimated: level.estimated || usd > 100_000 || missingTop || (execution && at === null),
+  const qty = nativeQty(target, side, sample.ratio, hedgeQtyA);
+  const level = qty === undefined
+    ? publicLeg(sample, side, bucketOf(target.notionalUsd), bid, ask)
+    : sizedPublicLeg(sample, side, bid, ask, qty * ((bid + ask) / 2), target);
+  return level && { ...level, at, estimated: level.estimated || missingTop || (execution && at === null),
     varSource: venue === 'var' ? level.bucket : undefined };
 }
 

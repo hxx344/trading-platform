@@ -8,6 +8,7 @@ import { api } from '../api.ts';
 import { useDialogGuard } from '../AppDialog.tsx';
 import { Callout, StatePanel, TableEmpty } from '../StateViews.tsx';
 import { useLiveResource } from '../use-live-resource.ts';
+import { readFailure } from '../live-resource.ts';
 import type { OrphanRow, PositionSummary, StateRow, StateView, VenueStatus } from '../../../src/varlighter/views.ts';
 import { Badge, Metric, useWrite } from './parts.tsx';
 import { VarLighterAccounts } from './VarLighterAccounts.tsx';
@@ -16,7 +17,7 @@ import { VarLighterLead } from './VarLighterLead.tsx';
 import { VarLighterReady } from './VarLighterReady.tsx';
 import {
   IDENTITY_LABELS, LIVE_STATE_LABELS, OVERVIEW_MODES, OVERVIEW_MODE_KEY, REGIME_LABELS, SIMPLE_SORT_KEYS, VARLIGHTER_BASE, VARLIGHTER_TABS, age, baselineMissing, blockedAtEntry, sampleStale, bps, comboShort, gateNote, type GateNote, costBreakdown, directionLabel, directionShort, directionSides, entryProgress, fundingAnnual, matchesCombo, matchesQuery, plain,
-  quickEnableBody, readOverviewMode, settingsBody, signal, signedUsd, sortRows, tone, usd, varLighterHref, venueShort, type ComboFilter, type OverviewMode, type SortKey, type VarLighterTab,
+  parseState, quickEnableBody, readOverviewMode, settingsBody, signal, signedUsd, sortRows, tone, usd, varLighterHref, venueShort, type ComboFilter, type OverviewMode, type SortKey, type VarLighterTab,
 } from './varlighter-form.ts';
 
 export const STATE_PATH = `${VARLIGHTER_BASE}/state`;
@@ -28,15 +29,11 @@ const READ_TIMEOUT_MS = 15_000;
 export function useVarLighterState(onExpired: () => void) {
   return useLiveResource<StateView>(STATE_PATH, { intervalMs: STATE_REFRESH_MS, timeoutMs: READ_TIMEOUT_MS, parse: parseState, onExpired });
 }
-function parseState(raw: unknown): StateView {
-  const value = raw as StateView | null;
-  if (!value || typeof value !== 'object' || !Array.isArray(value.rows) || !value.sources || !value.settings) throw new Error('应答格式不对');
-  return value;
-}
 
 export function VarLighterPage({ tab, symbol, onExpired }: { tab: VarLighterTab; symbol: string | null; onExpired: () => void }) {
   const live = useVarLighterState(onExpired);
   const { data, error, status, receivedAt } = live;
+  const failure = readFailure(live);
   return <div className="vl-page" data-varlighter>
     <header className="wb-heading"><div><h1>DEX 价差</h1>
       <p>比较同一资产在 Var、Lighter RH、Lighter 主网与 Entropy 上的价格。价差明显偏离平时水平时开仓，回到平时水平后平仓；实盘打开并勾选的配对在两个交易所下真实订单。</p></div>
@@ -44,10 +41,10 @@ export function VarLighterPage({ tab, symbol, onExpired }: { tab: VarLighterTab;
     <nav className="vl-tabs" aria-label="DEX 价差页签">
       {VARLIGHTER_TABS.map(item => <a key={item.id} href={varLighterHref(item.id, item.id === 'detail' ? symbol : null)} aria-current={tab === item.id ? 'page' : undefined}>{item.label}</a>)}
     </nav>
-    {error && data ? <p className="vl-note err" role="status">刷新失败：{error.message}（数据停留在 {receivedAt ? new Date(receivedAt).toLocaleTimeString() : '—'}）</p> : null}
+    {failure && data ? <p className="vl-note err" role="status">刷新失败：{failure}（数据停留在 {receivedAt ? new Date(receivedAt).toLocaleTimeString() : '—'}）</p> : null}
     {!data
       ? status === 'error' || status === 'offline' ? <StatePanel kind="error" title="读取价差模块失败" detail={error?.message ?? '网络离线'} /> : <StatePanel kind="loading" title="加载中…" />
-      : tab === 'overview' ? <Overview view={data} onChanged={live.refresh} />
+      : tab === 'overview' ? <Overview view={data} signalTime={status === 'ready' ? data.now : null} onChanged={live.refresh} />
         : tab === 'detail' ? <VarLighterDetail view={data} symbol={symbol} onChanged={live.refresh} onExpired={onExpired} />
           : tab === 'accounts' ? <VarLighterAccounts onExpired={onExpired} />
             : tab === 'lead' ? <VarLighterLead onExpired={onExpired} />
@@ -74,7 +71,7 @@ function VenueChip({ status, now }: { status: VenueStatus; now: number }) {
   return <span className={`vl-chip ${chipTone}`} title={detail || undefined}><i />{status.name} {stream?.connected ? `${status.pairs} 对` : '未连接'}{status.depth.length ? ` · 盘口 ${status.depth.length - staleDepth}/${status.depth.length}` : ''}</span>;
 }
 
-function Overview({ view, onChanged }: { view: StateView; onChanged: () => Promise<void> }) {
+function Overview({ view, signalTime, onChanged }: { view: StateView; signalTime: number | null; onChanged: () => Promise<void> }) {
   const [sort, setSort] = useState<{ key: SortKey; descending: boolean }>({ key: 'gap', descending: true });
   const [query, setQuery] = useState('');
   const [onlyEnabled, setOnlyEnabled] = useState(false);
@@ -82,7 +79,7 @@ function Overview({ view, onChanged }: { view: StateView; onChanged: () => Promi
   const orphanWrite = useWrite(), enableWrite = useWrite();
   const [combo, setCombo] = useState<ComboFilter>('all');
   const deferred = useDeferredValue(query);
-  const rows = sortRows(view.rows.filter(row => matchesQuery(row, deferred) && matchesCombo(row, combo) && (!onlyEnabled || row.enabled || row.position)), sort.key, sort.descending);
+  const rows = sortRows(view.rows.filter(row => matchesQuery(row, deferred) && matchesCombo(row, combo) && (!onlyEnabled || row.enabled || row.position)), sort.key, sort.descending, signalTime);
   const combos = (view.sources.combos ?? []).filter(item => item.enabled && item.pairs > 0);
   const customCount = view.rows.filter(row => row.custom).length;
   const filters: { id: ComboFilter; label: string }[] = [{ id: 'all', label: '全部' }, ...combos.map(item => ({ id: item.combo, label: comboShort(item.combo) })), ...(customCount ? [{ id: 'custom' as const, label: '手动' }] : [])];
@@ -90,8 +87,8 @@ function Overview({ view, onChanged }: { view: StateView; onChanged: () => Promi
   const counts = { verified: 0, review: 0, mismatch: 0 };
   for (const row of view.rows) counts[row.identity]++;
   // 样本过期的行不算机会，也不高亮：最后一个样本到过线不代表现在还在线上。
-  const hits = view.rows.filter(row => !isStale(row, view.now) && (signal(row)?.gap ?? -1) >= 0).length;
-  const blocked = blockedAtEntry(view.rows, view.now);
+  const hits = view.rows.filter(row => !isStale(row, signalTime) && (signal(row)?.gap ?? -1) >= 0).length;
+  const blocked = blockedAtEntry(view.rows, signalTime);
   const trading = view.trading;
   const simple = mode === 'simple';
   const changeMode = (next: OverviewMode) => {
@@ -108,11 +105,11 @@ function Overview({ view, onChanged }: { view: StateView; onChanged: () => Promi
     void enableWrite.run(`enable:${row.key}`, async () => { await api(`${VARLIGHTER_BASE}/settings`, { body: quickEnableBody(view.settings, row.key, on) }); await onChanged().catch(() => {}); },
       () => { return on ? `${label} 已启用策略，入场、出场、止损与最长持有按推荐值自动配置${view.trading.on && view.trading.pairs.includes(row.key) ? '' : '；还要在实盘准备页打开实盘并勾选这个配对才会下单'}` : `${label} 已停用${row.position ? '，已有实盘持仓照常平仓' : ''}`; });
   };
-  const enableProps = { now: view.now, multi, busy: enableWrite.busy !== null, onToggle: toggle };
+  const enableProps = { now: view.now, signalTime, multi, busy: enableWrite.busy !== null, onToggle: toggle };
   const pairFoot = [...combos.map(item => `${comboShort(item.combo)} ${item.pairs}`), customCount ? `手动 ${customCount}` : '', counts.review ? `待确认 ${counts.review}` : '', counts.mismatch ? `规格不同 ${counts.mismatch}` : ''].filter(Boolean).join(' · ');
   return <>
     <section className="vl-metrics" aria-label="概览">
-      <Metric label="开仓机会" value={`${hits} 个`} tone={hits ? 'up' : ''} accent={hits > 0} foot={`${hits ? '价差偏离已到开仓线，表格里绿色高亮；含只采集、不下单的配对' : '暂时没有配对的偏离到开仓线'}${blocked ? ` · 已启用的里到线被挡 ${blocked} 个，原因见表格` : ''}`} />
+      <Metric label="开仓机会" value={signalTime === null ? '—' : `${hits} 个`} tone={hits ? 'up' : ''} accent={hits > 0} foot={signalTime === null ? '等待读取最新行情' : `${hits ? '价差偏离已到开仓线，表格里绿色高亮；含只采集、不下单的配对' : '暂时没有配对的偏离到开仓线'}${blocked ? ` · 已启用的里到线被挡 ${blocked} 个，原因见表格` : ''}`} />
       <Metric label="监控中的配对" value={`${view.rows.length} 个`} foot={pairFoot || '还没有配对'} />
       <Metric label="实盘今日净盈亏" value={signedUsd(trading.todayNetUsd)} tone={tone(trading.todayNetUsd)} foot={trading.on ? '实盘已打开 · 明细在实盘准备页' : '实盘关闭，不开新仓'} />
       <Metric label="实盘持仓" value={`${trading.open} 笔`} foot={`名义金额 ${usd(trading.openNotionalUsd, 0)}（含开仓中、平仓中、待处理）`} />
@@ -150,7 +147,7 @@ function Overview({ view, onChanged }: { view: StateView; onChanged: () => Promi
           <dt>交易成本</dt><dd>开仓加平仓、两条腿合计要付的成本（不含滑点），小字把它分成两项：「买卖价差」是两个场所买价与卖价之间的差，开仓和平仓各吃一次；「手续费」是两条腿开平共四次成交付给场所的费用。偏离要明显大于合计才有利润；买卖价差写「估算」的是按一档价估算，写「手续费未知」的合计只有买卖价差。</dd>
           <dt>还想看更多</dt><dd>右上角切到「完整」，可以看基线、偏离 σ、两个方向的可成交价差、资金费和样本数。</dd>
         </dl> : <p>有 Var 腿的每分钟一个 Var 报价、对齐对手腿当时的一档；两腿都是行情流的每 5 秒（未启用每 20 秒），已启用或有持仓的一档一有变化就判断开平仓。策略一列勾选即启用并用自动配置（入场、出场、止损、最长持有取推荐值，约 10 分钟更新），信号列的入场阈值是当前生效的值。A 是配对键里的第一条腿（有 Var 时为 Var）。卖 A 价差 = A 买价 ÷（乘数 × B 卖价）− 1，买 A 价差 = A 卖价 ÷（乘数 × B 买价）− 1，按各配对名义金额取档（≤ 1000 美元用 1k 档）；往返成本 = 买卖价差（买 A 价差 − 卖 A 价差，两腿盘口的往返成本）+ 手续费（两腿开平四次成交，2 ×（A 费率 + B 费率）），不含滑点，小字分列这两项；
-          已启用或有持仓的配对订阅行情流腿的完整盘口（WebSocket）算冲击，其余用一档价估算（标「估」）。信号列是离入场最近的一侧：偏离 − 入场阈值，≥ 0 即达到开仓条件。资金费只作参考，两腿都折成年化。</p>}
+          已启用或有持仓的配对订阅行情流腿的完整盘口（WebSocket）算冲击，其余用一档价估算（标「估」）。信号列只比较允许开仓的方向，偏离减入场阈值达到 0 即到线。资金费只作参考，两腿都折成年化。</p>}
       </details>
     </section>
   </>;
@@ -211,7 +208,7 @@ function SymbolCell({ row, multi, simple }: { row: StateRow; multi: boolean; sim
     {row.identity !== 'verified' && !(simple && confirmed) ? <Badge tone={row.identity === 'mismatch' ? 'bad' : row.eligible ? 'ok' : 'warn'}>{confirmed ? '已确认' : IDENTITY_LABELS[row.identity]}</Badge> : null}
     <small>{simple ? [row.name, row.kindName].filter(Boolean).join(' · ') : row.name}</small></td>;
 }
-type EnableProps = { row: StateRow; now: number; multi: boolean; busy: boolean; onToggle: (row: StateRow, on: boolean) => void };
+type EnableProps = { row: StateRow; now: number; signalTime: number | null; multi: boolean; busy: boolean; onToggle: (row: StateRow, on: boolean) => void };
 function EnableCell({ row, now, busy, onToggle }: EnableProps) {
   // 规格没确认或不同的配对服务端不让启用；已启用的总能停用。
   const locked = !row.enabled && !row.eligible;
@@ -243,11 +240,11 @@ function GateLine({ note }: { note: GateNote | null }) {
 function SimpleRow(props: EnableProps) {
   const { row, now, multi } = props;
   const progress = entryProgress(row);
-  const stale = isStale(row, now);
+  const stale = isStale(row, props.signalTime);
   const reached = !!progress?.reached && !stale;
   // 偏离不为正时按这个方向做，回到平时水平也赚不到，不给买卖提示。
-  const sides = progress && progress.deviation > 0 ? directionSides(progress.direction, row.a.venue, row.b.venue) : null;
-  const gate = gateNote(row, now);
+  const sides = !stale && progress && progress.deviation > 0 ? directionSides(progress.direction, row.a.venue, row.b.venue) : null;
+  const gate = gateNote(row, props.signalTime);
   return <tr className={rowClass(reached, gate)}>
     <SymbolCell row={row} multi={multi} simple />
     <EnableCell {...props} />
@@ -255,7 +252,7 @@ function SimpleRow(props: EnableProps) {
       {stale ? <small className="vl-warn">{row.sampleAt ? `${age(row.sampleAt, now)}的数据` : '暂无数据'}</small>
         : <small title={row.baseline ? `${row.baseline.fallback ? '全天' : REGIME_LABELS[row.baseline.regime]}基线，${row.baseline.samples} 个样本` : undefined}>{row.baseline ? `平时 ${bps(row.baseline.median)}` : baselineMissing(row, true)}</small>}</td>
     <td>{progress ? <div className={`vl-gap${reached ? ' reached' : stale ? ' stale' : ''}`}>
-      <span>{progress.reached ? '已到开仓线' : `还差 ${plain(progress.short)}`}</span>
+      <span>{props.signalTime === null ? '上次读数' : stale ? '样本已过期' : reached ? '已到开仓线' : `还差 ${plain(progress.short)}`}</span>
       <svg viewBox="0 0 100 6" preserveAspectRatio="none" role="img" aria-label={`偏离 ${plain(progress.deviation)} 基点，开仓线 ${plain(progress.entry)} 基点`}>
         <rect className="track" width="100" height="6" /><rect className="fill" width={Math.round(progress.ratio * 100)} height="6" /></svg>
       <small>偏离 {plain(progress.deviation)} / 开仓线 {plain(progress.entry)}</small>
@@ -269,8 +266,8 @@ function Row(props: EnableProps) {
   const { row, now, multi } = props;
   const hit = signal(row);
   const funding = fundingAnnual(row.aFunding, row.bFunding);
-  const stale = isStale(row, now);
-  const gate = gateNote(row, now);
+  const stale = isStale(row, props.signalTime);
+  const gate = gateNote(row, props.signalTime);
   return <tr className={rowClass(!!hit && hit.gap >= 0 && !stale, gate)}>
     <SymbolCell row={row} multi={multi} simple={false} />
     <EnableCell {...props} />
@@ -280,7 +277,7 @@ function Row(props: EnableProps) {
     <td className={`num ${row.z !== null && Math.abs(row.z) >= 2 ? 'vl-warn' : ''}`}>{row.z === null ? '—' : row.z.toFixed(1)}</td>
     <td className="num">{bps(row.sellA)} / {bps(row.buyA)}{row.estimated ? <Badge>估</Badge> : null}</td>
     <CostCell row={row} />
-    <td className="num">{hit ? <><span className={hit.gap >= 0 ? 'vl-up' : undefined}>{bps(hit.gap)}</span><small title={directionLabel(hit.direction, row.a.venue, row.b.venue)}>{directionShort(hit.direction, row.a.venue)} {plain(hit.deviation)} / {plain(row.entryBps)}</small></> : '—'}<GateLine note={gate} /></td>
+    <td className="num">{hit ? <><span className={stale ? 'vl-dim' : hit.gap >= 0 ? 'vl-up' : undefined}>{bps(hit.gap)}</span><small title={directionLabel(hit.direction, row.a.venue, row.b.venue)}>{stale ? '上次 ' : ''}{directionShort(hit.direction, row.a.venue)} {plain(hit.deviation)} / {plain(row.entryBps)}</small></> : '—'}<GateLine note={gate} /></td>
     <td className="num">{funding.a} / {funding.b}<small>{venueShort(row.a.venue)} / {venueShort(row.b.venue)}</small></td>
     <td className="num">{row.samples24h}</td>
   </tr>;

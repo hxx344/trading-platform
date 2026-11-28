@@ -82,6 +82,8 @@ export interface StateRow {
   /** 平仓后的冷却截止时刻，已过期为 null。 */ cooldownUntil: number | null;
   /** entryBps、exitBps 是生效的值（自动配置时为推荐值）。auto：在用自动配置；autoPending：在用但样本还不够算出推荐值（按保存的参数显示，不开仓）。 */
   enabled: boolean; entryBps: number; exitBps: number; auto: boolean; autoPending: boolean;
+  /** 当前允许开仓的方向；旧版状态可从同一份应答的 settings.symbols 读取。 */
+  directions?: readonly Direction[];
   position: PositionSummary | null;
   /** 两腿每小时资金费率（小数，多头付费为正）。 */ aFunding: number | null; bFunding: number | null;
   /** 两腿手续费（基点，手动值或目录费率）；取不到为 null（不开仓）。 */ aFeeBps: number | null; bFeeBps: number | null;

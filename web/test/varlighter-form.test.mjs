@@ -11,7 +11,7 @@ import {
   DEFAULT_LEAD_FORM, applyCandidate, buildSeriesRows, buildXcorrRows, formFromConfig, formatEventVenue, formatLagMs, lagTone, lagVerdict, leadStartRequest,
 } from '../src/varlighter/varlighter-lead-form.ts';
 import {
-  EMPTY_PAIR_FORM, backtestBody, bps, bytesPerDay, chartRange, chartRows, comboLabel, comboShort, customPairKey, customPairRequest, directionLabel, directionShort, fundingAnnual, globalForm, globalRequest,
+  EMPTY_PAIR_FORM, backtestBody, bps, bytesPerDay, chartRange, chartRows, comboLabel, comboShort, customPairKey, customPairRequest, directionLabel, directionShort, fundingAnnual, globalForm, globalRequest, parseState,
   SIMPLE_SORT_KEYS, directionSides, entryProgress, matchesCombo, pairLabel, readOverviewMode, rebateAudit, settingsBody, signal, sortRows, costBreakdown, symbolForm, symbolRequest, toggleConfirmed, usd, varLighterHref, AUTO_FIELDS, autoBody, autoFormPatch, quickEnableBody,
   VARLIGHTER_TABS, reasonLabel, ACCOUNT_VENUE_FILTERS, accountActivityFoot, filterAccountPositions, filterAccountTrades, filterAccountFunding, selectedEquitySeries, selectedVenuePnlCurve, formatCurrencyAmount, signedCurrencyAmount, formatRatePct, marginModeLabel, tradeDirLabel, accountHealthBadge,
   liveExecForm, parseLiveExec, tradeTelemetrySummary,
@@ -130,6 +130,25 @@ test('custom pair form: same key as the server, rejects what the server rejects'
 });
 
 const row = (symbol, extra = {}) => ({ key: `var:${symbol}|rh:${symbol}`, a: { venue: 'var' }, b: { venue: 'rh' }, custom: false, symbol, name: symbol, kind: 'equity', mid: null, z: null, rich: null, cheap: null, entryBps: 10, cost: null, samples24h: 0, ...extra });
+
+test('总览从生效方向计算信号、进度和排序，旧应答取同一份参数，过期信号不排在机会里', () => {
+  const now = 1_000_000, patch = { sampleAt: now, rich: 25, cheap: 4 };
+  const old = row('A', patch), current = row('B', { ...patch, rich: 12, cheap: 30, directions: ['a_rich'] });
+  const stale = row('C', { ...patch, rich: 90, sampleAt: now - 300_001, gate: { reached: true } });
+  const empty = row('D', { ...patch, directions: [] }), defaults = row('E', { ...patch, rich: 11, cheap: 29 });
+  const view = parseState({ rows: [old, current, stale, empty, defaults], settings: { symbols: {
+    [old.key]: { directions: ['a_cheap'] }, [current.key]: { directions: ['a_cheap'] },
+  } }, sources: {} });
+  const [a, b, c, d, e] = view.rows;
+  assert.deepEqual(signal(a), { direction: 'a_cheap', deviation: 4, gap: -6 });
+  assert.equal(entryProgress(a).reached, false, '只有禁止方向过线');
+  assert.equal(signal({ ...b, rich: 3 }).gap, -7, '只允许卖 A 时忽略已过线的买 A');
+  assert.equal(signal(b).direction, 'a_rich');
+  assert.equal(signal(e).direction, 'a_rich', '旧默认双向同时过线时跟随后端的优先次序');
+  assert.equal(signal(d), null);
+  assert.equal(gateNote(c, now), null);
+  assert.deepEqual(sortRows(view.rows, 'gap', true, now).map(r => r.symbol), ['B', 'E', 'A', 'C', 'D']);
+});
 
 test('signal picks the side nearer to entry; sorting keeps rows without data last; combo filter', () => {
   assert.equal(signal(row('A')), null);

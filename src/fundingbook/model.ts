@@ -70,10 +70,14 @@ const RANGES: Record<NumericKey, readonly [number, number, boolean, string]> = {
 const ACCOUNT_RANGES = { mmrPct: [0.1, 20, '维持保证金率'], maxLeverage: [1, 100, '最大杠杆'], takerBps: [0, 50, '吃单费率'] } as const;
 const SETTING_KEYS = ['enabled', 'accounts', 'bases', 'paperAuto', ...Object.keys(RANGES)];
 
-export class SettingsError extends Error {
-  constructor(message: string) { super(message); this.name = 'SettingsError'; }
+export class StateFormatError extends Error {
+  readonly reason: 'structure' | 'unsupported';
+  constructor(message: string, reason: 'structure' | 'unsupported' = 'structure') { super(message); this.reason = reason; }
 }
-const record = (value: unknown): Record<string, unknown> | null => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+export class SettingsError extends StateFormatError { override name = 'SettingsError'; }
+export const record = (value: unknown): Record<string, unknown> | null => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+export const ACCOUNT_ID = /^[a-z0-9][a-z0-9-]{0,23}$/;
+export const BASE_ID = /^[A-Z0-9]{1,12}$/;
 const inRange = (value: unknown, low: number, high: number, integer = false): value is number =>
   typeof value === 'number' && Number.isFinite(value) && value >= low && value <= high && (!integer || Number.isInteger(value));
 
@@ -82,7 +86,7 @@ export function parseSettings(raw: unknown): Settings {
   const input = record(raw);
   if (!input) throw new SettingsError('参数须为对象');
   const unknown = Object.keys(input).filter(key => !SETTING_KEYS.includes(key));
-  if (unknown.length) throw new SettingsError(`不认识的参数：${unknown.join('、').slice(0, 100)}`);
+  if (unknown.length) throw new SettingsError(`不认识的参数：${unknown.join('、').slice(0, 100)}`, 'unsupported');
   if (typeof input.enabled !== 'boolean' || typeof input.paperAuto !== 'boolean') throw new SettingsError('启用与模拟盘开关须为 true 或 false');
   const numbers = {} as Record<NumericKey, number>;
   for (const key of Object.keys(RANGES) as NumericKey[]) {
@@ -94,8 +98,9 @@ export function parseSettings(raw: unknown): Settings {
   if (!Array.isArray(input.accounts) || input.accounts.length > MAX_ACCOUNTS) throw new SettingsError(`账户须为列表，最多 ${MAX_ACCOUNTS} 个`);
   const accounts = input.accounts.map((item): Account => {
     const value = record(item);
-    if (!value || Object.keys(value).some(key => !['id', 'venue', 'mmrPct', 'maxLeverage', 'takerBps'].includes(key))) throw new SettingsError('账户须为对象，只含名称、场所、维持保证金率、最大杠杆与吃单费率');
-    if (typeof value.id !== 'string' || !/^[a-z0-9][a-z0-9-]{0,23}$/.test(value.id)) throw new SettingsError('账户名称须为 1 到 24 位小写字母、数字或连字符');
+    if (!value) throw new SettingsError('账户须为对象');
+    if (Object.keys(value).some(key => !['id', 'venue', 'mmrPct', 'maxLeverage', 'takerBps'].includes(key))) throw new SettingsError('账户只含名称、场所、维持保证金率、最大杠杆与吃单费率', 'unsupported');
+    if (typeof value.id !== 'string' || !ACCOUNT_ID.test(value.id)) throw new SettingsError('账户名称须为 1 到 24 位小写字母、数字或连字符');
     if (typeof value.venue !== 'string' || !venueSpec(value.venue)) throw new SettingsError(`账户 ${value.id} 的场所不在支持的列表里`);
     for (const key of Object.keys(ACCOUNT_RANGES) as (keyof typeof ACCOUNT_RANGES)[]) {
       const [low, high, label] = ACCOUNT_RANGES[key];
@@ -106,7 +111,7 @@ export function parseSettings(raw: unknown): Settings {
   if (new Set(accounts.map(item => item.id)).size !== accounts.length) throw new SettingsError('账户名称不能重复');
   if (!Array.isArray(input.bases) || input.bases.length > MAX_BASES) throw new SettingsError(`标的须为列表，最多 ${MAX_BASES} 个`);
   const bases = input.bases.map(base => {
-    if (typeof base !== 'string' || !/^[A-Z0-9]{1,12}$/.test(base)) throw new SettingsError('标的须为 1 到 12 位大写字母或数字，例如 BTC');
+    if (typeof base !== 'string' || !BASE_ID.test(base)) throw new SettingsError('标的须为 1 到 12 位大写字母或数字，例如 BTC');
     return base;
   });
   if (new Set(bases).size !== bases.length) throw new SettingsError('标的不能重复');
@@ -114,10 +119,8 @@ export function parseSettings(raw: unknown): Settings {
   return { enabled: input.enabled, paperAuto: input.paperAuto, accounts, bases, ...numbers };
 }
 
-/** 库里存的参数：缺的键补默认值（新版本加了参数），读不出来就整份用默认值。 */
+/** 兼容既有读取契约中仅缺 paperAuto 的旧参数，其他必填项和未知字段均走整份校验。 */
 export function storedSettings(raw: unknown): Settings {
   const input = record(raw);
-  if (!input) return structuredClone(DEFAULT_SETTINGS);
-  try { return parseSettings({ ...structuredClone(DEFAULT_SETTINGS), ...Object.fromEntries(Object.entries(input).filter(([key]) => SETTING_KEYS.includes(key))) }); }
-  catch { return structuredClone(DEFAULT_SETTINGS); }
+  return parseSettings(input && !Object.hasOwn(input, 'paperAuto') ? { ...input, paperAuto: DEFAULT_SETTINGS.paperAuto } : raw);
 }

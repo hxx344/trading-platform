@@ -81,15 +81,17 @@ test('页面提示：未启用、行情未运行、规划失败、回补中；�
   assert.equal(notice(base), null);
   assert.equal(notice({ ...base, settings: DEFAULT_SETTINGS }).tone, 'info');
   assert.match(notice({ ...base, running: false }).text, /合约价差监控没有运行/);
-  assert.deepEqual(notice({ ...base, roundError: '拿不到价格' }), { tone: 'error', text: '上一次规划没有完成：拿不到价格' });
+  assert.deepEqual(notice({ ...base, roundError: '拿不到价格' }), { tone: 'error', text: '本轮规划不可用。拿不到价格' });
+  assert.equal(notice({ ...base, roundError: '参数 JSON 损坏', settings: DEFAULT_SETTINGS, running: false }).tone, 'error');
   assert.match(notice({ ...base, round: null, collect: { done: 3, total: 12, errors: [] } }).text, /3 \/ 12/);
-  assert.match(resetConfirmText({ settings: DEFAULT_SETTINGS, rounds: [1, 2] }), /2 轮规划记录.*\$10,000/);
+  assert.match(resetConfirmText({ recovery: { book: null, settings: null }, settings: DEFAULT_SETTINGS, rounds: [1, 2] }), /规划记录（最近 2 轮可见）.*\$10,000/);
+  assert.match(resetConfirmText({ recovery: { book: 'JSON 损坏', settings: 'JSON 损坏' }, settings: DEFAULT_SETTINGS, rounds: [] }), /删除原始账本.*恢复参数后/);
 });
 
 test('应答校验：缺字段时按读取失败处理', () => {
   assert.throws(() => parseState(null), /应答格式不对/);
   assert.throws(() => parseState({ settings: DEFAULT_SETTINGS }), /应答格式不对/);
-  const ok = { settings: DEFAULT_SETTINGS, venues: VENUE_SPECS, legs: [], rounds: [], collect: { done: 0, total: 0, errors: [] } };
+  const ok = { settings: DEFAULT_SETTINGS, recovery: { settings: null, book: null }, venues: VENUE_SPECS, legs: [], rounds: [], collect: { done: 0, total: 0, errors: [] } };
   assert.equal(parseState(ok), ok);
   assert.throws(() => parseState({ ...ok, venues: undefined }), /应答格式不对/);
   assert.throws(() => parseState({ ...ok, collect: { done: 0, total: 0 } }), /应答格式不对/);

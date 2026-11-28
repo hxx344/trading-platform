@@ -5,11 +5,11 @@ import type { AccountFunding, AccountTrade } from '../../../src/varlighter/accou
 import type { LiveExecSettings, LiveLimits, LiveOrderRole, LivePosition, LiveSettings } from '../../../src/varlighter/live.ts';
 import type { AssetKind, Combo, CustomPair, Regime, VarPriceSource, VenueId } from '../../../src/varlighter/model.ts';
 import type { AutoParams, Direction, GlobalParams, SymbolParams } from '../../../src/varlighter/strategy.ts';
-import type { AccountsView, LiveBreakdownRow, LiveOutcomeCounts, LivePositionMark, LiveView, Settings, StateRow, SymbolPoint, VenueAccountView, VenuePositionView } from '../../../src/varlighter/views.ts';
+import type { AccountsView, LiveBreakdownRow, LiveOutcomeCounts, LivePositionMark, LiveView, Settings, StateRow, StateView, SymbolPoint, VenueAccountView, VenuePositionView } from '../../../src/varlighter/views.ts';
 import type { VarLighterTab } from '../route-parse.ts';
 
 export const VARLIGHTER_BASE = '/api/varlighter';
-export const VAR_QUOTE_LABELS: Record<VarPriceSource, string> = { token: '按量询价', '0': '公开一档', '1k': '公开 1 千美元档', '100k': '公开 10 万美元档' };
+export const VAR_QUOTE_LABELS: Record<VarPriceSource, string> = { token: '按量询价', '0': '公开一档', '1k': '公开 1 千美元档', '100k': '公开 10 万美元档', interpolated: '公开深度插值', mixed: '公开买卖盘分别取价' };
 export type { VarLighterTab };
 export const VARLIGHTER_TABS: readonly { id: VarLighterTab; label: string }[] = [
   { id: 'overview', label: '价差总览' }, { id: 'detail', label: '标的详情' }, { id: 'accounts', label: '账户资产' }, { id: 'ready', label: '实盘准备' }, { id: 'lead', label: '领先测速' },
@@ -103,13 +103,23 @@ export function fundingAnnual(aHourly: number | null, bHourly: number | null): {
 export const tone = (value: number | null | undefined): 'up' | 'down' | '' => !finite(value) || value === 0 ? '' : value > 0 ? 'up' : 'down';
 
 // ---- 总览 ----
-/** 离入场最近的一侧：偏离减去入场阈值，≥ 0 表示已达到开仓条件（还要过风控）。 */
-export function signal(row: Pick<StateRow, 'rich' | 'cheap' | 'entryBps'>): { direction: Direction; deviation: number; gap: number } | null {
-  const rich = row.rich, cheap = row.cheap;
-  if (!finite(rich) && !finite(cheap)) return null;
-  const direction: Direction = !finite(cheap) || (finite(rich) && rich >= cheap) ? 'a_rich' : 'a_cheap';
-  const deviation = direction === 'a_rich' ? rich! : cheap!;
-  return { direction, deviation, gap: deviation - row.entryBps };
+export function parseState(raw: unknown): StateView {
+  const value = raw as StateView | null;
+  if (!value || typeof value !== 'object' || !Array.isArray(value.rows) || !value.sources || !value.settings) throw new Error('应答格式不对');
+  if (value.rows.every(row => row.directions !== undefined)) return value;
+  return { ...value, rows: value.rows.map(row => row.directions !== undefined ? row
+    : { ...row, directions: value.settings.symbols?.[row.key]?.directions ?? ALL_DIRECTIONS }) };
+}
+
+type SignalRow = Pick<StateRow, 'rich' | 'cheap' | 'entryBps' | 'directions'>;
+/** 只比较允许开仓的方向。若两侧同时过线，与策略 decide 一样优先卖 A。 */
+export function signal(row: SignalRow): { direction: Direction; deviation: number; gap: number } | null {
+  const allowed = row.directions === undefined ? ALL_DIRECTIONS : row.directions;
+  if (!Array.isArray(allowed) || !finite(row.entryBps)) return null;
+  const rich = allowed.includes('a_rich') ? row.rich : null;
+  const cheap = allowed.includes('a_cheap') ? row.cheap : null;
+  if (finite(rich) && (rich >= row.entryBps || !finite(cheap) || rich >= cheap)) return { direction: 'a_rich', deviation: rich, gap: rich - row.entryBps };
+  return finite(cheap) ? { direction: 'a_cheap', deviation: cheap, gap: cheap - row.entryBps } : null;
 }
 
 export type SortKey = 'symbol' | 'mid' | 'z' | 'gap' | 'cost' | 'samples' | 'kind';
@@ -125,7 +135,7 @@ export const readOverviewMode = (raw: string | null): OverviewMode => raw === 'f
 /** 简洁视图表头上有的排序列。 */
 export const SIMPLE_SORT_KEYS: readonly SortKey[] = ['symbol', 'mid', 'gap', 'cost'];
 /** 离开仓线的进度：ratio 是偏离占开仓线的比例（0 到 1，反向偏离记 0），short 是还差的基点数。 */
-export function entryProgress(row: Pick<StateRow, 'rich' | 'cheap' | 'entryBps'>): { direction: Direction; deviation: number; entry: number; ratio: number; short: number; reached: boolean } | null {
+export function entryProgress(row: SignalRow): { direction: Direction; deviation: number; entry: number; ratio: number; short: number; reached: boolean } | null {
   const hit = signal(row);
   if (!hit || !finite(row.entryBps)) return null;
   const reached = hit.gap >= 0;
@@ -137,9 +147,9 @@ export const directionSides = (direction: Direction, a: VenueId, b: VenueId): { 
 /** 「为什么没开仓」的一行小字：tone 决定颜色（bad 是到了入场线却被挡），title 是悬停时的全文（含最近一次没开成）。 */
 export type GateNote = { tone: 'bad' | 'warn' | 'ok' | 'dim'; text: string; title: string };
 /** 已启用、无持仓的配对现在为什么没开仓；旧服务没有 gate、或有持仓与未启用的配对（gate 为 null）时为 null。 */
-export function gateNote(row: Pick<StateRow, 'gate'>, now: number): GateNote | null {
+export function gateNote(row: Pick<StateRow, 'gate' | 'sampleAt'>, now: number | null): GateNote | null {
   const gate = row.gate;
-  if (!gate) return null;
+  if (now === null || !gate || (gate.reached && sampleStale(row, now))) return null;
   const last = gate.last ? `最近一次没开成：${age(gate.last.at, now)}，${gate.last.reason}` : null;
   let main: { tone: GateNote['tone']; text: string; title: string } | null = null;
   if (gate.blocker) {
@@ -156,10 +166,10 @@ export function gateNote(row: Pick<StateRow, 'gate'>, now: number): GateNote | n
 }
 /** 样本超过这么久的行不算机会、不高亮，也不计入「到线被挡」：最后一个样本到过线不代表现在还在线上。 */
 export const STALE_SAMPLE_MS = 5 * 60_000;
-export const sampleStale = (row: Pick<StateRow, 'sampleAt'>, now: number): boolean => row.sampleAt === null || now - row.sampleAt > STALE_SAMPLE_MS;
+export const sampleStale = (row: Pick<StateRow, 'sampleAt'>, now: number | null): boolean => now === null || row.sampleAt === null || now - row.sampleAt > STALE_SAMPLE_MS;
 /** 到了入场线却被要处理的原因挡住的配对数（样本过期的、不用处理的拦截不计）；没有一行带 gate（旧服务）时为 null，页面不显示。 */
-export const blockedAtEntry = (rows: readonly Pick<StateRow, 'gate' | 'sampleAt'>[], now: number): number | null =>
-  rows.some(row => row.gate !== undefined) ? rows.filter(row => row.gate?.reached && row.gate.blocker && row.gate.attention !== false && !sampleStale(row, now)).length : null;
+export const blockedAtEntry = (rows: readonly Pick<StateRow, 'gate' | 'sampleAt'>[], now: number | null): number | null =>
+  now !== null && rows.some(row => row.gate !== undefined) ? rows.filter(row => row.gate?.reached && row.gate.blocker && row.gate.attention !== false && !sampleStale(row, now)).length : null;
 /** 基线为 null 时的说明：后台还在预热，或同时段样本不足。 */
 export const baselineMissing = (row: Pick<StateRow, 'baselineWarming'>, simple: boolean): string =>
   row.baselineWarming ? '基线预热中' : simple ? '平时水平统计中' : '样本不足';
@@ -175,14 +185,14 @@ export function costBreakdown(row: Pick<StateRow, 'cost' | 'feeCost' | 'totalCos
   if (!fee) return { total, parts: spread ? `${spread} · 手续费未知` : '缺盘口与手续费', warn: true };
   return { total, parts: spread ? `${spread} + ${fee}` : `缺盘口 · ${fee}`, warn: false };
 }/** 排序：缺数的行总在最后；同值按标的代码。 */
-export function sortRows(rows: readonly StateRow[], key: SortKey, descending: boolean): StateRow[] {
+export function sortRows(rows: readonly StateRow[], key: SortKey, descending: boolean, now: number | null): StateRow[] {
   const value = (row: StateRow): number | string | null => {
     switch (key) {
       case 'symbol': return row.symbol;
       case 'kind': return row.kind;
       case 'mid': return row.mid;
       case 'z': return finite(row.z) ? Math.abs(row.z) : null;
-      case 'gap': return signal(row)?.gap ?? null;
+      case 'gap': return sampleStale(row, now) ? null : signal(row)?.gap ?? null;
       case 'cost': return row.totalCost ?? row.cost;
       case 'samples': return row.samples24h;
     }

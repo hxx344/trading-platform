@@ -53,6 +53,27 @@ test('风险模型：日波动率是小时收益标准差乘 √24；同向为�
   assert.equal(riskModel(new Map([['A', gapped]]), NOW, 30).samples[0], 398);
 });
 
+test('7、8、90 天按整点收益结束时刻入窗，重复、乱序和非整点不改变结果，缺收盘不跨小时', () => {
+  for (const days of [7, 8, 90]) {
+    const hours = days * 24;
+    const points = Array.from({ length: hours + 1 }, (_, i) => ({ time: NOW - (hours - i) * HOUR, close: 100 + i % 7 }));
+    const anchor = points[0]!, last = points.at(-1)!;
+    const noisy = [...points].reverse().concat([anchor, last, { time: anchor.time - HOUR, close: 1 }, { time: NOW + HOUR, close: 9 }]);
+    // 即使非整点记录也两两相隔一小时，仍不能作为小时收盘收益。
+    noisy.push(...points.map(p => ({ time: p.time + HOUR / 4, close: p.close * 2 })));
+    for (const now of [NOW, NOW + HOUR / 2]) {
+      const model = (series: typeof points) => riskModel(new Map([['BTC', series]]), now, days);
+      const complete = model(points);
+      assert.deepEqual(complete.samples, [hours]);
+      assert.deepEqual(model(noisy).samples, [hours]);
+      assert.ok(Math.abs(complete.vol[0]! - model(noisy).vol[0]!) < 1e-12);
+      assert.deepEqual(model(points.slice(1)).samples, days === 7 ? [] : [hours - 1]);
+      const gap = points.filter(p => p.time !== NOW - 10 * HOUR);
+      assert.deepEqual(model(gap).samples, days === 7 ? [] : [hours - 2]);
+    }
+  }
+});
+
 test('路径规划：先减仓、再划转、最后加仓；小于最小金额的调整不出单，平仓总是出单', () => {
   const steps = buildPlan({
     accounts: ['a', 'b', 'c'], bases: ['BTC', 'ETH'],
@@ -129,19 +150,19 @@ test('库：资金费与覆盖范围一起写；规划与模拟盘一起落库�
 
   const book = newBook(['a'], 100, 7);
   const id = store.commitRound(book, 7, { capital: 100 }, { steps: [] });
-  assert.deepEqual(store.book(), book);
+  assert.deepEqual(store.book(), { status: 'valid', value: book });
   assert.deepEqual(store.rounds(10), [{ id, at: 7, summary: { capital: 100 } }]);
   assert.deepEqual(store.round(id), { steps: [] });
   assert.deepEqual(store.latestRound(), { id, at: 7, detail: { steps: [] } });
   store.resetPaper();
-  assert.equal(store.book(), null);
+  assert.deepEqual(store.book(), { status: 'missing' });
   assert.deepEqual(store.rounds(10), []);
   assert.equal(store.funding('x', 0).length, 2);
   store.prune(2);
   assert.equal(store.funding('x', 0).length, 1);
 });
 
-test('参数：整份校验，越界、多余的键、重复的账户都拒绝；默认不启用；库里缺的键补默认值', () => {
+test('参数整份校验，兼容仅缺 paperAuto 的旧记录，拒绝损坏、缺少其余必填项和未知版本', () => {
   assert.equal(DEFAULT_SETTINGS.enabled, false);
   assert.deepEqual(parseSettings(structuredClone(DEFAULT_SETTINGS)), DEFAULT_SETTINGS);
   const bad = (patch: Record<string, unknown>) => assert.throws(() => parseSettings({ ...structuredClone(DEFAULT_SETTINGS), ...patch }), SettingsError);
@@ -152,8 +173,7 @@ test('参数：整份校验，越界、多余的键、重复的账户都拒绝�
   assert.throws(() => parseSettings(null), SettingsError);
   const { paperAuto: _dropped, ...older } = DEFAULT_SETTINGS;
   assert.deepEqual(storedSettings({ ...older, capital: 5000 }), { ...DEFAULT_SETTINGS, capital: 5000 });
-  assert.deepEqual(storedSettings({ ...DEFAULT_SETTINGS, capital: 'x' }), DEFAULT_SETTINGS);
-  assert.deepEqual(storedSettings(null), DEFAULT_SETTINGS);
+  for (const invalid of [null, {}, { ...DEFAULT_SETTINGS, capital: 'x' }, { ...DEFAULT_SETTINGS, version: 2 }]) assert.throws(() => storedSettings(invalid), SettingsError);
 });
 
 test('风险模型：相关性只用共同时刻，矩阵半正定；与别的标的没有足够共同时刻的标的不进模型', () => {

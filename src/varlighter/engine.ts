@@ -9,7 +9,7 @@ import { TOKEN_QUOTE_CONCURRENCY, TOKEN_QUOTE_MAX_AGE_MS, TOKEN_QUOTE_PHASE_MS, 
 import { Worker } from 'node:worker_threads';
 import { backtestRequest } from './backtest.ts';
 import type { ReplayJob } from './replay-worker.ts';
-import { HyperliquidStream, LighterStream, MAX_DEPTH_MARKETS, depthAt, fetchEntropyMarkets, fetchRhMarkets, fetchVarListings,
+import { DEPTH_MAX_GAP_MS, HyperliquidStream, LighterStream, MAX_DEPTH_MARKETS, depthAt, fetchEntropyMarkets, fetchRhMarkets, fetchVarListings,
   type Connect, type DepthSnapshot, type FetchLike, type LiveStream, type TopPoint } from './feeds.ts';
 import { createLeadTester } from './lead-streams.ts';
 import { ACCOUNT_HISTORY_LIMIT, ACCOUNT_HISTORY_WINDOW_MS, COLLATERAL_ASSET, fetchAccount, fetchAccountHistory, type AccountFunding, type AccountHistorySnapshot, type AccountSnapshot, type AccountTrade } from './accounts.ts';
@@ -52,7 +52,7 @@ export const TRACKER_REBUILD_MS = 60_000;
 /** 按配对记最近一次被挡下的原因，最多记这么多个配对。 */
 const LAST_BLOCKED_MAX = 500;
 /** 盘口（行情流）超过这么久没同步算过期。 */
-export const DEPTH_STALE_MS = 3 * 60_000;
+export const DEPTH_STALE_MS = DEPTH_MAX_GAP_MS;
 const PRUNE_MS = 3_600_000;
 const PRUNE_BATCH = 500;
 const RECOUNT_MS = 10 * 60_000;
@@ -182,7 +182,7 @@ interface VenueRuntime {
   venue: LiveVenue; stream: LiveStream | null; markets: MarketSpec[]; bySymbol: Map<string, MarketSpec>; catalog: SourceState; nextCatalog: number;
   depth: Map<string, DepthEntry>;
 }
-interface DepthEntry { leg: LegInfo; snapshot: DepthSnapshot | null; error: string | null }
+interface DepthEntry { leg: LegInfo; at: number | null; error: string | null }
 
 export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now: customNow, monoNow: customMonoNow, log = () => {}, quoter, accounts: envAccounts = () => ({ accounts: {}, problem: null }), liveKeys, traders, signerProblem = lighterSignerProblem, lighterSigner, lighterAuth }: EngineOptions) {
   const now = customNow ?? Date.now;
@@ -644,7 +644,8 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now:
     const baseline = saved?.entryBaseline ?? (pair ? baselineOf(pair, now())?.median : undefined) ?? entrySpread;
     return {
       id: position.id, symbol: position.symbol, direction: position.direction, openedAt: position.openedAt, ratio,
-      qty: remaining > 0 ? remaining : position.plan.qty,
+      qty: position.a.qty > 0 ? Math.max(0, remaining) : position.plan.qty,
+      bQty: Math.max(0, position.b.qty - position.b.exitQty),
       notionalUsd: saved?.notionalUsd ?? (position.a.entryQuote > 0 ? position.a.entryQuote : position.plan.qty * position.plan.limit),
       entrySpread, entryBaseline: baseline, entryRegime: saved?.entryRegime ?? (pair ? regimeOf(pair.kind, position.openedAt) : 'all'),
       aEntry: aEntry ?? position.plan.limit, bEntry: bEntry ?? (position.plan.bLimit ?? 0) * ratio,
@@ -761,7 +762,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now:
         for (const leg of pair ? [pair.a, pair.b] : []) if (leg.venue === runtime.venue && wanted.size < MAX_DEPTH_MARKETS) wanted.set(legKey(leg), leg);
       }
       for (const [key, entry] of runtime.depth) if (wanted.get(key)?.market.id !== entry.leg.market.id) runtime.depth.delete(key);
-      for (const [key, leg] of wanted) if (!runtime.depth.has(key)) runtime.depth.set(key, { leg, snapshot: null, error: null });
+      for (const [key, leg] of wanted) if (!runtime.depth.has(key)) runtime.depth.set(key, { leg, at: null, error: null });
       runtime.stream?.setDepthMarkets(new Map([...runtime.depth.values()].map(({ leg }) => [leg.market.id, leg.market.coin ?? `io:${leg.symbol}`])));
     }
   }
@@ -802,10 +803,11 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now:
     } catch (error) { runtime.catalog.error = message(error); }
   }
 
-  /** 从行情流取一条腿当前的盘口快照；取不到时保留上一份（按时刻过期），原因记在该腿上。 */
-  function refreshEntry(runtime: VenueRuntime, entry: DepthEntry): void {
-    const snapshot = runtime.stream?.depth(entry.leg.market.id) ?? null;
-    if (snapshot) { entry.snapshot = snapshot; entry.error = null; } else entry.error = runtime.stream?.depthError(entry.leg.market.id) ?? '行情流未连接';
+  /** 只从当前订阅取深度；失效时保留上次可用的来源时刻供状态页显示。 */
+  function refreshEntry(runtime: VenueRuntime, entry: DepthEntry, reuseMs = 0): DepthSnapshot | null {
+    const snapshot = runtime.stream?.depth(entry.leg.market.id, reuseMs) ?? null;
+    if (snapshot) { entry.at = snapshot.at; entry.error = null; } else entry.error = runtime.stream?.depthError(entry.leg.market.id) ?? '行情流未连接';
+    return snapshot;
   }
   /** 刷新各场所订阅中的盘口快照（读行情流里的当前盘口，不发请求）。 */
   function refreshDepth(): void {
@@ -847,9 +849,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now:
     const at = top === undefined ? stream?.topAt(leg.market.id, t) ?? null : top;
     if (!at) return null;
     const entry = runtime.depth.get(legKey(leg));
-    // 重算盘口快照要把整本盘口排序：按推送判断时沿用刚算过的。
-    if (entry && !(entry.snapshot && t - entry.snapshot.at < depthReuseMs)) refreshEntry(runtime, entry);
-    const depth = depthAt(entry?.snapshot, at, t);
+    const depth = depthAt(entry && refreshEntry(runtime, entry, depthReuseMs), at, t);
     const rx = decideAt === t ? at : stream?.topAt(leg.market.id, decideAt) ?? null;
     return {
       At: at.at, Mark: at.mark ?? leg.market.mark, Index: at.index ?? leg.market.index, Funding: at.funding ?? leg.market.fundingHourly,
@@ -1238,7 +1238,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now:
         z: baseline && mid !== null ? (mid - baseline.median) / baseline.sigma : null,
         rich: baseline && spread ? spread.sellA - baseline.median : null, cheap: baseline && spread ? baseline.median - spread.buyA : null,
         samples24h: recentCount(pair.key, time), firstAt: firstOf(pair.key), cooldownUntil: cooldown[pair.key] > time ? cooldown[pair.key] : null,
-        enabled: params.enabled, entryBps: params.entryBps, exitBps: params.exitBps, auto: autoKeys.has(pair.key), autoPending: autoPending(pair.key),
+        enabled: params.enabled, directions: params.directions, entryBps: params.entryBps, exitBps: params.exitBps, auto: autoKeys.has(pair.key), autoPending: autoPending(pair.key),
         position: positionSummary(position, sample),
         aFunding: sample?.aFunding ?? pair.a.market.fundingHourly, bFunding: sample?.bFunding ?? pair.b.market.fundingHourly,
         aFeeBps, bFeeBps,
@@ -1255,7 +1255,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now:
         venues: [...live.values()].map((runtime): VenueStatus => ({
           venue: runtime.venue, name: VENUE_NAMES[runtime.venue], enabled: used.has(runtime.venue), catalog: runtime.catalog,
           stream: runtime.stream?.status(runtime.venue === 'entropy' ? (runtime.stream as HyperliquidStream).marketCount : runtime.markets.length) ?? null,
-          depth: [...runtime.depth].map(([key, entry]): DepthStatus => ({ key, marketId: entry.leg.market.id, at: entry.snapshot?.at ?? null, error: entry.error })),
+          depth: [...runtime.depth].map(([key, entry]): DepthStatus => ({ key, marketId: entry.leg.market.id, at: entry.at, error: entry.error })),
           pairs: pairs.filter(pair => pair.a.venue === runtime.venue || pair.b.venue === runtime.venue).length,
         })),
         live: lastLive, push: { ...pushStats },
@@ -1391,7 +1391,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now:
     if (position.closedAt === null || position.netUsd === null || !(a.qty > 0 && b.qty > 0 && a.exitQty > 0 && b.exitQty > 0)) return null;
     const entry = strategyOf(position), aExit = a.exitQuote / a.exitQty, bExit = ratio * b.exitQuote / b.exitQty, costUsd = a.feesUsd + b.feesUsd;
     return {
-      ...entry, qty: a.qty, closedAt: position.closedAt, aExit, bExit, exitSpread: (aExit - bExit) / bExit * 1e4, reason: position.closeReason ?? 'signal',
+      ...entry, qty: a.qty, bQty: b.qty, closedAt: position.closedAt, aExit, bExit, exitSpread: (aExit - bExit) / bExit * 1e4, reason: position.closeReason ?? 'signal',
       grossUsd: position.netUsd + costUsd, costUsd, netUsd: position.netUsd, netBps: entry.notionalUsd > 0 ? position.netUsd / entry.notionalUsd * 10_000 : 0, fundingUsd: null,
       estimated: entry.estimated,
     };

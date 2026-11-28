@@ -1,11 +1,11 @@
 // 资金费组合的引擎（docs/fundingbook.md）：回补各条腿的已结算资金费与各标的的小时收盘价，按间隔求解目标仓位、
 // 生成路径规划并记入模拟盘。第一期不读任何账户、不向任何交易所发单；行情与历史都经合约价差监控读取，监控没有
 // 运行时本模块不采集也不规划。
-import { DEFAULT_SETTINGS, parseSettings, PRICE_VENUES, storedSettings, VENUE_SPECS, venueSpec, type Settings } from './model.ts';
+import { ACCOUNT_ID, DEFAULT_SETTINGS, parseSettings, PRICE_VENUES, record, VENUE_SPECS, venueSpec, type Settings } from './model.ts';
 import { accountEquity, accrueFunding, applyPlan, newBook, occupiedAccounts, reconcileAccounts, unrealized, type PaperBook } from './paper.ts';
 import { buildPlan, type PlanLeg } from './plan.ts';
 import { allocate, accountRisk, solve, type SolveAccount, type SolveInput, type Solution } from './solver.ts';
-import { DAY, fundingStats, HOUR, riskModel, type FundingRecord, type FundingStats, type PricePoint, type RiskModel } from './stats.ts';
+import { DAY, fundingStats, HOUR, riskAnchor, riskModel, type FundingRecord, type FundingStats, type PricePoint, type RiskModel } from './stats.ts';
 import type { Coverage, FundingBookStore } from './store.ts';
 import type { BookView, LegView, RoundAccount, RoundBase, RoundSummary, RoundView, StateView } from './views.ts';
 
@@ -59,18 +59,30 @@ const NO_TRADE_BAND = 0.03;
 const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error)).slice(0, 160);
 const quotePrice = (quote: SourceQuote): number | null => {
   const value = quote.mark ?? (quote.bid !== null && quote.ask !== null ? (quote.bid + quote.ask) / 2 : quote.last);
-  return value !== null && value > 0 ? value : null;
+  return value !== null && Number.isFinite(value) && value > 0 ? value : null;
 };
 const legKey = (venue: string, symbol: string): string => `${venue}:${symbol}`;
 
 interface Target { key: string; kind: 'funding' | 'price'; venue: string; symbol: string; base: string; want: number; segment: number }
 interface LegInfo { view: LegView; key: string; stats: FundingStats | null; usable: boolean }
 
+/** 旧轮次中的账户身份可作为同次写入账本的旁证。只使用完整、无重复的账户与场所清单。 */
+function savedRoundAccounts(round: RoundView | null): RoundAccount[] | null {
+  if (!Array.isArray(round?.accounts) || !round.accounts.length) return null;
+  const ids = new Set<string>();
+  for (const account of round.accounts) {
+    if (!account || typeof account.id !== 'string' || !ACCOUNT_ID.test(account.id) || typeof account.venue !== 'string' || !venueSpec(account.venue) || ids.has(account.id)) return null;
+    ids.add(account.id);
+  }
+  return round.accounts;
+}
+
 export function createFundingBookEngine(options: EngineOptions) {
   const { store, source } = options, now = options.now ?? Date.now, log = options.log ?? (() => {});
   const budget = options.collectBudgetMs ?? COLLECT_BUDGET_MS;
-  let settings: Settings = storedSettings(store.settings());
-  let book: PaperBook | null = store.book();
+  const savedSettings = store.settings(), savedBook = store.book();
+  let settings = savedSettings.status === 'valid' ? savedSettings.value : structuredClone(DEFAULT_SETTINGS);
+  let book: PaperBook | null = savedBook.status === 'valid' ? savedBook.value : null;
   let revision = 0, closed = false, solving = false, nextRoundAt = 0, prunedAt = 0;
   let roundError: string | null = null;
   let collect = { done: 0, total: 0, errors: [] as string[] };
@@ -81,13 +93,44 @@ export function createFundingBookEngine(options: EngineOptions) {
   const listRounds = (): StateView['rounds'] => store.rounds(ROUND_LIST).map(row => ({ id: row.id, at: row.at, ...(row.summary as RoundSummary) }));
   const latest = store.latestRound();
   let lastRound: RoundView | null = latest ? withId(latest.id, latest.detail) : null;
+  const savedAccounts = savedRoundAccounts(lastRound);
   let rounds = listRounds();
 
+  const recovery: StateView['recovery'] = {
+    settings: savedSettings.status === 'invalid' ? savedSettings.reason : savedSettings.status === 'missing' && (latest || savedBook.status !== 'missing') ? '已有模拟盘记录，但缺少参数' : null,
+    book: savedBook.status === 'invalid' ? savedBook.reason : savedBook.status === 'missing' && latest ? '已有规划历史，但缺少账本' : null,
+  };
+  if (!recovery.settings && store.settingsRecoveryPending()) recovery.settings = '重置账本前的参数尚待确认恢复';
+  // 每次规划均先补齐本轮账户，再将整份账本与轮次一同写入。目标仓位可能未执行，账户身份一定在账本中。
+  if (book && lastRound) {
+    if (!savedAccounts) recovery.book = '同轮规划的账户记录无效，无法核对账本';
+    else if (savedAccounts.some(account => !Object.hasOwn(book!.accounts, account.id))) recovery.book = '账本缺少同轮规划已记录的账户';
+  }
+  // 不完整账本的剩余账户仍能证明参数与原场所冲突。确认重置前保留这份证据，仅在读数或规划时停用。
+  if (book && !recovery.settings && accountConflict(settings, savedAccounts ?? settings.accounts)) recovery.settings = '与模拟账本的账户或场所不匹配';
+  function recoveryError(): string | null {
+    const messages: string[] = [];
+    if (recovery.settings) messages.push(`参数不可用（${recovery.settings}），请在设置中核对并确认保存恢复参数`);
+    if (recovery.book) messages.push(`模拟账本不可用（${recovery.book}），请修复原记录后重启，或在模拟盘中确认重置`);
+    return messages.length ? messages.join('。') : null;
+  }
+  const initialError = recoveryError();
+  if (initialError) log(`fundingbook: ${initialError}`);
+  else if (book) risk = computeRisk(now());
+
+  function heldBases(): string[] {
+    return [...new Set(Object.values(book?.accounts ?? {}).flatMap(account => Object.keys(account.positions)))];
+  }
   const venuesInUse = (): string[] => [...new Set(settings.accounts.map(account => account.venue))];
+  function riskBases(): string[] { return [...new Set([...settings.bases, ...heldBases()])]; }
+  function heldRiskError(model: RiskModel | null): string | null {
+    const missing = model ? heldBases().filter(base => !model.bases.includes(base)) : [];
+    return missing.length ? `模拟持仓 ${missing.join('、')} 的小时收益或共同样本不足，账户风险与所需资金未知。本轮暂停规划，持仓和规划历史可继续查看` : null;
+  }
 
   /** 每个（场所，标的）选一个合约：按场所的计价币顺序取第一个可比、没在下架的。 */
   function index(market: MarketSource): (venue: string, base: string) => SourceQuote | null {
-    const wanted = new Set([...settings.bases, ...Object.values(book?.accounts ?? {}).flatMap(account => Object.keys(account.positions))]);
+    const wanted = new Set(riskBases());
     const found = new Map<string, SourceQuote[]>();
     for (const quote of market.quotes()) {
       if (!wanted.has(quote.base) || quote.comparable === false || quote.delisting) continue;
@@ -102,17 +145,30 @@ export function createFundingBookEngine(options: EngineOptions) {
     };
   }
 
+  function heldPriceError(pick: ReturnType<typeof index> | null): string | null {
+    if (!book) return null;
+    for (const { id, venue } of settings.accounts) {
+      if (!Object.hasOwn(book.accounts, id)) continue;
+      for (const base of Object.keys(book.accounts[id]!.positions)) {
+        const quote = pick?.(venue, base);
+        if (!quote || quotePrice(quote) === null) return `账户 ${id} 的 ${base} 模拟持仓拿不到价格，本轮不规划`;
+      }
+    }
+    return null;
+  }
+
   function targets(pick: ReturnType<typeof index>, at: number): Target[] {
     const list: Target[] = [];
-    for (const base of settings.bases) {
+    for (const base of riskBases()) {
       for (const venue of venuesInUse()) {
+        if (!settings.bases.includes(base) && !settings.accounts.some(account => account.venue === venue && book?.accounts[account.id]?.positions?.[base])) continue;
         const quote = pick(venue, base);
         if (quote) list.push({ key: `funding:${legKey(venue, quote.symbol)}`, kind: 'funding', venue, symbol: quote.symbol, base, want: at - settings.longDays * DAY, segment: fundingSegment(venue) });
       }
       for (const venue of PRICE_VENUES) {
         const quote = pick(venue, base);
         if (!quote) continue;
-        list.push({ key: `price:${base}:${legKey(venue, quote.symbol)}`, kind: 'price', venue, symbol: quote.symbol, base, want: Math.floor((at - settings.volDays * DAY) / HOUR) * HOUR - HOUR, segment: PRICE_SEGMENT });
+        list.push({ key: `price:${base}:${legKey(venue, quote.symbol)}`, kind: 'price', venue, symbol: quote.symbol, base, want: riskAnchor(at, settings.volDays) - HOUR, segment: PRICE_SEGMENT });
         break;
       }
     }
@@ -128,7 +184,7 @@ export function createFundingBookEngine(options: EngineOptions) {
     }
     const due = target.kind === 'price' ? end > coverage.to : end - coverage.to >= FUNDING_REFRESH_MS;
     if (due) return { range: { from: Math.max(coverage.from, coverage.to - REFRESH_LOOKBACK_MS, end - target.segment), to: end }, next: { from: coverage.from, to: end } };
-    if (coverage.from > target.want + HOUR) {
+    if (coverage.from > target.want + (target.kind === 'price' ? 0 : HOUR)) {
       const from = Math.max(target.kind === 'price' ? target.want : Math.floor(target.want), coverage.from - target.segment);
       return { range: { from, to: coverage.from }, next: { from, to: coverage.to } };
     }
@@ -178,7 +234,8 @@ export function createFundingBookEngine(options: EngineOptions) {
   }
 
   function computeRisk(at: number): RiskModel {
-    return riskModel(new Map(settings.bases.map(base => [base, store.prices(base, at - settings.volDays * DAY - HOUR)])), at, settings.volDays);
+    const after = riskAnchor(at, settings.volDays) - HOUR;
+    return riskModel(new Map(riskBases().map(base => [base, store.prices(base, after)])), at, settings.volDays);
   }
 
   /** 每条腿的统计与本轮能不能用。 */
@@ -226,31 +283,33 @@ export function createFundingBookEngine(options: EngineOptions) {
     const at = now(), rev = revision, current = settings;
     const pick = index(market), model = computeRisk(at), legs = computeLegs(pick, model, at);
     risk = model; legsView = [...legs.values()].map(info => info.view);
+    const missingRisk = heldRiskError(model);
+    if (missingRisk) throw new FundingBookError(409, 'unknown_risk', missingRisk);
+    const missingPrice = heldPriceError(pick);
+    if (missingPrice) throw new FundingBookError(409, 'no_price', missingPrice);
     const accounts = current.accounts, ids = accounts.map(account => account.id);
     const working: PaperBook = structuredClone(book ?? newBook(ids, current.capital, at));
     reconcileAccounts(working, ids);
 
-    // 模拟持仓里有参数已删掉的标的时也带进来：它没有可做的腿，求解会把它平掉。
-    const bases = [...new Set([...current.bases, ...ids.flatMap(id => Object.keys(working.accounts[id]!.positions))])];
+    // 这里只保留有真实协方差的标的。仍有持仓的已移出标的也参与风险计算，目标为平仓。
+    const bases = model.bases;
     const prices = accounts.map(account => bases.map(base => { const quote = pick(account.venue, base); return quote ? quotePrice(quote) : null; }));
     for (const [a, account] of accounts.entries()) for (const [base, position] of Object.entries(working.accounts[account.id]!.positions)) {
-      const price = prices[a]![bases.indexOf(base)];
-      if (price == null) throw new FundingBookError(409, 'no_price', `账户 ${account.id} 的 ${base} 模拟持仓拿不到价格，本轮不规划`);
+      const price = prices[a]![bases.indexOf(base)]!;
       accrueFunding(working.accounts[account.id]!, base, store.funding(legKey(account.venue, position.symbol), position.fundingAt), price, at);
     }
     const equity = accounts.map((account, a) => accountEquity(working.accounts[account.id]!, base => prices[a]![bases.indexOf(base)] ?? null) ?? 0);
     const capital = equity.reduce((sum, value) => sum + value, 0);
     if (!(capital > 0)) throw new FundingBookError(409, 'no_capital', '模拟盘的权益已经不为正，重置模拟盘后再规划');
 
-    const modelIndex = bases.map(base => model.bases.indexOf(base));
-    const cov = bases.map((_, i) => bases.map((__, j) => modelIndex[i]! >= 0 && modelIndex[j]! >= 0 ? model.cov[modelIndex[i]!]![modelIndex[j]!]! : 0));
+    const cov = model.cov;
     const leg = (a: number, b: number): LegInfo | undefined => legs.get(`${accounts[a]!.venue}|${bases[b]}`);
     const apr = accounts.map((_, a) => bases.map((__, b) => { const info = leg(a, b); return info?.usable && info.stats ? info.stats.adjustedApr : null; }));
     // 当前仓位按每个标的同一个参考价折成名义金额：各场所自己的价格有基差，按各自的价格折，数量配平的两腿名义金额
     // 合计不为零，求解会去「修」它，出单腿订单。目标名义金额也按参考价折回数量，所以各账户的数量合计为零。
     const ref = bases.map((_, b) => { const list = prices.map(row => row[b]).filter((value): value is number => value != null); return list.length ? list.reduce((sum, value) => sum + value, 0) / list.length : null; });
     const held = accounts.map((account, a) => bases.map((base, b) => { const position = working.accounts[account.id]!.positions[base]; return position ? position.qty * ref[b]! : 0; }));
-    // 有持仓的腿这一轮用不了（资金费读不到、过期或样本不足）而标的还在参数里：这个标的保持不动，等数据恢复。
+    // 已知风险，但有持仓的腿资金费读不到或过期且标的还在参数里：仓位保持不动，仍占用风险预算。
     const hold = bases.map((base, b) => current.bases.includes(base) && accounts.some((_, a) => held[a]![b] !== 0 && apr[a]![b] === null));
     const solveAccounts: SolveAccount[] = accounts.map(account => ({ id: account.id, mmr: account.mmrPct / 100, maxLeverage: account.maxLeverage, costRate: (account.takerBps + current.slippageBps) / 10_000 }));
     const input: SolveInput = {
@@ -343,42 +402,56 @@ export function createFundingBookEngine(options: EngineOptions) {
     return { startedAt: book.startedAt, initialCapital: book.initialCapital, equity, funding, fees, realized, accounts };
   }
 
+  function accountConflict(next: Settings, previous: readonly { id: string; venue: string }[]): string | null {
+    if (!book) return null;
+    const occupied = occupiedAccounts(book, next.accounts.map(account => account.id));
+    if (occupied.length) return `账户 ${occupied.join('、')} 在模拟盘里还有资金或持仓，先重置模拟盘再删除`;
+    for (const account of next.accounts) {
+      const paper = Object.hasOwn(book.accounts, account.id) ? book.accounts[account.id] : null;
+      if (!paper || !Object.keys(paper.positions).length) continue;
+      const before = previous.find(item => item.id === account.id);
+      if (!before) return `规划历史缺少持仓账户 ${account.id} 的原场所，请修复原参数后重启，或先重置模拟盘`;
+      if (before.venue !== account.venue) return `账户 ${account.id} 仍有模拟持仓，须沿用原场所。先重置模拟盘才能重新指定`;
+    }
+    return null;
+  }
+
   const views = {
     state(): StateView {
       const market = source(), running = market?.running() ?? false;
+      const pick = !recovery.settings && !recovery.book && running && market ? index(market) : null;
+      const problem = recoveryError(), unavailable = problem ?? heldRiskError(risk) ?? heldPriceError(pick) ?? roundError;
       return {
-        running, settings, venues: VENUE_SPECS, collect, roundError, solving,
-        lastRoundAt: lastRound?.at ?? null, nextRoundAt: settings.enabled && running ? nextRoundAt : null,
+        running, settings, venues: VENUE_SPECS, collect, roundError: unavailable, recovery: { ...recovery }, solving,
+        lastRoundAt: lastRound?.at ?? null, nextRoundAt: !problem && settings.enabled && running ? nextRoundAt : null,
         legs: legsView, risk: risk ? { bases: risk.bases, vol: risk.vol, corr: risk.corr, samples: risk.samples } : null,
-        round: lastRound, rounds, book: bookView(running && market ? index(market) : null), checkedAt: now(),
+        round: unavailable ? null : lastRound, rounds, book: recovery.book ? null : bookView(pick), checkedAt: now(),
       };
     },
     settings(body: unknown): StateView {
-      const next = parseSettings(body);
-      if (book) {
-        const occupied = occupiedAccounts(book, next.accounts.map(account => account.id));
-        if (occupied.length) throw new FundingBookError(409, 'account_in_use', `账户 ${occupied.join('、')} 在模拟盘里还有资金或持仓，先重置模拟盘再删除`);
-        const moved = next.accounts.filter(account => {
-          const before = settings.accounts.find(item => item.id === account.id), paper = book!.accounts[account.id];
-          return before && before.venue !== account.venue && paper && Object.keys(paper.positions).length > 0;
-        }).map(account => account.id);
-        if (moved.length) throw new FundingBookError(409, 'account_in_use', `账户 ${moved.join('、')} 在模拟盘里还有持仓，先重置模拟盘再换场所`);
-      }
+      const request = record(body);
+      if (recovery.settings && !(request?.confirm === true && Object.keys(request).length === 2 && Object.hasOwn(request, 'settings'))) throw new FundingBookError(409, 'confirm_required', '参数不可用，须核对整份参数并确认保存才能恢复');
+      const next = parseSettings(recovery.settings ? request!.settings : body);
+      const conflict = accountConflict(next, recovery.settings ? savedAccounts ?? [] : settings.accounts);
+      if (conflict) throw new FundingBookError(409, 'account_in_use', conflict);
       store.saveSettings(next, now());
-      settings = next; revision += 1; nextRoundAt = 0; roundError = null;
+      settings = next; recovery.settings = null; revision += 1; nextRoundAt = 0; roundError = null;
+      risk = book && !recovery.book ? computeRisk(now()) : null; legsView = [];
       inflight?.abort(new Error('参数已修改'));
       return views.state();
     },
     /** 立即规划一轮（等这一遍采集结束后）。 */
     plan(): StateView {
+      const problem = recoveryError();
+      if (problem) throw new FundingBookError(409, 'state_unavailable', problem);
       if (!settings.enabled) throw new FundingBookError(409, 'disabled', '模块还没有启用');
       nextRoundAt = 0;
       return views.state();
     },
     reset(body: unknown): StateView {
       if (!body || typeof body !== 'object' || (body as { confirm?: unknown }).confirm !== true) throw new FundingBookError(400, 'confirm_required', '重置模拟盘须带上确认');
-      store.resetPaper();
-      book = null; lastRound = null; rounds = []; revision += 1; nextRoundAt = 0; roundError = null;
+      store.resetPaper(!!recovery.settings, now());
+      book = null; recovery.book = null; lastRound = null; rounds = []; revision += 1; nextRoundAt = 0; roundError = null;
       return views.state();
     },
     round(id: number): RoundView {
@@ -395,7 +468,7 @@ export function createFundingBookEngine(options: EngineOptions) {
     async loop(context: LoopContext): Promise<void> {
       while (!context.stopped() && !closed) {
         const market = source();
-        if (!settings.enabled || !market?.running()) { await context.pause(3_000); continue; }
+        if (recovery.settings || recovery.book || !settings.enabled || !market?.running()) { await context.pause(3_000); continue; }
         let settled = false;
         try { settled = await collectOnce(market, context); refreshViews(market); }
         catch (error) { log(`fundingbook: 采集出错：${errorText(error)}`); }

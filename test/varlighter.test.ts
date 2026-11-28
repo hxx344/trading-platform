@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { BUSY_BLOCK, COST_BLOCK, DECAYED, FALLBACK_BLOCK, FEE_BLOCK, NO_LIVE_TOP, NO_QUOTE_TIME, STALE_QUOTE, THIN_BLOCK, closeSpread, confirmOpen, expectedNetBps, openEconomics, slippageBudgetBps } from '../src/varlighter/strategy.ts';
-import { DEFAULT_COMBOS, SAMPLE_FIELDS, comboPairs, customPairInfo, sameSymbol, sizeBucket, targetSpread, formatRatio, varQuoteQty, legacyKeyOf, lighterMarket, pairKey, pairTitle, parseEntropyMarkets, upgradeKey, varMarket, type MarketSpec } from '../src/varlighter/model.ts';
+import { DEFAULT_COMBOS, SAMPLE_FIELDS, comboPairs, customPairInfo, sameSymbol, targetSpread, formatRatio, varQuoteQty, legacyKeyOf, lighterMarket, pairKey, pairTitle, parseEntropyMarkets, upgradeKey, varMarket, type MarketSpec } from '../src/varlighter/model.ts';
 import type { SamplesView } from '../src/varlighter/views.ts';
 import { TOKEN_BLOCK_PAUSE_MS, TOKEN_ERROR_KEEP_MS, TOKEN_SYMBOL_PAUSE_MS, TOKEN_QUOTE_MAX_AGE_MS, TOKEN_QUOTE_PHASE_MS, createVarQuoter, parseTokenQuote, varInstrument, type VarQuoter } from '../src/varlighter/varquote.ts';
 import { VARIATIONAL_SESSION_FILE } from '../src/monitor/variational-session.ts';
@@ -580,7 +580,7 @@ test('Lighter 盘口行情流：订阅 order_book，快照加增量（数量 0 �
     book('subscribed/order_book', { code: 0, bids: [{ price: '99.9', size: '5' }, { price: '99.8', size: '50' }], asks: [{ price: '100.1', size: '5' }, { price: '100.2', size: '20' }], nonce: 10 });
     clock += 5_000;
     const first = stream.depth(1)!;
-    assert.deepEqual([first.at, first.bid, first.ask], [clock, 99.9, 100.1], '快照时刻为取用时刻');
+    assert.deepEqual([first.at, first.bid, first.ask], [T0, 99.9, 100.1], '读取保留快照接收时刻');
     book('update/order_book', { bids: [{ price: '99.9', size: '0' }, { price: '99.85', size: '2' }], asks: [{ price: '100.05', size: '1' }], begin_nonce: 10, nonce: 11 });
     assert.deepEqual([stream.depth(1)!.bid, stream.depth(1)!.ask], [99.85, 100.05], '数量 0 删档，新档加入');
     socket.sent.length = 0;
@@ -886,6 +886,9 @@ test('引擎：各组合各自对齐样本写库，盘口快照，Var 配对只�
     const minute = async () => {
       clock += 60_000;
       tick++;
+      const depth = { bids: [], asks: [], begin_nonce: tick, nonce: tick + 1 };
+      rh().push({ type: 'update/order_book', channel: 'order_book:1', order_book: depth });
+      main().push({ type: 'update/order_book', channel: 'order_book:7', order_book: depth });
       rh().push({ type: 'update/market_stats', channel: 'market_stats:all', market_stats: { 1: { market_id: 1, mark_price: String(100 + tick * 0.0001) } } });
       main().push({ type: 'update/market_stats', channel: 'market_stats:all', market_stats: { 7: { market_id: 7, mark_price: String(100 + tick * 0.0001) }, 8: { market_id: 8, mark_price: String(10 + tick * 0.0001) } } });
       await engine.pollVar(signal);
@@ -976,7 +979,7 @@ test('Entropy 盘口与市场状态：l2Book 推送算冲击并确认一档，�
     push('io:SNDK', '99.9', '100.1');
     clock += 30_000;
     const book = stream.depth(0)!;
-    assert.deepEqual([book.at, book.bid, book.ask], [clock, 99.9, 100.1], '连接在就是当前盘口');
+    assert.deepEqual([book.at, book.bid, book.ask], [T0, 99.9, 100.1], '读取保留该市场的深度确认时刻');
     assert.deepEqual([Math.abs(book.ask1k! - 100.1) < 1e-9, book.ask100k! > 100.1], [true, true], '1k 在第一档内成交，100k 吃到第二档');
     assert.equal(stream.topAt(0, T0)?.bid, 99.9, '盘口推送也记一档');
     // 一档没变的推送 10 秒内不重复记。
@@ -1006,7 +1009,9 @@ test('持仓取价：100k 档缺盘口快照时退回 1k 档估算，超时与�
   assert.equal(spreadOf(now, '100k'), null, '100k 档缺 B 腿盘口');
   const spread = positionSpread(now, held)!;
   assert.equal(spread.estimated, true);
-  assert.deepEqual([spread.varSource, spread.prices.aAsk, spread.prices.bBid], ['100k', now.aAsk100k, now.bBid1k], '保留有深度那条腿的档位，只有缺盘口的一腿退小档');
+  assert.equal(spread.varSource, 'interpolated');
+  assert.ok(spread.prices.aAsk > now.aAsk1k! && spread.prices.aAsk < now.aAsk100k!);
+  assert.equal(spread.prices.bBid, now.bBid1k, '只有缺盘口的一腿退回 1k 档估算');
   assert.equal(decide(now, null, params, held).kind, 'hold');
   const late = decide(sample(T0 + 31 * 60_000, 100.3), null, params, held);
   assert.equal(late.kind === 'close' && late.reason, 'timeout', '缺 100k 档也按时超时平仓');
@@ -1015,27 +1020,61 @@ test('持仓取价：100k 档缺盘口快照时退回 1k 档估算，超时与�
   assert.equal(decide(now, null, params, null).kind, 'wait', '开仓仍要求该档完整报价');
 });
 
-test('持仓取档：1000 美元的仓市值漂过分档线仍按 1k 档平仓与止损，超出名义金额两成才按市值换档', () => {
+test('持仓按量取价：1000 美元仓轻微涨价不误止损，市值穿过原两成边界与公开档位的冲击连续', () => {
   // 开仓后两腿各涨 0.3%：市值 1003 美元。B 腿 100k 档的冲击约 50 基点，1k 档 1 基点。
   const key = 'rh:NVDA|entropy:NVDA', params: SymbolParams = { ...DEFAULT_SYMBOL, stopBps: 50 };
   const held = position(key, { direction: 'a_cheap', openedAt: T0, qty: 10, notionalUsd: 1_000, entrySpread: -12, aEntry: 100, bEntry: 100.12 });
   const live = (aMid: number, bMid: number) => sample(T0 + 5_000, aMid, bMid, { symbol: key, aBidRx: aMid - 0.01, aAskRx: aMid + 0.01, aRxAt: T0 + 5_000,
     aBid100k: aMid - 0.05, aAsk100k: aMid + 0.05, bBid100k: bMid - 0.5, bAsk100k: bMid + 0.5 });
   const drifted = live(100.3, 100.42);
-  assert.deepEqual([sizeBucket(1000.03, 1000), sizeBucket(1200, 1000), sizeBucket(1200.01, 1000), sizeBucket(999, 1100), sizeBucket(800, 1100)], ['1k', '1k', '100k', '100k', '1k']);
   const mark = positionSpread(drifted, held)!, exit = closeSpread(drifted, held)!;
-  assert.deepEqual([mark.prices.aBid, mark.prices.bAsk, mark.estimated], [drifted.aBid1k, drifted.bAsk1k, false], '止损判断用 1k 档');
-  assert.deepEqual([exit.prices.aBid, exit.prices.bAsk, exit.estimated], [drifted.aBid1k, drifted.bAsk1k, false], '平仓成交用 1k 档');
-  assert.equal(decide(drifted, null, params, held).kind, 'hold', '1k 档浮亏约 4 基点');
+  assert.deepEqual(exit.prices, mark.prices);
+  assert.equal(exit.estimated, true);
+  assert.ok(Math.abs(mark.prices.bAsk - drifted.bAsk1k!) < 0.0001);
+  assert.equal(decide(drifted, null, params, held).kind, 'hold', '轻微漂移时浮亏仍约 4 基点');
   const wrong = targetSpread(drifted, { ...held, notionalUsd: 100_000, qty: 1_000 }, false)!.spread;
   assert.ok(markToMarket(held, wrong).pnlBps < -params.stopBps, '同一样本按 100k 档是约 −55 基点，会越过止损线');
   const trade = closePosition(held, drifted.t, exit, 'manual', { slippageBps: 0 }, null);
-  assert.ok(Math.abs(trade.grossUsd - (drifted.aBid1k! - 100 + 100.12 - drifted.bAsk1k!) * 10) < 1e-9);
-  // 真的亏到止损线照常止损；市值涨过两成（B 腿 125）才按 100k 档。
+  assert.ok(Math.abs(trade.grossUsd - (mark.prices.aBid - 100 + 100.12 - mark.prices.bAsk) * 10) < 1e-9);
+  // 真正的行情亏损仍触发止损。
   const crash = decide(live(99.5, 100.42), null, params, held);
   assert.equal(crash.kind === 'close' && crash.reason, 'stop');
-  const doubled = live(125, 125);
-  assert.deepEqual([positionSpread(doubled, held)?.prices.bAsk, closeSpread(doubled, held)?.prices.bAsk], [doubled.bAsk100k, doubled.bAsk100k]);
+  const book = live(100, 100);
+  for (const notionalUsd of [834, 1000, 1100]) {
+    for (const boundary of [notionalUsd * 0.8, 1000, notionalUsd * 1.2, 50_500, 100_000]) {
+      for (const delta of [-0.01, 0, 0.01]) {
+        const usd = boundary + delta, entry = { ...held, qty: usd / 100, notionalUsd };
+        const fraction = Math.max(0, Math.min(1, (usd - 1_000) / 99_000));
+        const expected = book.bAsk1k! + (book.bAsk100k! - book.bAsk1k!) * fraction;
+        const quoted = positionSpread(book, entry)!, closed = closeSpread(book, entry)!;
+        assert.ok(Math.abs(quoted.prices.bAsk - expected) < 1e-10, `名义 ${notionalUsd}，市值 ${usd}`);
+        assert.equal(closed.prices.bAsk, quoted.prices.bAsk);
+      }
+    }
+  }
+  for (const mid of [119.999, 120, 120.001]) {
+    assert.equal(decide(live(mid, mid + 0.12), null, params, held).kind, 'hold', '原 20% 边界两侧都没有触发假止损');
+  }
+});
+
+test('B 腿按实际剩余量估值，另一侧缺深度不改变平仓所用的买盘或卖盘', () => {
+  const key = 'rh:BTC|entropy:BTC@3', held = position(key, {
+    ratio: 3, qty: 0.5, bQty: 1, notionalUsd: 1_500, aEntry: 3_050, bEntry: 2_940, aFeeBps: 1, bFeeBps: 2,
+  });
+  const book = sample(T0, 3_000, 1_000, { symbol: key, ratio: 3, aBidRx: 2999.99, aAskRx: 3000.01, aRxAt: T0,
+    bBid1k: 999, bAsk1k: 1001, bBid100k: 975, bAsk100k: 1025 });
+  const spread = closeSpread(book, held)!;
+  assert.equal(spread.prices.bBid, 3 * 999, '应对冲 1.5 单位，实际 B 只成交 1 单位');
+  const trade = closePosition(held, T0, spread, 'manual', { slippageBps: 0 }, null);
+  assert.ok(Math.abs(trade.grossUsd - (0.5 * (3050 - trade.aExit) + 999 - 980)) < 1e-9);
+  assert.ok(Math.abs(trade.costUsd - (0.5 * (3050 + trade.aExit) + 2 * (980 + 999)) / 10_000) < 1e-9);
+  const larger = { ...held, qty: 50.5 / 3, bQty: 50.5 };
+  const selling = closeSpread({ ...book, bAsk100k: null }, larger)!, buying = closeSpread({ ...book, bBid100k: null }, larger)!;
+  const both = closeSpread(book, larger)!;
+  assert.deepEqual([selling.prices.bBid, buying.prices.bAsk], [3 * 987, 3 * 1013]);
+  assert.equal(selling.prices.bBid, both.prices.bBid);
+  assert.equal(buying.prices.bAsk, both.prices.bAsk);
+  assert.equal(positionSpread({ ...book, bAsk100k: null }, larger)!.prices.bBid, both.prices.bBid);
 });
 
 test('Lighter 行情流：握手不完成按超时重连，沉默重连，退避增长且封顶 60 秒', t => {
@@ -1336,6 +1375,21 @@ test('两腿行情流的配对：启用或有持仓的每 5 秒、其余每 20 �
     assert.deepEqual(view.sources.venues.map(item => [item.venue, item.enabled, item.pairs]), [['rh', false, 0], ['lighter', true, 1], ['entropy', true, 1]]);
     assert.equal(view.sources.var.enabled, false, '没有配对用到 Var');
     assert.equal(view.rows[0].bFeeBps, 6.75, 'Entropy 手续费按目录');
+    const depthAt = clock;
+    const mainBook = () => main.push({ type: 'subscribed/order_book', channel: 'order_book:9',
+      order_book: { bids: [{ price: '99.99', size: 2000 }], asks: [{ price: '100.01', size: 2000 }] } });
+    mainBook();
+    entropy.push({ channel: 'l2Book', data: { coin: 'io:SNDK', levels: [[{ px: '100.09', sz: '2000' }], [{ px: '100.11', sz: '2000' }]] } });
+    const depthReady = () => engine.views.readiness().items.find(item => item.key === 'depth')!;
+    assert.equal(depthReady().status, 'ok');
+    clock += DEPTH_MAX_GAP_MS + 1;
+    mainBook();
+    assert.equal(check(clock).written, 1, 'Entropy 仍推 BBO，采样继续');
+    const stale = store.latest(LE_SNDK)!;
+    assert.deepEqual([stale.aAsk100k !== null, stale.bBid1k, stale.bAsk100k], [true, null, null]);
+    const entropyStatus = engine.views.state().sources.venues.find(item => item.venue === 'entropy')!.depth[0];
+    assert.deepEqual([entropyStatus.at, depthReady().status], [depthAt, 'warn']);
+    assert.match(depthReady().detail, /entropy:SNDK（盘口超过 120 秒/);
   } finally { engine.close(); rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -1374,10 +1428,11 @@ test('自动配置：总览勾选即启用并按推荐参数运行，保存的�
     assert.ok(preview.params !== null && preview.params.entryBps >= 25 && preview.params.entryBps <= 50, `入场 ${preview.params?.entryBps} 应接近偏离 95 分位`);
 
     assert.deepEqual(code(() => engine.views.settings({ revision: 3, auto: 'x' })), [400, 'invalid_body']);
-    const saved = engine.views.settings({ revision: 3, symbols: { [RH_BTC]: { enabled: true } }, auto: [RH_BTC, 'rh:BTC', 'var:ETH|rh:ETH'] });
+    const saved = engine.views.settings({ revision: 3, symbols: { [RH_BTC]: { enabled: true, directions: ['a_cheap'] } }, auto: [RH_BTC, 'rh:BTC', 'var:ETH|rh:ETH'] });
     assert.deepEqual(saved.auto, [RH_BTC], '旧写法的键规整、去重，没有保存参数的键不留');
     assert.deepEqual([row().enabled, row().auto, row().autoPending, row().entryBps, row().exitBps], [true, true, false, preview.params.entryBps, -2]);
     const view = engine.views.symbol(RH_BTC, 24);
+    assert.deepEqual(row().directions, ['a_cheap'], '自动配置启用后，总览仍取该配对允许的方向');
     assert.deepEqual([view.params.entryBps, view.params.stopBps, view.params.maxHoldMinutes], [DEFAULT_SYMBOL.entryBps, DEFAULT_SYMBOL.stopBps, DEFAULT_SYMBOL.maxHoldMinutes], '保存的参数不变');
     assert.deepEqual({ entryBps: view.effective.entryBps, exitBps: view.effective.exitBps, stopBps: view.effective.stopBps, maxHoldMinutes: view.effective.maxHoldMinutes }, view.auto.params);
     assert.deepEqual([view.auto.on, view.auto.reason, view.auto.at, view.effective.notionalUsd, view.effective.cooldownMinutes], [true, null, T0, DEFAULT_SYMBOL.notionalUsd, DEFAULT_SYMBOL.cooldownMinutes]);
@@ -1824,14 +1879,18 @@ test('按实际数量选择 Var 询价：复核与持仓成交共用，其他金
   assert.deepEqual([trade.aExit, trade.exitVarSource], [100.04, 'token']);
   assert.equal(closeSpread({ ...later, aTkQty: 10 }, held)?.varSource, '1k');
 
-  // A 便宜方向：询价数量 10.1（1000 ÷ 99 取四位有效数字），对冲腿市值 1010 美元，仍按名义金额的 1k 档成交（B 腿没有 100k 档盘口）。
+  // A 便宜方向：询价数量 10.1，对冲腿市值 1010 美元。缺大档时小额对冲保留 1k 近似，有大档则按实际市值估算。
   const cheap = sample(T0, 99, 100, { bBidRx: 99.99, bAskRx: 100.01, aBidTk: 98.99, aAskTk: 99.01, aTkQty: 10.1, aTkAt: T0 + 900, aTkReceivedAt: T0 + 950 });
   const cheapSignal = decide(cheap, baseline, params, null);
   assert.ok(cheapSignal.kind === 'open' && cheapSignal.direction === 'a_cheap');
   const hedged = confirmOpen(cheap, baseline, params, cheapSignal, 30);
   assert.ok(typeof hedged !== 'string', `对冲腿不应因市值略过 1000 美元被挡：${String(hedged)}`);
-  assert.deepEqual([hedged.spread.varQtyA, hedged.spread.varSource, hedged.spread.estimated], [10.1, 'token', false]);
+  assert.deepEqual([hedged.spread.varQtyA, hedged.spread.varSource, hedged.spread.estimated], [10.1, 'token', true]);
   assert.ok(Math.abs(hedged.spread.prices.bBid - 99.98) < 1e-9, 'B 腿按 1k 档的冲击成交');
+  const full = fill({ ...cheap, bBid100k: 98, bAsk100k: 102 })!;
+  assert.equal(full.varSource, 'token');
+  assert.ok(Math.abs(full.prices.bBid - (99.98 - (10 / 99000) * 1.98)) < 1e-9);
+  assert.equal(fill({ ...cheap, bBidRx: 124.99, bAskRx: 125.01 }), undefined, '对冲量超过小额余量且没有大档时不开仓');
 });
 
 test('逐腿决策年龄：Var 在任一侧，对手一档和公开价的时效都含等待，边界等于上限可用', () => {
@@ -1883,8 +1942,10 @@ test('Var 为 B 且乘数为 2：1k/100k 回放分别成交，按持仓实际单
   const trade = run([held, end], 1000).trades[0];
   assert.deepEqual([trade.direction, trade.reason, trade.bExit, trade.exitVarSource, trade.qty], ['a_rich', 'revert', 99.9, 'token', 10]);
   assert.equal(trade.grossUsd, (trade.aEntry - trade.aExit + trade.bExit - trade.bEntry) * trade.qty);
-  const changed = { ...end, bBid0: 119.9, bAsk0: 120.1, bBid100k: 119, bAsk100k: 121, bTkQty: null };
-  assert.deepEqual([closeSpread(changed, small.open!)?.varSource, closeSpread(changed, large.open!)?.estimated], ['100k', true]);
+  const changed = { ...end, bBid0: 119.9, bAsk0: 120.1, bBid1k: 119.8, bAsk1k: 120.2, bBid100k: 119, bAsk100k: 121, bTkQty: null };
+  const sized = closeSpread(changed, small.open!)!;
+  assert.deepEqual([sized.varSource, closeSpread(changed, large.open!)?.estimated], ['interpolated', true]);
+  assert.ok(Math.abs(sized.prices.bBid - 2 * (119.8 - (2400 - 1000) / 99000 * 0.8)) < 1e-9, 'B 腿先把 A 的 10 单位折成原生 20 单位');
   assert.equal(varQuoteQty({ notionalUsd: 1000, qty: 1.234567891 }, 'b', 2, 60), null, '历史持仓不能按八位小数精确询价时改用公共档');
 });
 
@@ -2029,7 +2090,7 @@ test('引擎接 Var 询价：只给已启用的配对询价，询价记进样本
     varMid = 100.5; publicAge = 29_000; tokenWait = 8_000; mode = 'fail';
     poll = await minute();
     latest = store.latest(RH_BTC)!;
-    assert.deepEqual([poll.tokenFailed, latest.receivedAt - latest.t, latest.decisionAt! - latest.t, latest.bRxAt, latest.aTkQty], [1, 29_000, 37_000, clock, null]);
+    assert.deepEqual([poll.tokenFailed, latest.receivedAt - latest.t, latest.decisionAt! - latest.t, latest.bRxAt, latest.aTkQty], [1, 29_000, 37_000, clock - tokenWait, null], '等待期间的 stats 重放保留盘口实际确认的时刻');
     t.mock.timers.enable({ apis: ['setTimeout'] });
     try {
       mode = 'timeout';
@@ -2265,6 +2326,15 @@ test('两腿行情流的配对按策略信号驱动实盘（docs/dexspread.md �
     assert.ok(row.position && row.position.pnlBps! < -10 && row.position.pnlBps! > -15, `浮盈按实际成交价：${row.position?.pnlBps}`);
     assert.deepEqual([row.position.id, row.position.state, engine.views.symbol(key, '1').position?.entrySpread], ['l-1', 'open', (100.4 - 100) / 100 * 1e4]);
     assert.deepEqual([store.liveActive()[0]?.state, placed], ['open', []]);
+    // 缓存两腿的有效冲击；距下一次推送不到一秒时，A 腿 nonce 断档。
+    clock = T0 + 800;
+    for (const [venue, mid] of [['rh', 100.5], ['lighter', 100]] as const) sockets.get(venue)!.push({
+      type: 'subscribed/order_book', channel: 'order_book:1',
+      order_book: { bids: [{ price: mid - 0.01, size: 2000 }], asks: [{ price: mid + 0.01, size: 2000 }], nonce: 1 },
+    });
+    assert.ok(engine.views.state().sources.venues.filter(item => item.enabled).every(item => item.depth[0]?.at === clock));
+    clock += 100;
+    sockets.get('rh')!.push({ type: 'update/order_book', channel: 'order_book:1', order_book: { bids: [], asks: [], begin_nonce: 5, nonce: 6 } });
     // 价差扩到约 102 基点：按实际成交亏 62 基点，止损。第一腿的平仓单挂着没回来。
     hold = true;
     push('rh', T0 + 1_000, 101);
@@ -2272,6 +2342,8 @@ test('两腿行情流的配对按策略信号驱动实盘（docs/dexspread.md �
     assert.deepEqual([store.liveActive()[0]?.state, store.liveActive()[0]?.closeReason, placed], ['closing', 'stop', ['rh buy 1 R', 'lighter sell 1 R']]);
     assert.ok(liveEvents().some(text => text.startsWith('平仓信号（止损）')), '平仓信号写进实盘事件');
     assert.equal(store.latest(key)!.t, T0 + 1_000, '有动作的推送留下这一刻的样本');
+    const consumed = store.latest(key)!;
+    assert.deepEqual([consumed.aBid1k, consumed.aAsk100k, consumed.bAsk100k !== null], [null, null, true], '推送成交只用仍有效的 B 深度，A 的失效立即穿透一秒复用窗口');
     const checks = stats().checks;
     push('rh', T0 + 1_200, 101.3);
     assert.deepEqual([stats().checks, placed.length], [checks, 2], '平仓途中不再判断，不重复下单');
@@ -2475,7 +2547,7 @@ test('实盘持仓还原成策略持仓：旧记录没有策略读数时名义�
     closeReason: null, singleLeg: false, netUsd: null, note: '' };
   // v0.111.2 的旧记录：没有 strategy，A 腿 2 个已平掉 0.5，持仓卡住等人工。乘数 2：B 腿每单位折 2 倍。
   store.saveLive({ ...base, id: 'l-old', symbol: key, paperId: 'p-old', direction: 'a_rich', ratio: 2, state: 'stuck',
-    a: leg('rh', 'BTC', 'sell', 2, 100.4, 0.5), b: leg('lighter', 'BTC', 'buy', 4, 50, 1) });
+    a: leg('rh', 'BTC', 'sell', 2, 100.4, 0.5), b: leg('lighter', 'BTC', 'buy', 3.5, 50, 1) });
   store.saveLive({ ...base, id: 'l-gone', symbol: gone, direction: 'a_cheap', state: 'open',
     a: leg('rh', 'GONE', 'buy', 1, 10), b: leg('lighter', 'GONE', 'sell', 1, 10.02) });
   const market = (symbol: string) => ({ symbol, market_id: 1, market_type: 'perp', status: 'active', size_decimals: 4, price_decimals: 2, taker_fee: '0', mark_price: '100' });
@@ -2489,7 +2561,7 @@ test('实盘持仓还原成策略持仓：旧记录没有策略读数时名义�
     for (const venue of ['rh', 'lighter'] as const) await engine.refreshCatalog(new AbortController().signal, venue);
     for (const socket of sockets.values()) socket.push(RH_SNAPSHOT);
     const held = engine.views.symbol(key, '1').position!;
-    assert.deepEqual([held.state, held.qty, held.notionalUsd, held.aEntry, held.bEntry, held.ratio], ['stuck', 1.5, 200.8, 100.4, 100, 2]);
+    assert.deepEqual([held.state, held.qty, held.bQty, held.notionalUsd, held.aEntry, held.bEntry, held.ratio], ['stuck', 1.5, 2.5, 200.8, 100.4, 100, 2]);
     assert.ok(Math.abs(held.entrySpread - 40) < 1e-9, `入场价差 (100.4 − 2×50) / (2×50)：${held.entrySpread}`);
     const orphan = engine.views.state().orphans.find(item => item.key === gone)!;
     assert.deepEqual([orphan.key, orphan.position?.id, orphan.position?.state, orphan.position?.direction], [gone, 'l-gone', 'open', 'a_cheap']);
@@ -2529,7 +2601,7 @@ test('#11 orderPlan：A 腿精度更粗取整后重算 B 腿数量，防止两�
   assert.equal(alignedPlan.ready, true);
 });
 
-test('#20a LighterStream.depth 按 nonce 缓存排序档位并在 delta/resync 时失效', () => {
+test('LighterStream.depth 缓存盘口冲击，未收到增量时保留来源时间，异常在推送复用窗口内也立即失效', () => {
   let clock = T0;
   const sockets: FakeSocket[] = [];
   const stream = new LighterStream({ venue: 'rh', connect: () => { const socket = new FakeSocket(); sockets.push(socket); return socket; }, now: () => clock });
@@ -2544,12 +2616,12 @@ test('#20a LighterStream.depth 按 nonce 缓存排序档位并在 delta/resync �
     const d1 = stream.depth(7)!;
     clock += 1_000;
     const d2 = stream.depth(7)!;
-    assert.deepEqual([d1.bid, d1.ask, d1.at], [100, 101, T0 + 1_000]);
-    assert.deepEqual([d2.bid, d2.ask, d2.at], [100, 101, T0 + 2_000]);
+    assert.deepEqual([d1.bid, d1.ask, d1.at], [100, 101, T0]);
+    assert.deepEqual(d2, d1);
     socket.push({ type: 'update/order_book', channel: 'order_book:7', order_book: { bids: [{ price: '100.5', size: '15' }], asks: [], begin_nonce: 10, nonce: 11 } });
     assert.equal(stream.depth(7)!.bid, 100.5);
     socket.push({ type: 'update/order_book', channel: 'order_book:7', order_book: { bids: [{ price: '101.5', size: '10' }], asks: [], begin_nonce: 11, nonce: 12 } });
-    assert.equal(stream.depth(7), null, '倒挂触发 resync 清除缓存');
+    assert.equal(stream.depth(7, 1000), null, '倒挂触发 resync 清除推送的冲击缓存');
   } finally { stream.close(); }
 });
 
@@ -2749,4 +2821,174 @@ test('开关关闭后再重启不复用已关闭的旧私有流与陈旧 traderC
     assert.equal(liveStatus.rh?.wsHits, 1, '重开后通过新私有流 S2 命中 WS 确认');
     assert.equal(liveStatus.rh?.restFallbacks, 0);
   } finally { engine.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('Lighter 单市场深度停推：同价同量的连续增量可确认，其他市场、心跳与读取不能续期', t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+  let clock = T0;
+  const sockets: FakeSocket[] = [];
+  const stream = new LighterStream({ now: () => clock, connect: () => { const socket = new FakeSocket(); sockets.push(socket); return socket; } });
+  const markets = new Map([[1, '1'], [2, '2']]);
+  const push = (id: number, type: string, book: object) => sockets.at(-1)!.push({ type: `${type}/order_book`, channel: `order_book:${id}`, order_book: book });
+  const snapshot = (id: number, size = '2000') => push(id, 'subscribed', { nonce: 1, bids: [{ price: '99.99', size }], asks: [{ price: '100.01', size }] });
+  const subscriptions = (socket: FakeSocket) => socket.sent.filter(item => item.channel === 'order_book/1').map(item => item.type);
+  try {
+    stream.setDepthMarkets(markets); stream.start();
+    const first = sockets[0];
+    first.open(); first.push(RH_SNAPSHOT);
+    snapshot(1); snapshot(2);
+    clock += 10_000;
+    push(1, 'update', { bids: [], asks: [], begin_nonce: 1, nonce: 2 });
+    const confirmed = stream.depth(1)!;
+    assert.equal(confirmed.at, clock);
+    assert.ok(confirmed.bid100k !== null);
+    clock += DEPTH_MAX_GAP_MS;
+    snapshot(2); first.push({ type: 'ping' }); first.push(RH_SNAPSHOT);
+    assert.deepEqual(stream.depth(1), confirmed, '等于时限时可读，读取保留原时刻');
+    clock++;
+    first.push({ type: 'ping' });
+    assert.equal(stream.depth(1, 1000), null, '定时检查还没跑也拒用');
+    assert.match(stream.depthError(1)!, /超过 120 秒/);
+    const other = stream.depth(2)!;
+    assert.equal(other.at, clock - 1);
+    t.mock.timers.tick(1_000);
+    const resubscribed = ['subscribe', 'unsubscribe', 'subscribe'];
+    assert.deepEqual(subscriptions(first), resubscribed);
+    stream.setDepthMarkets(markets); t.mock.timers.tick(1_000);
+    push(1, 'update', { bids: [], asks: [], begin_nonce: 2, nonce: 3 });
+    assert.equal(stream.depth(1), null, '重订后须等新的完整快照');
+    assert.deepEqual(subscriptions(first), resubscribed, '反复检查不重复订阅');
+    snapshot(1, '5');
+    assert.deepEqual([stream.depth(1)?.at, stream.depth(1)?.bid100k], [clock, null], '同价但数量已变，按恢复快照重算');
+    first.onclose?.({}); t.mock.timers.tick(1_000);
+    const next = sockets[1];
+    next.open(); next.push(RH_SNAPSHOT);
+    assert.deepEqual(subscriptions(next), ['subscribe']);
+    assert.equal(stream.depth(1), null);
+    snapshot(1);
+    assert.deepEqual([stream.depth(1)?.at, stream.depth(1)?.bid100k], [clock, confirmed.bid100k]);
+    next.push({ type: 'update/market_stats', channel: 'market_stats:all', market_stats: { 1: { market_id: 1, best_bid_price: '98', best_ask_price: '101' } } });
+    clock += DEPTH_MAX_GAP_MS + 1;
+    snapshot(2); next.push({ type: 'ping' }); t.mock.timers.tick(1_000);
+    assert.equal(stream.topAt(1, clock), null, '只有别的市场活跃时，重订不能把旧 market_stats 买卖价当成刚收到');
+    assert.equal(stream.depth(2)?.at, clock);
+    snapshot(1);
+    clock += 6_000;
+    const statsAt = clock;
+    next.push({ type: 'update/market_stats', channel: 'market_stats:all', market_stats: { 1: { market_id: 1, best_bid_price: '98', best_ask_price: '101' } } });
+    clock += 4_000;
+    push(1, 'update', { bids: [], asks: [], begin_nonce: 9, nonce: 10 });
+    assert.deepEqual([stream.topAt(1, clock)?.bid, stream.topAt(1, clock)?.at], [98, statsAt], '退回仍有效的 market_stats 时保留它的接收时间');
+    const samePriceAt = clock;
+    next.push(RH_SNAPSHOT);
+    clock++;
+    push(1, 'subscribed', { nonce: 1, bids: [{ price: '99.9', size: '20' }], asks: [{ price: '100.1', size: '20' }] });
+    clock++; snapshot(1);
+    stream.setDepthMarkets(new Map([[2, '2']]));
+    assert.equal(stream.topAt(1, clock)?.at, samePriceAt, '切换来源时即使价格相同也按 stats 的时刻核龄');
+  } finally { stream.close(); }
+});
+
+test('Entropy 单市场深度停推：BBO、市场状态和其他币种的 l2Book 不能续期，限频重订后按新数量恢复', t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+  let clock = T0;
+  const sockets: FakeSocket[] = [];
+  const stream = new HyperliquidStream({ now: () => clock, connect: () => { const socket = new FakeSocket(); sockets.push(socket); return socket; } });
+  const markets = new Map([[0, 'io:SNDK'], [1, 'io:OAI']]);
+  const book = (coin: string, size = '2000') => sockets.at(-1)!.push({ channel: 'l2Book', data: { coin, levels: [[{ px: '99.99', sz: size }], [{ px: '100.01', sz: size }]] } });
+  const subscriptions = (socket: FakeSocket) => socket.sent.filter(item => (item.subscription as { type?: string; coin?: string } | undefined)?.type === 'l2Book').map(item => [item.method, (item.subscription as { coin: string }).coin]);
+  try {
+    stream.setMarkets(markets); stream.setDepthMarkets(markets); stream.start();
+    const first = sockets[0];
+    first.open(); book('io:SNDK'); book('io:OAI');
+    clock += 20_000; book('io:SNDK');
+    const confirmed = stream.depth(0)!;
+    assert.equal(confirmed.at, clock);
+    assert.ok(confirmed.bid100k !== null);
+    clock += DEPTH_MAX_GAP_MS;
+    book('io:OAI');
+    first.push({ channel: 'activeAssetCtx', data: { coin: 'io:SNDK', ctx: { markPx: '100' } } });
+    first.push({ channel: 'bbo', data: { coin: 'io:SNDK', bbo: [{ px: '100.02' }, { px: '100.03' }] } });
+    assert.deepEqual(stream.depth(0), confirmed, '等于时限仍可用');
+    first.sent.length = 0;
+    clock++; first.push({ channel: 'pong' });
+    assert.equal(stream.topAt(0, clock)?.at, clock - 1, '本市场的一档仍新鲜');
+    assert.equal(stream.depth(0), null);
+    assert.match(stream.depthError(0)!, /超过 120 秒/);
+    stream.tick(); stream.tick(); stream.setDepthMarkets(markets);
+    const oneRetry = [['unsubscribe', 'io:SNDK'], ['subscribe', 'io:SNDK']];
+    assert.deepEqual(subscriptions(first), oneRetry);
+    assert.equal(stream.depth(1)?.at, clock - 1);
+    clock += 60_000; first.push({ channel: 'pong' }); stream.tick();
+    assert.deepEqual(subscriptions(first), oneRetry);
+    clock++; stream.tick();
+    assert.deepEqual(subscriptions(first), [...oneRetry, ...oneRetry]);
+    book('io:SNDK', '5');
+    assert.deepEqual([stream.depth(0)?.at, stream.depth(0)?.bid100k, stream.depthError(0)], [clock, null, null]);
+    first.onclose?.({}); t.mock.timers.tick(1_000);
+    const next = sockets[1];
+    next.open(); next.push({ channel: 'pong' });
+    assert.deepEqual(subscriptions(next), [['subscribe', 'io:SNDK'], ['subscribe', 'io:OAI']]);
+    assert.equal(stream.depth(0), null);
+    book('io:SNDK');
+    assert.equal(stream.depth(0)?.bid100k, confirmed.bid100k);
+    next.push({ channel: 'l2Book', data: { coin: 'io:SNDK', levels: [[{ px: '99', sz: '2' }, { px: '98', sz: 'bad' }], [{ px: '100', sz: '2' }]] } });
+    assert.equal(stream.depth(0), null, '一条损坏的档位不会把部分深度当成新快照');
+    assert.match(stream.depthError(0)!, /档位无效/);
+  } finally { stream.close(); }
+});
+
+test('采样与实盘准备按当前订阅核对深度：过期后的历史对齐和重订途中的旧快照都不能充当可成交档', async () => {
+  let clock = T0;
+  const fetchImpl = async (url: string) => url.includes('orderBookDetails')
+    ? Response.json({ code: 200, order_book_details: [{ symbol: 'BTC', market_id: 1, market_type: 'perp', status: 'active', size_decimals: 4, price_decimals: 2, mark_price: '100' }] })
+    : Response.json({ listings: [{ ticker: 'BTC', mark_price: '100', quotes: { updated_at: new Date(clock - 2_000).toISOString(),
+      base: { bid: '99.99', ask: '100.01' }, size_1k: { bid: '99.98', ask: '100.02' }, size_100k: { bid: '99.9', ask: '100.1' } } }] });
+  const { engine, store, sockets, dispose } = seededEngine(store => store.setState(SETTINGS_KEY, settings2({ [RH_BTC]: { ...DEFAULT_SYMBOL, enabled: true } }), T0), { clock: () => clock, fetchImpl });
+  const depth = () => engine.views.state().sources.venues.find(item => item.venue === 'rh')!.depth[0];
+  const readiness = () => engine.views.readiness().items.find(item => item.key === 'depth')!.status;
+  try {
+    engine.startStreams();
+    const rh = sockets[0];
+    rh.open(); rh.push(RH_SNAPSHOT);
+    const signal = new AbortController().signal;
+    await engine.refreshCatalog(signal, 'rh'); await engine.pollVar(signal);
+    const book = { bids: [{ price: '99.99', size: '2000' }], asks: [{ price: '100.01', size: '2000' }], nonce: 1 };
+    const restore = () => rh.push({ type: 'subscribed/order_book', channel: 'order_book:1', order_book: book });
+    restore();
+    clock += 5_000; rh.push(RH_SNAPSHOT); await engine.pollVar(signal);
+    assert.ok(store.latest(RH_BTC)!.bBid100k !== null);
+    assert.deepEqual([depth().at, depth().error, readiness()], [T0, null, 'ok']);
+    clock = T0 + DEPTH_MAX_GAP_MS - 3_000; rh.push(RH_SNAPSHOT);
+    clock = T0 + DEPTH_MAX_GAP_MS; rh.push(RH_SNAPSHOT);
+    assert.equal(readiness(), 'ok');
+    clock++; rh.push({ type: 'ping' }); await engine.pollVar(signal);
+    const latest = store.latest(RH_BTC)!;
+    assert.equal(latest.t, clock - 2_000, 'Var 报价在深度失效前，实际采样时已经失效');
+    assert.deepEqual([latest.bBid1k, latest.bAsk100k, depth().at, readiness()], [null, null, T0, 'warn']);
+    assert.equal(spreadOf(latest, '100k'), null);
+    assert.equal(spreadOf(latest, '1k')?.estimated, true);
+    assert.match(depth().error!, /超过 120 秒/);
+    restore(); clock += 5_000; rh.push(RH_SNAPSHOT); await engine.pollVar(signal);
+    assert.ok(store.latest(RH_BTC)!.bAsk100k !== null);
+    // 重订原因与年龄无关时也须清掉消费缓存；Var 对齐时刻可以落在上一次有效深度之前。
+    clock++;
+    rh.push({ type: 'update/order_book', channel: 'order_book:1', order_book: { bids: [], asks: [], begin_nonce: 9, nonce: 10 } });
+    await engine.pollVar(signal);
+    const unsynced = store.latest(RH_BTC)!;
+    assert.deepEqual([unsynced.t, unsynced.bBid1k, unsynced.bAsk100k, readiness()], [clock - 2_000, null, null, 'warn']);
+    assert.match(depth().error!, /增量不连续/);
+    clock += 78_000;
+    rh.push({ type: 'subscribed/order_book', channel: 'order_book:1', order_book: { bids: [{ price: '100.5', size: '20' }], asks: [{ price: '100.6', size: '20' }], nonce: 12 } });
+    const beforeGap = clock;
+    clock += 2_000;
+    rh.push({ type: 'update/order_book', channel: 'order_book:1', order_book: { bids: [], asks: [], begin_nonce: 20, nonce: 21 } });
+    await engine.pollVar(signal);
+    const delayed = store.latest(RH_BTC)!;
+    assert.deepEqual([delayed.t, delayed.bBid0, delayed.bRxAt, delayed.bBid1k], [beforeGap, 100.5, null, null], '失效后收到的 Var 报价保留断档前一档；决策时刻的一档和深度为空');
+    clock += 3_000; restore(); await engine.pollVar(signal);
+    assert.equal(store.latest(RH_BTC)!.t, beforeGap, 'Var 对齐落在空窗时，即使当前已恢复仍跳过');
+    clock += 2_000; await engine.pollVar(signal);
+    assert.deepEqual([store.latest(RH_BTC)!.t, store.latest(RH_BTC)!.bBid0], [clock - 2_000, 99.99]);
+  } finally { dispose(); }
 });

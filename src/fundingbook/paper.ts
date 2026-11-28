@@ -3,6 +3,7 @@
 // 单边成本率从现金里扣；资金费按已结算记录逐笔计，持仓数量取计入那一刻的数量。
 import type { PlanStep } from './plan.ts';
 import type { FundingRecord } from './stats.ts';
+import { ACCOUNT_ID, BASE_ID, record, StateFormatError } from './model.ts';
 
 export interface PaperPosition {
   symbol: string;
@@ -14,6 +15,32 @@ export interface PaperPosition {
 }
 export interface PaperAccount { cash: number; funding: number; fees: number; realized: number; positions: Record<string, PaperPosition> }
 export interface PaperBook { startedAt: number; initialCapital: number; accounts: Record<string, PaperAccount> }
+
+const finite = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
+const timestamp = (value: unknown): boolean => finite(value) && Number.isSafeInteger(value) && value >= 0;
+
+function bookFields(value: unknown, keys: readonly string[]): Record<string, unknown> {
+  const fields = record(value);
+  if (!fields) throw new StateFormatError('账本记录须为对象');
+  if (Object.keys(fields).some(key => !keys.includes(key))) throw new StateFormatError('账本含不支持的字段', 'unsupported');
+  if (!keys.every(key => Object.hasOwn(fields, key))) throw new StateFormatError('账本缺少必要字段');
+  return fields;
+}
+
+/** 只有已识别的完整账本才允许交给规划器写回。现金、资金费、已实现盈亏和持仓数量可以为负。 */
+export function storedBook(raw: unknown): PaperBook {
+  const book = bookFields(raw, ['startedAt', 'initialCapital', 'accounts']), accounts = record(book.accounts);
+  if (!timestamp(book.startedAt) || !finite(book.initialCapital) || book.initialCapital <= 0 || !accounts || !Object.keys(accounts).length) throw new StateFormatError('账本起点或账户表无效');
+  for (const [id, item] of Object.entries(accounts)) {
+    const account = bookFields(item, ['cash', 'funding', 'fees', 'realized', 'positions']), positions = record(account.positions);
+    if (!ACCOUNT_ID.test(id) || !finite(account.cash) || !finite(account.funding) || !finite(account.realized) || !finite(account.fees) || account.fees < 0 || !positions) throw new StateFormatError('账本账户结构或金额无效');
+    for (const [base, item] of Object.entries(positions)) {
+      const p = bookFields(item, ['symbol', 'qty', 'entry', 'fundingAt']);
+      if (!BASE_ID.test(base) || typeof p.symbol !== 'string' || !p.symbol.trim() || !finite(p.qty) || p.qty === 0 || !finite(p.entry) || p.entry <= 0 || !timestamp(p.fundingAt)) throw new StateFormatError('账本持仓结构或数值无效');
+    }
+  }
+  return raw as PaperBook;
+}
 
 const empty = (cash = 0): PaperAccount => ({ cash, funding: 0, fees: 0, realized: 0, positions: {} });
 
@@ -29,7 +56,7 @@ export function occupiedAccounts(book: PaperBook, keep: readonly string[]): stri
 
 /** 让账户表与参数一致：补上新加的账户，去掉已删且空着的账户。 */
 export function reconcileAccounts(book: PaperBook, accounts: readonly string[]): void {
-  for (const id of accounts) book.accounts[id] ??= empty();
+  for (const id of accounts) if (!Object.hasOwn(book.accounts, id)) book.accounts[id] = empty();
   for (const id of Object.keys(book.accounts)) if (!accounts.includes(id) && !occupiedAccounts(book, accounts).includes(id)) delete book.accounts[id];
 }
 

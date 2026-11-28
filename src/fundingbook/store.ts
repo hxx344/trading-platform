@@ -1,7 +1,8 @@
 // 资金费组合自己的数据库（fundingbook.sqlite，docs/fundingbook.md 第 7 节）：已结算资金费、小时收盘价、
 // 各序列已查询的范围、参数、模拟盘与每轮规划。只有本模块写。丢掉这个文件丢的是模拟盘与规划记录，行情历史会重新回补。
 import { DatabaseSync } from 'node:sqlite';
-import type { PaperBook } from './paper.ts';
+import { StateFormatError, storedSettings } from './model.ts';
+import { storedBook, type PaperBook } from './paper.ts';
 import type { FundingRecord, PricePoint } from './stats.ts';
 
 export const FUNDINGBOOK_FILE = 'fundingbook.sqlite';
@@ -11,6 +12,8 @@ export const ROUND_RETENTION = 500;
 export interface Coverage { from: number | null; to: number | null; error: string | null; retryAt: number }
 export interface StoredRound { id: number; at: number; summary: unknown }
 export type FundingBookStore = ReturnType<typeof openFundingBookStore>;
+type StoredState<T> = { status: 'missing' } | { status: 'invalid'; reason: string } | { status: 'valid'; value: T };
+const PENDING_SETTINGS = 'settings-recovery';
 
 export function openFundingBookStore(file: string) {
   const db = new DatabaseSync(file);
@@ -46,15 +49,24 @@ export function openFundingBookStore(file: string) {
   const pruneFunding = db.prepare('DELETE FROM funding WHERE time < ?');
   const prunePrices = db.prepare('DELETE FROM prices WHERE time < ?');
 
-  const state = (key: string): unknown => {
+  function state<T>(key: string, parse: (raw: unknown) => T): StoredState<T> {
     const row = readState.get(key) as { json: string } | undefined;
-    if (!row) return null;
-    try { return JSON.parse(row.json); } catch { return null; }
-  };
+    if (!row) return { status: 'missing' };
+    let raw: unknown;
+    try { raw = JSON.parse(row.json); } catch { return { status: 'invalid', reason: 'JSON 损坏' }; }
+    try { return { status: 'valid', value: parse(raw) }; }
+    catch (error) {
+      if (!(error instanceof StateFormatError)) throw error;
+      return { status: 'invalid', reason: error.reason === 'unsupported' ? '含当前版本不支持的字段' : '记录结构或数值无效' };
+    }
+  }
   return {
-    settings: (): unknown => state('settings'),
-    saveSettings(value: unknown, now: number): void { putState.run('settings', JSON.stringify(value), now); },
-    book: (): PaperBook | null => state('book') as PaperBook | null,
+    settings: () => state('settings', storedSettings),
+    settingsRecoveryPending: () => !!readState.get(PENDING_SETTINGS),
+    saveSettings(value: unknown, now: number): void {
+      transaction(() => { putState.run('settings', JSON.stringify(value), now); dropState.run(PENDING_SETTINGS); });
+    },
+    book: () => state('book', storedBook),
     /** 模拟盘与这一轮规划一起落库：只落一半会让下一轮从对不上的仓位出发。 */
     commitRound(book: PaperBook, at: number, summary: unknown, detail: unknown): number {
       return transaction(() => {
@@ -64,8 +76,13 @@ export function openFundingBookStore(file: string) {
         return id;
       });
     },
-    /** 重置模拟盘：持仓、现金与规划记录一起清掉。 */
-    resetPaper(): void { transaction(() => { dropState.run('book'); clearRounds.run(); }); },
+    /** 清账本和历史会抹去「缺少参数」的旁证；同一事务保留尚未确认恢复的参数状态。 */
+    resetPaper(pendingSettings = false, now = Date.now()): void {
+      transaction(() => {
+        if (pendingSettings) putState.run(PENDING_SETTINGS, 'true', now);
+        dropState.run('book'); clearRounds.run();
+      });
+    },
     coverage(key: string): Coverage | null {
       const row = readCoverage.get(key) as { from_ms: number | null; to_ms: number | null; error: string | null; retry_at: number } | undefined;
       return row ? { from: row.from_ms, to: row.to_ms, error: row.error, retryAt: row.retry_at } : null;

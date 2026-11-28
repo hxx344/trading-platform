@@ -34,7 +34,7 @@ export function FundingBookPage({ tab, onExpired }: { tab: FundingBookTab; onExp
     </nav> : null}
     {error && data ? <p className="vl-note err" role="status">刷新失败：{error.message}（数据停留在 {receivedAt ? new Date(receivedAt).toLocaleTimeString() : '—'}）</p> : null}
     {write.message ? <Callout tone={write.message.tone} action={{ label: '知道了', onClick: write.clear }}>{write.message.text}</Callout> : null}
-    {hint && tab !== 'settings' ? <Callout tone={hint.tone}>{hint.text}</Callout> : null}
+    {hint && (tab !== 'settings' || data?.recovery.settings || data?.recovery.book) ? <Callout tone={hint.tone}>{hint.text}</Callout> : null}
     {!data
       ? status === 'error' || status === 'offline' ? <StatePanel kind="error" title="读取资金费组合模块失败" detail={error?.message ?? '网络离线'} /> : <StatePanel kind="loading" title="加载中…" />
       : tab === 'overview' ? <Overview view={data} />
@@ -47,7 +47,7 @@ export function FundingBookPage({ tab, onExpired }: { tab: FundingBookTab; onExp
 function Chips({ view }: { view: StateView }) {
   const collecting = view.collect.total > 0 && view.collect.done < view.collect.total;
   return <div className="vl-sources" aria-label="运行状态">
-    <span className={`vl-chip ${view.settings.enabled ? 'ok' : ''}`}><i />{view.settings.enabled ? '模拟盘运行中' : '未启用'}</span>
+    <span className={`vl-chip ${view.roundError ? 'warn' : view.settings.enabled ? 'ok' : ''}`}><i />{view.roundError ? '规划暂停' : view.settings.enabled ? '模拟盘运行中' : '未启用'}</span>
     <span className={`vl-chip ${view.running ? 'ok' : 'warn'}`}><i />{view.running ? '行情在线' : '合约价差监控未运行'}</span>
     {view.settings.enabled && view.running ? <span className={`vl-chip ${view.collect.errors.length ? 'warn' : collecting ? '' : 'ok'}`} title={view.collect.errors.join('\n') || undefined}><i />历史 {view.collect.done} / {view.collect.total}</span> : null}
     {view.solving ? <span className="vl-chip"><i />求解中</span> : null}
@@ -59,8 +59,8 @@ function Overview({ view }: { view: StateView }) {
   const profit = book && book.equity !== null ? book.equity - book.initialCapital : null;
   return <>
     <section className="vl-metrics" aria-label="组合">
-      <Metric label="模拟盘权益" value={usd(book?.equity, 2)} tone={tone(profit)} foot={book ? `本金 ${usd(book.initialCapital)} · 盈亏 ${signedUsd(profit)}` : '还没有模拟盘'} />
-      <Metric label="预期年化（调整均值）" value={percent(round?.expectedApr)} tone={tone(round?.expectedApr)} foot={round ? `按短窗口 ${percent(round.optimisticApr)} · 相对权益，不含成本` : '第一轮规划后给出'} />
+      <Metric label="模拟盘权益" value={usd(book?.equity, 2)} tone={tone(profit)} foot={book ? `本金 ${usd(book.initialCapital)} · 盈亏 ${signedUsd(profit)}` : view.recovery.book ? '账本不可用' : '还没有模拟盘'} />
+      <Metric label="预期年化（调整均值）" value={percent(round?.expectedApr)} tone={tone(round?.expectedApr)} foot={round ? `按短窗口 ${percent(round.optimisticApr)} · 相对权益，不含成本` : view.roundError ? '本轮无法估算' : '第一轮规划后给出'} />
       <Metric label="持仓名义合计" value={usd(round?.gross)} foot={round ? `权益的 ${round.capital > 0 ? (round.gross / round.capital).toFixed(2) : '—'} 倍 · 上限 ${view.settings.maxGrossLeverage} 倍` : undefined} />
       <Metric label="所需资金" value={usd(round?.required)} foot={round ? `占权益 ${percent(round.required / round.capital, 1)} · 预留 ${view.settings.reservePct}%` : undefined} />
       <Metric label="累计资金费" value={signedUsd(book?.funding)} tone={tone(book?.funding)} foot={book ? `手续费与滑点 ${usd(book.fees, 2)}` : undefined} />
@@ -79,7 +79,7 @@ function Overview({ view }: { view: StateView }) {
           <td className={`num ${account.distance !== null && account.distance < view.settings.safetySigma ? 'vl-warn' : ''}`}>{multiple(account.distance)}</td>
           <td className="wrap">{account.positions.length ? account.positions.map(position => <span key={position.base}>{position.notional > 0 ? '多' : '空'} {position.base} {usd(Math.abs(position.notional))}<Badge tone={-position.notional * position.adjustedApr > 0 ? 'ok' : 'warn'}>{position.notional > 0 ? '付' : '收'} {percent(position.adjustedApr)}</Badge> </span>) : <span className="vl-dim">空仓</span>}</td>
         </tr>)}</tbody></table></div>
-        : <TableEmpty>还没有规划。启用并补齐历史后给出第一轮。</TableEmpty>}
+        : <TableEmpty>{view.roundError ? '本轮没有账户风险估算或目标仓位。已有持仓可在模拟盘查看。' : '还没有规划。启用并补齐历史后给出第一轮。'}</TableEmpty>}
       <p className="vl-note">安全距离 =（目标权益 − 维持保证金）÷ 1 日波动金额：价格朝不利方向走这么多个日标准差才触及维持保证金。1 日波动金额按账户内各标的的波动率与相关性合算，方向相反的相关标的会互相抵掉。</p>
     </section>
     <section className="panel" aria-label="各标的的作用">
@@ -94,7 +94,7 @@ function Overview({ view }: { view: StateView }) {
           <td className={`num vl-${tone(item.marginal)}`}>{signedUsd(item.marginal)}</td>
           <td className="wrap">{item.impacts.map(impact => <span key={impact.account}>{impact.account}：{usd(impact.sigmaWithout)} → {usd(impact.sigma)}（{multiple(impact.distanceWithout)} → {multiple(impact.distance)}）<br /></span>)}</td>
         </tr>)}</tbody></table></div>
-        : <TableEmpty>{round ? '这一轮没有值得开的仓位：各账户之间的息差扣掉往返成本后不为正' : '还没有规划'}</TableEmpty>}
+        : <TableEmpty>{round ? '这一轮没有值得开的仓位：各账户之间的息差扣掉往返成本后不为正' : view.roundError ? '本轮无法估算各标的的作用' : '还没有规划'}</TableEmpty>}
       <p className="vl-note">边际贡献：不许做这个标的时重新求解，整个组合在持有期内的净收入少多少。自身收入不为正而边际贡献为正的标的是对冲仓：它压低账户的波动金额，腾出的额度由息差仓位用掉。「对账户波动的影响」是去掉这个标的之前 → 之后的 1 日波动金额与安全距离。</p>
     </section>
     <div className="vl-columns">
@@ -151,10 +151,10 @@ function PlanTab({ view, write, onChanged, onExpired }: { view: StateView; write
   const plan = () => { void write.run('plan', () => api(`${FUNDINGBOOK_BASE}/plan`, { body: {} }), () => { setPicked(null); void onChanged(); return '已排入下一轮规划，这一遍采集结束后开始'; }); };
   return <>
     <section className="panel" aria-label="路径规划">
-      <div className="panel-heading"><h2>路径规划{shown ? ` · 第 ${shown.id} 轮` : ''}</h2><span className="muted">{shown ? `${stamp(shown.at)} · ${shown.applied ? '已记入模拟盘' : '只出规划，模拟盘未动'}` : ''}</span></div>
+      <div className="panel-heading"><h2>{chosen !== null ? '历史规划' : '路径规划'}{shown ? ` · 第 ${shown.id} 轮` : ''}</h2><span className="muted">{shown ? `${stamp(shown.at)} · ${shown.applied ? '已记入模拟盘' : '只出规划，模拟盘未动'}` : ''}</span></div>
       <div className="vl-toolbar">
         <span className="muted">先减仓放出保证金，再在账户之间划转，最后加仓。只是规划：不向任何交易所发单。</span><span className="grow" />
-        <button type="button" className="button secondary" disabled={write.busy !== null || !view.settings.enabled || !view.running} onClick={plan}>{write.busy === 'plan' ? <LoaderCircle size={14} className="spin" aria-hidden="true" /> : <Play size={14} aria-hidden="true" />}立即规划</button>
+        <button type="button" className="button secondary" disabled={write.busy !== null || !view.settings.enabled || !view.running || !!view.recovery.settings || !!view.recovery.book} onClick={plan}>{write.busy === 'plan' ? <LoaderCircle size={14} className="spin" aria-hidden="true" /> : <Play size={14} aria-hidden="true" />}立即规划</button>
       </div>
       {shown ? <>
         <div className="vl-metrics inset">
@@ -165,7 +165,7 @@ function PlanTab({ view, write, onChanged, onExpired }: { view: StateView; write
         </div>
         <Steps round={shown} />
       </> : chosen !== null && detail.error ? <p className="vl-note err">读取第 {chosen} 轮失败：{detail.error.message}</p>
-        : <TableEmpty>{chosen !== null ? '读取中…' : '还没有规划'}</TableEmpty>}
+        : <TableEmpty>{chosen !== null ? '读取中…' : view.roundError ? '本轮没有调整或划转建议。可在下方选择历史轮次。' : '还没有规划'}</TableEmpty>}
     </section>
     <section className="panel" aria-label="规划记录">
       <div className="panel-heading"><h2>规划记录</h2><span className="muted">最近 {view.rounds.length} 轮</span></div>
@@ -194,15 +194,15 @@ function PaperTab({ view, write, onChanged }: { view: StateView; write: Write; o
   const reset = async () => {
     if (writeBusyRef.current !== null) return;
     if (!await dialog.confirm(resetConfirmText(view), { title: '重置模拟盘', confirmLabel: '确认重置', tone: 'danger' })) return;
-    if (!dialog.isAlive() || writeBusyRef.current !== null || !viewRef.current.book) return;
-    void write.run('reset', () => api(`${FUNDINGBOOK_BASE}/paper/reset`, { body: { confirm: true } }), () => { void onChanged(); return '模拟盘已重置，下一轮规划从本金重新开始'; });
+    if (!dialog.isAlive() || writeBusyRef.current !== null || viewRef.current.book?.startedAt !== book?.startedAt || viewRef.current.recovery.book !== view.recovery.book) return;
+    void write.run('reset', () => api(`${FUNDINGBOOK_BASE}/paper/reset`, { body: { confirm: true } }), () => { void onChanged(); return '模拟账本与规划记录已重置'; });
   };
   const profit = book && book.equity !== null ? book.equity - book.initialCapital : null;
   const days = book ? (view.checkedAt - book.startedAt) / 86_400_000 : 0;
   const points = book ? [...view.rounds].reverse().map(item => ({ t: item.at, net: item.capital - book.initialCapital })) : [];
   return <>
     <section className="vl-metrics" aria-label="模拟盘">
-      <Metric label="权益" value={usd(book?.equity, 2)} tone={tone(profit)} foot={book ? `本金 ${usd(book.initialCapital)} · 自 ${stamp(book.startedAt)}` : '第一轮规划时建立'} />
+      <Metric label="权益" value={usd(book?.equity, 2)} tone={tone(profit)} foot={book ? `本金 ${usd(book.initialCapital)} · 自 ${stamp(book.startedAt)}` : view.recovery.book ? '账本不可用' : '第一轮规划时建立'} />
       <Metric label="累计盈亏" value={signedUsd(profit)} tone={tone(profit)} foot={profit !== null && book && days >= 1 ? `折年化 ${percent(profit / book.initialCapital / days * 365)}（${days.toFixed(1)} 天）` : '满 1 天后给出折年化'} />
       <Metric label="资金费" value={signedUsd(book?.funding)} tone={tone(book?.funding)} foot="按已结算记录逐笔计入" />
       <Metric label="手续费与滑点" value={usd(book?.fees, 2)} foot={`已实现价差盈亏 ${signedUsd(book?.realized)}`} />
@@ -212,7 +212,7 @@ function PaperTab({ view, write, onChanged }: { view: StateView; write: Write; o
       <div className="vl-chart small"><EquityChart points={points} label="模拟盘累计盈亏" /></div>
     </section> : null}
     <section className="panel" aria-label="模拟持仓">
-      <div className="panel-heading"><h2>账户与持仓</h2><span className="muted">{view.settings.paperAuto ? '每轮规划后按规划更新' : '自动更新已关闭，持仓不动'}</span></div>
+      <div className="panel-heading"><h2>账户与持仓</h2><span className="muted">{view.roundError ? '本轮暂停更新' : view.settings.paperAuto ? '每轮规划后按规划更新' : '自动更新已关闭，持仓不动'}</span></div>
       {book ? <div className="vl-table"><table>
         <thead><tr><th>账户 · 标的</th><th className="num">数量</th><th className="num">开仓均价</th><th className="num">现价</th><th className="num">名义金额</th><th className="num">浮动盈亏</th><th className="num">资金费 / 成本</th></tr></thead>
         <tbody>{book.accounts.flatMap(account => [
@@ -232,9 +232,9 @@ function PaperTab({ view, write, onChanged }: { view: StateView; write: Write; o
             <td className="num" />
           </tr>),
         ])}</tbody></table></div>
-        : <TableEmpty>还没有模拟盘。启用后第一轮规划时按本金建立。</TableEmpty>}
+        : <TableEmpty>{view.recovery.book ? '原账本不可读，持仓和现金未知。' : '还没有模拟盘。启用后第一轮规划时按本金建立。'}</TableEmpty>}
       <div className="vl-actions vl-pause">
-        <button type="button" className="button secondary" disabled={write.busy !== null || !book} onClick={reset}>{write.busy === 'reset' ? <LoaderCircle size={14} className="spin" aria-hidden="true" /> : <RotateCcw size={14} aria-hidden="true" />}重置模拟盘</button>
+        <button type="button" className="button secondary" disabled={write.busy !== null || (!book && !view.recovery.book)} onClick={reset}>{write.busy === 'reset' ? <LoaderCircle size={14} className="spin" aria-hidden="true" /> : <RotateCcw size={14} aria-hidden="true" />}重置模拟盘</button>
       </div>
       <p className="vl-note">模拟盘按规划价成交，每次成交扣账户的吃单费率加滑点；资金费按各腿已结算的记录逐笔计入，名义金额用计入时的价格近似。它不反映排队、部分成交、划转在途与各所的保证金档位。</p>
     </section>
@@ -242,6 +242,7 @@ function PaperTab({ view, write, onChanged }: { view: StateView; write: Write; o
 }
 
 function SettingsTab({ view, write, onChanged }: { view: StateView; write: Write; onChanged: Changed }) {
+  const dialog = useDialogGuard();
   const [form, setForm] = useState<SettingsForm>(() => settingsForm(view.settings));
   const [touched, setTouched] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
@@ -253,14 +254,18 @@ function SettingsTab({ view, write, onChanged }: { view: StateView; write: Write
   const edit = (change: (current: SettingsForm) => SettingsForm) => { setTouched(true); setForm(change); };
   const editAccount = (index: number, patch: Partial<SettingsForm['accounts'][number]>) => edit(current => ({ ...current, accounts: current.accounts.map((account, at) => at === index ? { ...account, ...patch } : account) }));
   const dirty = settingsChanged(form, view.settings);
-  const save = () => {
+  const save = async () => {
     const request = settingsRequest(form);
     if (!request.ok) { setProblem(request.message); return; }
     setProblem(null);
-    void write.run('settings', () => api(`${FUNDINGBOOK_BASE}/settings`, { body: request.body }), () => { setForm(settingsForm(request.body)); setTouched(false); void onChanged(); return request.body.enabled ? '参数已保存，下一轮规划起生效' : '参数已保存；模块未启用'; });
+    const recovering = !!view.recovery.settings;
+    if (recovering && !await dialog.confirm('将用表单中的整份参数替换不可用的参数记录。模拟持仓、现金与规划历史保留。', { title: '恢复参数', confirmLabel: '确认保存', tone: 'danger' })) return;
+    if (!dialog.isAlive()) return;
+    const body = recovering ? { confirm: true, settings: request.body } : request.body;
+    void write.run('settings', () => api(`${FUNDINGBOOK_BASE}/settings`, { body }), () => { setForm(settingsForm(request.body)); setTouched(false); void onChanged(); return recovering ? '已保存恢复参数' : request.body.enabled ? '参数已保存，下一轮规划起生效' : '参数已保存；模块未启用'; });
   };
   return <section className="panel" aria-label="参数">
-    <div className="panel-heading"><h2>参数</h2><span className="muted">保存整份，下一轮规划起生效</span></div>
+    <div className="panel-heading"><h2>参数</h2><span className="muted">{view.recovery.settings ? '以下为恢复草稿，请逐项核对后保存' : '保存整份，下一轮规划起生效'}</span></div>
     <div className="fb-switches">
       <label className={`vl-check${form.enabled ? ' on' : ''}`}><input type="checkbox" checked={form.enabled} onChange={event => edit(current => ({ ...current, enabled: event.target.checked }))} />启用（采集公开行情、求解、记模拟盘）</label>
       <label className={`vl-check${form.paperAuto ? ' on' : ''}`}><input type="checkbox" checked={form.paperAuto} onChange={event => edit(current => ({ ...current, paperAuto: event.target.checked }))} />每轮规划后按规划更新模拟盘</label>
@@ -292,7 +297,7 @@ function SettingsTab({ view, write, onChanged }: { view: StateView; write: Write
     <div className="vl-actions">
       {problem ? <Callout tone="error">{problem}</Callout> : null}
       <button type="button" className="button secondary" disabled={write.busy !== null || form.accounts.length >= 8} onClick={() => edit(current => ({ ...current, accounts: [...current.accounts, newAccount(current, view.venues)] }))}><Plus size={14} aria-hidden="true" />添加账户</button>
-      <button type="button" className="button" disabled={!dirty || write.busy !== null} onClick={save}>{write.busy === 'settings' ? <LoaderCircle size={14} className="spin" aria-hidden="true" /> : <Save size={14} aria-hidden="true" />}保存参数</button>
+      <button type="button" className="button" disabled={(!dirty && !view.recovery.settings) || write.busy !== null} onClick={save}>{write.busy === 'settings' ? <LoaderCircle size={14} className="spin" aria-hidden="true" /> : <Save size={14} aria-hidden="true" />}{view.recovery.settings ? '保存恢复参数' : '保存参数'}</button>
       <button type="button" className="button secondary" disabled={!dirty || write.busy !== null} onClick={() => { setTouched(false); setProblem(null); setForm(settingsForm(view.settings)); }}>撤销修改</button>
     </div>
   </section>;

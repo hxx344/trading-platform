@@ -136,11 +136,13 @@ export function upgradeGlobal(value: unknown): GlobalParams {
 
 // ---- 开平仓 ----
 /**
- * 一笔持仓。qty 是 A 腿数量（B 腿数量 = qty × ratio）；aEntry 是 A 腿成交价，bEntry 是 B 腿成交价乘乘数后的折算价
- * （与 A 同一单位，qty × bEntry 即 B 腿名义）。手续费在开仓时按当时的场所费率记下，平仓沿用。
+ * qty 是 A 腿数量，B 腿使用实盘记录的 bQty 或模拟对冲量 qty × ratio。aEntry 是 A 腿成交价，
+ * bEntry 是 B 腿原生成交价乘 ratio 后的折算价。手续费在开仓时记下，平仓沿用。
  */
 export interface Position {
   id: string; symbol: string; direction: Direction; openedAt: number; qty: number; notionalUsd: number;
+  /** 实盘 B 腿实际剩余的原生数量，含步长取整和已平部分。回测仓按 qty × ratio 对冲。 */
+  bQty?: number;
   /** 开仓时的可成交价差（基点）、基线与往返成本（基点）。 */ entrySpread: number; entryBaseline: number; entryRegime: Regime;
   aEntry: number; bEntry: number; estimated: boolean; ratio: number; aFeeBps: number; bFeeBps: number;
   entryVarSource?: VarPriceSource;
@@ -169,7 +171,7 @@ export function markToMarket(position: Position, spread: Spread): { exitSpread: 
 }
 
 /**
- * 持仓信号按实际数量取价，档位见 model.ts 的 sizeBucket（市值在开仓名义金额 ±20% 以内沿用名义金额的档位）；缺大档时允许小档估算。
+ * 持仓信号按实际数量逐腿估算公开盘口冲击；同一套取价规则用于平仓与回测期末估值。
  */
 export function positionSpread(sample: Sample, position: Position): Spread | null {
   return targetSpread(sample, position, false)?.spread ?? null;
@@ -221,13 +223,17 @@ export function openPosition(id: string, sample: Sample, params: SymbolParams, d
   };
 }
 
+/** B 腿的价格已按乘数折算成 A 单位；用同一单位的实际数量换算名义额。 */
+const bQtyInA = (position: Position): number => position.bQty === undefined ? position.qty : position.bQty / position.ratio;
+
 /** 平仓结算：价差收益按两腿实际成交价算；滑点与手续费按四次成交（每腿开平各一次）的名义金额扣，手续费用开仓时记下的。 */
 export function closePosition(position: Position, at: number, spread: Spread, reason: CloseReason, global: Pick<GlobalParams, 'slippageBps'>, fundingUsd: number | null): ClosedTrade {
   const prices = spread.prices, rich = position.direction === 'a_rich';
   const aExit = rich ? prices.aAsk : prices.aBid, bExit = rich ? prices.bBid : prices.bAsk;
   const aPnl = (rich ? position.aEntry - aExit : aExit - position.aEntry) * position.qty;
-  const bPnl = (rich ? bExit - position.bEntry : position.bEntry - bExit) * position.qty;
-  const tradedA = position.qty * (position.aEntry + aExit), tradedB = position.qty * (position.bEntry + bExit);
+  const bQty = bQtyInA(position);
+  const bPnl = (rich ? bExit - position.bEntry : position.bEntry - bExit) * bQty;
+  const tradedA = position.qty * (position.aEntry + aExit), tradedB = bQty * (position.bEntry + bExit);
   const costUsd = (tradedA * (global.slippageBps + position.aFeeBps) + tradedB * (global.slippageBps + position.bFeeBps)) / 10_000;
   const grossUsd = aPnl + bPnl, netUsd = grossUsd - costUsd;
   return { ...position, closedAt: at, aExit, bExit, exitSpread: rich ? spread.buyA : spread.sellA, reason, grossUsd, costUsd, netUsd, netBps: netUsd / position.notionalUsd * 10_000, fundingUsd,
@@ -242,7 +248,7 @@ export function fundingEstimate(position: Position, until: number, aHourly: numb
   if (aHourly === null || bHourly === null) return null;
   const hours = Math.max(0, until - position.openedAt) / 3_600_000;
   const sign = position.direction === 'a_rich' ? 1 : -1;
-  return sign * aHourly * hours * position.qty * position.aEntry - sign * bHourly * hours * position.qty * position.bEntry;
+  return sign * aHourly * hours * position.qty * position.aEntry - sign * bHourly * hours * bQtyInA(position) * position.bEntry;
 }
 
 /**

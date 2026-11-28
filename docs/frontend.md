@@ -44,7 +44,7 @@
 | 交易中心 | 金油 | `#/goldoil` | 同原油，三者共用执行账户 | 《金油页（G1，v0.74.0）》，页面内容见 [goldoil.md](goldoil.md) 第 3 节 |
 | 交易中心 | CrossEx | `#/crossex`，子页 `#/crossex/trade`、`#/crossex/hedge`、`#/crossex/orders`、`#/crossex/settings` | 已配置 CrossEx，后台重试期间也显示 | 《CrossEx 页》 |
 | 交易中心 | Ondo 挂单奖励 | `#/ondo` | 服务已接入 Ondo | 《Ondo 挂单奖励页》 |
-| 交易中心 | DEX 价差（原 Var/Lighter 价差） | `#/varlighter`，子页 `#/varlighter/detail/<场所:代码|场所:代码[@乘数]>`、`#/varlighter/paper`、`#/varlighter/accounts`、`#/varlighter/ready` | 服务开启了该模块（默认开启，`"varLighter": false` 关闭） | 《DEX 价差页》，内容见 [varlighter.md](varlighter.md) 第 10 节、[dexspread.md](dexspread.md) 第 10–14 节 |
+| 交易中心 | DEX 价差（原 Var/Lighter 价差） | `#/varlighter`，子页 `#/varlighter/detail/<场所:代码|场所:代码[@乘数]>`、`#/varlighter/accounts`、`#/varlighter/ready`、`#/varlighter/lead` | 服务开启了该模块（默认开启，`"varLighter": false` 关闭） | 《DEX 价差页》、《DEX 价差：Binance 领先测速（v0.115.0）》，内容见 [varlighter.md](varlighter.md) 第 10 节、[dexspread.md](dexspread.md) 第 10–21 节 |
 | 策略与风险 | 配对组 | `#/`、`#/pair/<配对>` | 总是 | F1–F3、《ASTER 页面按工作台重排（F4）》 |
 | 策略与风险 | 资金费组合 | `#/fundingbook`，子页 `#/fundingbook/plan`、`#/fundingbook/paper`、`#/fundingbook/settings` | 总是显示（默认未启用，在本页设置里打开） | 《资金费组合页》，内容见 [fundingbook.md](fundingbook.md) |
 | 期权 | 期权 | `#/options`，子页 `#/options/positions`、`#/options/orders`、`#/options/performance`、`#/options/rfq` | 已配置期权，后台重试期间也显示 | 《期权页》 |
@@ -870,3 +870,8 @@ DEX 价差详情在采集缺口处断开价差、基线和入场带。图形限�
 - **对照的工作台页面**：工作台无此聚合展示，沿用现有资产总览表格、明细展开行、资产走势与每日波动视图。`web/src/asset-connection-form.ts` 显式将 `dex-spread` 排除出 `CONNECTION_NAMES`，使「交易所连接」卡片与待连接数量保持只包含直连交易所。
 - **格式与样式**：`web/src/asset-format.ts` 为 `dex-spread` 提供数量栏「账户总值」、钱包展示名、明细副标题及去重与计价说明 `DETAIL_NOTES['dex-spread']`；`web/src/asset.css` 新增 `.asset-desk .exchange-mark.dex-spread` 蓝色标识（`#14262b` 背景与 `#38bdf8` 前景字母 `D`）。单元测试见 `test/asset-format.test.ts` 与 `web/test/asset-connection-form.test.mjs`。
 - **浏览器验收**：`pnpm build:web` 后启动 `node scripts/asset-demo.ts --data-dir <临时空目录> --port <端口> --with-dex-spread`，内置浏览器在 `v0.107.0+` 新版暗色壳层下于 1280×800 与 390×844 宽度核查登录与 `#/asset`：点击「刷新资产」后表格新增「DEX 价差」行（`6,700.00`，`只读同步 · 3 个账号`），表内总额（`$30,500.01`）与交易所资产（`$26,500.00`）均相应增加 `6,700.00`，展开明细显示 4 项账号资产与自动去重说明，「每日波动与来源」计入 `DEX 价差 · 资产 +6,700.00`，「交易所连接」仍为 9 项且不含 `DEX 价差`；全页可见文本未出现 `0x` 或 `101` / `202`（剔除年份）等明文标识。390 与 1280 宽度下 `html` / `body` / `main` 均未超出视口（表格在 `[data-slot="table-container"]` 容器内横向滚动），无控制台报错、未捕获异常与 CSP 报错（仅见 demo 未挂载宿主路由 `/api/host`、`/api/update`、`/api/read-token` 的预期 404）。
+
+## DEX 价差：Binance 领先测速（v0.115.0，回滚版本 v0.114.0）
+
+- **入口与参照**：`web/src/route-parse.ts` 扩展 `#/varlighter/lead`，`VARLIGHTER_TABS` 新增「领先测速」（`web/src/varlighter/varlighter-form.ts`）。页面工作台无同功能参照，按本仓《DEX 价差页》的卡片、指标网格（`vl-metrics`）、`SvgPlot`（200px 高，`.vl-chart.small`）及 `StateViews.tsx` / `useDialogGuard()` / `useWrite()` 风格实现（`VarLighterLead.tsx` 与 `varlighter-lead-form.ts`、`varlighter.css` 的 `.vl-lead-*` 纯设计令牌样式，无内联 `style=` / `<style>` / `<script>`）。不依赖 DOM 的校验、延迟格式化、颜色分级及图数据转换单测见 `web/test/varlighter-form.test.mjs`。
+- **浏览器验收**：在本地替身后端 `node scripts/dev-varlighter.ts --port 4745`（仅 `127.0.0.1`，模拟 Binance 周期脉冲与三场所滞后 140/220/420 ms）下由浏览器子代理核查 `1280×900` 与 `390×844` 宽度：候选填充（`NVDAUSDT`）、4 条实时流连线、指标卡与场所汇总延迟梯次（Entropy P50 `+106 ms` < 主网 `+214 ms` < RH `+428 ms`，互相关峰值 `+100 / +200 / +400 ms`）、两张 SVG 曲线、停表入史及「清空历史」模态对话框取消与确定交互均正常；两宽度均 `0` console error / pageerror / CSP 报错，无整页横向溢出（统计与事件表在各自外层容器中横向滚动；仅见 demo 未挂宿主路由 `/api/host`、`/api/update`、`/api/read-token` 的预期 404）。（注：浏览器验收后依据二轮审查小幅调整 `initialized` 冷启动锁、目录报错红条、0ms 竖线裁剪守卫与 `height={200}` 对齐，并重过 `pnpm check`、`pnpm build:web` 与表单单测。）

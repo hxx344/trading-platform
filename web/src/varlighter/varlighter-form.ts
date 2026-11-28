@@ -12,7 +12,7 @@ export const VARLIGHTER_BASE = '/api/varlighter';
 export const VAR_QUOTE_LABELS: Record<VarPriceSource, string> = { token: '按量询价', '0': '公开一档', '1k': '公开 1 千美元档', '100k': '公开 10 万美元档' };
 export type { VarLighterTab };
 export const VARLIGHTER_TABS: readonly { id: VarLighterTab; label: string }[] = [
-  { id: 'overview', label: '价差总览' }, { id: 'detail', label: '标的详情' }, { id: 'accounts', label: '账户资产' }, { id: 'ready', label: '实盘准备' },
+  { id: 'overview', label: '价差总览' }, { id: 'detail', label: '标的详情' }, { id: 'accounts', label: '账户资产' }, { id: 'ready', label: '实盘准备' }, { id: 'lead', label: '领先测速' },
 ];
 /** 详情页地址里的是配对键「场所:代码|场所:代码[@乘数]」：冒号、竖线与 @ 在地址片段里合法，保留原样便于阅读。 */
 export const varLighterHref = (tab: VarLighterTab, key?: string | null): string =>

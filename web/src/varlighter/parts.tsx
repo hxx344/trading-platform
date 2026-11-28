@@ -19,12 +19,13 @@ export function useWrite() {
   const [busy, setBusy] = useState<string | null>(null);
   const [message, setMessage] = useState<WriteMessage | null>(null);
   const running = useRef(false);
-  const run = useCallback(async <T,>(key: string, send: () => Promise<T>, done: (result: T) => string): Promise<T | null> => {
+  const run = useCallback(async <T,>(key: string, send: () => Promise<T>, done: (result: T) => string | WriteMessage): Promise<T | null> => {
     if (running.current) return null;
     running.current = true; setBusy(key); setMessage(null);
     try {
       const result = await send();
-      setMessage({ tone: 'success', text: done(result) });
+      const feedback = done(result);
+      setMessage(typeof feedback === 'string' ? { tone: 'success', text: feedback } : feedback);
       return result;
     } catch (error) {
       if (error instanceof ApiError) setMessage({ tone: 'error', text: error.message });

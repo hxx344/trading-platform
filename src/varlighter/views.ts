@@ -310,3 +310,177 @@ export interface EntropyCostView {
   summary: EntropyCostSummary;
   fills: EntropyFillView[];
 }
+
+// ---- Binance 领先测速（#/varlighter/lead） ----
+export type LeadVenue = 'lighter' | 'rh' | 'entropy';
+export type LeadSource = 'binance' | LeadVenue;
+export type LeadFollowStatus = 'followed' | 'unfollowed' | 'pending' | 'disconnected' | 'no_data' | 'cancelled';
+
+export interface LeadConfig {
+  binanceSymbol: string;
+  targets: Partial<Record<LeadVenue, string>>;
+  durationSec: number;
+  thresholdBps: number;
+  impulseWindowMs: number;
+  followRatio: number;
+  maxWaitMs: number;
+  cooldownMs: number;
+}
+
+export interface LeadContractView {
+  symbol: string;
+  baseAsset: string;
+  quoteAsset: string;
+  contractType: 'PERPETUAL' | 'TRADIFI_PERPETUAL';
+}
+
+export interface LeadCandidateView extends LeadContractView {
+  targets: Partial<Record<LeadVenue, string>>;
+  matchCount: number;
+}
+
+export interface LeadCatalogEntry {
+  symbol: string;
+  mark: number | null;
+}
+
+export interface LeadStreamView {
+  source: LeadSource;
+  name: string;
+  symbol: string;
+  connected: boolean;
+  lastError: string | null;
+  reconnects: number;
+  ticks: number;
+  ticksPerSec: number;
+  bid: number | null;
+  ask: number | null;
+  mid: number | null;
+  spreadBps: number | null;
+  lastTickAt: number | null;
+  exchangeLagMs: number | null;
+  basisBps: number | null;
+}
+
+export interface LeadXcorrPoint {
+  lagMs: number;
+  corr: number;
+  samples: number;
+}
+
+export interface LeadXcorrView {
+  peakLagMs: number;
+  peakCorr: number;
+  zeroCorr: number | null;
+  samples: number;
+  points: LeadXcorrPoint[];
+}
+
+export interface LeadVenueStatsView {
+  venue: LeadVenue;
+  name: string;
+  symbol: string;
+  followed: number;
+  unfollowed: number;
+  disconnected: number;
+  noData: number;
+  cancelled: number;
+  pending: number;
+  followRate: number | null;
+  bnLeadCount: number;
+  dexLeadCount: number;
+  tieCount: number;
+  bnLeadRate: number | null;
+  medianMs: number | null;
+  meanMs: number | null;
+  p25Ms: number | null;
+  p75Ms: number | null;
+  p90Ms: number | null;
+  p95Ms: number | null;
+  minMs: number | null;
+  maxMs: number | null;
+  xcorr: LeadXcorrView | null;
+  xcorrReason: string | null;
+}
+
+export interface LeadEventVenueView {
+  status: LeadFollowStatus;
+  lagMs: number | null;
+  maxMoveBps: number | null;
+}
+
+export interface LeadEventView {
+  id: number;
+  at: number;
+  direction: 'up' | 'down';
+  baseMid: number;
+  triggerMid: number;
+  moveBps: number;
+  venues: Partial<Record<LeadVenue, LeadEventVenueView>>;
+}
+
+export interface LeadSeriesPoint {
+  t: number;
+  binance: number | null;
+  lighter: number | null;
+  rh: number | null;
+  entropy: number | null;
+}
+
+export interface LeadSessionView {
+  id: string;
+  status: 'running' | 'completed' | 'stopped';
+  config: LeadConfig;
+  startedAt: number;
+  finishedAt: number | null;
+  elapsedMs: number;
+  remainingMs: number;
+  eventCount: number;
+  streams: LeadStreamView[];
+  venues: LeadVenueStatsView[];
+  events: LeadEventView[];
+  series: LeadSeriesPoint[];
+}
+
+export interface LeadHistoryVenueSummary {
+  venue: LeadVenue;
+  name: string;
+  symbol: string;
+  followed: number;
+  unfollowed: number;
+  followRate: number | null;
+  bnLeadRate: number | null;
+  medianMs: number | null;
+  meanMs: number | null;
+  p90Ms: number | null;
+  peakLagMs: number | null;
+  peakCorr: number | null;
+}
+
+export interface LeadHistoryItem {
+  id: string;
+  status: 'completed' | 'stopped';
+  config: LeadConfig;
+  startedAt: number;
+  finishedAt: number;
+  elapsedMs: number;
+  eventCount: number;
+  venues: LeadHistoryVenueSummary[];
+}
+
+export interface LeadView {
+  now: number;
+  catalog: {
+    loading: boolean;
+    at: number | null;
+    ok: number | null;
+    error: string | null;
+    count: number;
+    contracts: LeadContractView[];
+  };
+  dexCatalogs: Record<LeadVenue, LeadCatalogEntry[]>;
+  candidates: LeadCandidateView[];
+  active: LeadSessionView | null;
+  last: LeadSessionView | null;
+  history: LeadHistoryItem[];
+}

@@ -6,6 +6,10 @@ import { backtestRequest } from '../../src/varlighter/backtest.ts';
 import { pairKey, parsePairKey } from '../../src/varlighter/model.ts';
 import { readCustomPair } from '../../src/varlighter/engine.ts';
 import { DEFAULT_LIVE_EXEC, DEFAULT_LIVE_SETTINGS, LIVE_EXEC_RANGES as SERVER_EXEC_RANGES, LIVE_LIMIT_RANGES as SERVER_LIMIT_RANGES, readLiveExecSettings, readLiveSettings } from '../../src/varlighter/live.ts';
+import { readLeadConfig } from '../../src/varlighter/lead.ts';
+import {
+  DEFAULT_LEAD_FORM, applyCandidate, buildSeriesRows, buildXcorrRows, formFromConfig, formatEventVenue, formatLagMs, lagTone, lagVerdict, leadStartRequest,
+} from '../src/varlighter/varlighter-lead-form.ts';
 import {
   EMPTY_PAIR_FORM, backtestBody, bps, bytesPerDay, chartRange, chartRows, comboLabel, comboShort, customPairKey, customPairRequest, directionLabel, directionShort, fundingAnnual, globalForm, globalRequest,
   SIMPLE_SORT_KEYS, directionSides, entryProgress, matchesCombo, pairLabel, readOverviewMode, rebateAudit, settingsBody, signal, sortRows, costBreakdown, symbolForm, symbolRequest, toggleConfirmed, usd, varLighterHref, AUTO_FIELDS, autoBody, autoFormPatch, quickEnableBody,
@@ -208,7 +212,7 @@ test('overview simple view: entry progress, sell and buy venues, stored mode', (
 });
 
 test('accounts tab helpers: route, filters, series selection and formatting', () => {
-  assert.deepEqual(VARLIGHTER_TABS.map(item => item.id), ['overview', 'detail', 'accounts', 'ready']);
+  assert.deepEqual(VARLIGHTER_TABS.map(item => item.id), ['overview', 'detail', 'accounts', 'ready', 'lead']);
   assert.deepEqual(ACCOUNT_VENUE_FILTERS.map(item => item.id), ['all', 'lighter', 'rh', 'entropy']);
   assert.equal(varLighterHref('accounts'), '#/varlighter/accounts');
   assert.deepEqual(parseRoute('#/varlighter/accounts'), { page: 'varlighter', tab: 'accounts', symbol: null });
@@ -507,4 +511,62 @@ test('live position mark cells and breakdown rows degrade to dashes', () => {
   assert.equal(breakdownRows([{ key: 'not_a_reason', trades: 0, wins: 0, netUsd: 0 }], 'reason')[0].winRate, null);
   assert.equal(breakdownRows([{ key: 'stop', trades: 1, wins: 0, netUsd: -1 }], 'reason')[0].label, '止损');
   assert.equal(breakdownRows([{ key: '2026-01-02', trades: 1, wins: 1, netUsd: 1 }], 'day')[0].label, '2026-01-02');
+});
+
+test('lead tab route, form validation matches server, candidate fill and chart rows', () => {
+  assert.deepEqual(parseRoute('#/varlighter/lead'), { page: 'varlighter', tab: 'lead', symbol: null });
+  assert.equal(varLighterHref('lead'), '#/varlighter/lead');
+
+  const candidate = { symbol: 'NVDAUSDT', baseAsset: 'NVDA', quoteAsset: 'USDT', contractType: 'TRADIFI_PERPETUAL', targets: { lighter: 'NVDA', rh: 'NVDA', entropy: 'NVDA' }, matchCount: 3 };
+  const filled = applyCandidate(DEFAULT_LEAD_FORM, candidate);
+  assert.equal(filled.binanceSymbol, 'NVDAUSDT');
+  assert.equal(filled.rh, 'NVDA');
+
+  const req = leadStartRequest({ ...filled, binanceSymbol: ' nvdauSdt ' });
+  assert.ok(req.ok);
+  assert.deepEqual(readLeadConfig(req.value), req.value, '服务端校验接受前端生成的参数');
+
+  const invalid = [
+    [{ binanceSymbol: '' }, 'Binance 合约代码无效（应为 2–32 位大写字母或数字，如 BTCUSDT）'],
+    [{ lighter: '', rh: '', entropy: '' }, '至少选择一个需要对比的 DEX 场所并填写标的代码'],
+    [{ durationSec: '20' }, '测试时长（秒）须在 30 到 1800 之间'],
+    [{ durationSec: '60.5' }, '测试时长（秒）须为整数'],
+    [{ thresholdBps: 'abc' }, '触发阈值（基点）须填数字'],
+    [{ followRatio: '1.2' }, '跟进判定比例须在 0.2 到 1 之间'],
+  ];
+  for (const [patch, err] of invalid) {
+    assert.deepEqual(leadStartRequest({ ...filled, ...patch }), { ok: false, error: err });
+  }
+
+  assert.equal(formatLagMs(null), '—');
+  assert.equal(formatLagMs(240), '+240 ms');
+  assert.equal(formatLagMs(-150), '−150 ms');
+  assert.equal(formatLagMs(1250), '+1.25 s');
+
+  const session = {
+    id: 'lead-1', status: 'running', config: req.value, startedAt: 1000, finishedAt: null, elapsedMs: 5000, remainingMs: 55000, eventCount: 0, streams: [], events: [],
+    venues: [
+      { venue: 'lighter', name: 'Lighter 主网', symbol: 'NVDA', followed: 0, unfollowed: 0, disconnected: 0, noData: 0, cancelled: 0, pending: 0, followRate: null, bnLeadCount: 0, dexLeadCount: 0, tieCount: 0, bnLeadRate: null, medianMs: null, meanMs: null, p25Ms: null, p75Ms: null, p90Ms: null, p95Ms: null, minMs: null, maxMs: null, xcorr: { peakLagMs: 200, peakCorr: 0.9, zeroCorr: 0.5, samples: 100, points: [{ lagMs: 0, corr: 0.5, samples: 100 }, { lagMs: 200, corr: 0.9, samples: 100 }] }, xcorrReason: null },
+    ],
+    series: [{ t: 1000, binance: 0, lighter: 0, rh: null, entropy: null }, { t: 1250, binance: 3.1, lighter: 1.2, rh: null, entropy: null }],
+  };
+  assert.deepEqual(buildXcorrRows(session), [{ time: 0, lighter: 0.5, rh: null, entropy: null }, { time: 200, lighter: 0.9, rh: null, entropy: null }]);
+  assert.deepEqual(buildSeriesRows(session), [{ time: 1000, binance: 0, lighter: 0, rh: null, entropy: null }, { time: 1250, binance: 3.1, lighter: 1.2, rh: null, entropy: null }]);
+
+  // 补齐 formFromConfig / lagTone / lagVerdict / formatEventVenue 边界覆盖
+  assert.deepEqual(formFromConfig({ ...req.value, targets: { lighter: 'NVDA' } }), {
+    binanceSymbol: 'NVDAUSDT', lighter: 'NVDA', rh: '', entropy: '',
+    durationSec: '180', thresholdBps: '3', impulseWindowMs: '1000', followRatio: '0.5', maxWaitMs: '10000', cooldownMs: '2000',
+  });
+  assert.deepEqual([lagTone(50), lagTone(-50), lagTone(0), lagTone(null)], ['up', 'down', '', '']);
+  assert.equal(lagVerdict({ name: 'Lighter 主网', followed: 2, medianMs: 120, xcorr: null }), 'Binance 领先约 +120 ms');
+  assert.equal(lagVerdict({ name: 'Entropy', followed: 2, medianMs: -80, xcorr: null }), 'Entropy 反超约 +80 ms');
+  assert.equal(lagVerdict({ name: 'Lighter RH', followed: 2, medianMs: 10, xcorr: null }), '两边基本同步（±20 ms）');
+  assert.equal(lagVerdict({ name: 'Entropy', followed: 0, medianMs: null, xcorr: { peakLagMs: 200, peakCorr: 0.9, zeroCorr: 0.5, samples: 80, points: [] } }), '互相关显示 Binance 领先 200 ms');
+  assert.equal(lagVerdict({ name: 'Entropy', followed: 0, medianMs: null, xcorr: null }), '等待足够波动样本');
+  assert.deepEqual(formatEventVenue({ status: 'followed', lagMs: 180, maxMoveBps: 3 }), { text: '+180 ms', tone: 'ok' });
+  assert.deepEqual(formatEventVenue({ status: 'followed', lagMs: -150, maxMoveBps: 3 }), { text: '−150 ms', tone: 'warn' });
+  assert.deepEqual(formatEventVenue({ status: 'unfollowed', lagMs: null, maxMoveBps: 0.5 }), { text: '未跟进', tone: 'bad' });
+  assert.deepEqual(formatEventVenue({ status: 'disconnected', lagMs: null, maxMoveBps: null }), { text: '中途断线', tone: 'warn' });
+  assert.deepEqual(formatEventVenue(undefined), { text: '—', tone: '' });
 });

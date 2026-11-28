@@ -12,6 +12,7 @@ import type { OrphanRow, PositionSummary, StateRow, StateView, VenueStatus } fro
 import { Badge, Metric, useWrite } from './parts.tsx';
 import { VarLighterAccounts } from './VarLighterAccounts.tsx';
 import { VarLighterDetail } from './VarLighterDetail.tsx';
+import { VarLighterLead } from './VarLighterLead.tsx';
 import { VarLighterReady } from './VarLighterReady.tsx';
 import {
   IDENTITY_LABELS, LIVE_STATE_LABELS, OVERVIEW_MODES, OVERVIEW_MODE_KEY, REGIME_LABELS, SIMPLE_SORT_KEYS, VARLIGHTER_BASE, VARLIGHTER_TABS, age, baselineMissing, blockedAtEntry, sampleStale, bps, comboShort, gateNote, type GateNote, costBreakdown, directionLabel, directionShort, directionSides, entryProgress, fundingAnnual, matchesCombo, matchesQuery, plain,
@@ -49,7 +50,8 @@ export function VarLighterPage({ tab, symbol, onExpired }: { tab: VarLighterTab;
       : tab === 'overview' ? <Overview view={data} onChanged={live.refresh} />
         : tab === 'detail' ? <VarLighterDetail view={data} symbol={symbol} onChanged={live.refresh} onExpired={onExpired} />
           : tab === 'accounts' ? <VarLighterAccounts onExpired={onExpired} />
-            : <VarLighterReady view={data} onChanged={live.refresh} onExpired={onExpired} />}
+            : tab === 'lead' ? <VarLighterLead onExpired={onExpired} />
+              : <VarLighterReady view={data} onChanged={live.refresh} onExpired={onExpired} />}
   </div>;
 }
 

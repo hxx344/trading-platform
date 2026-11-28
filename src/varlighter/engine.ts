@@ -11,6 +11,7 @@ import { backtestRequest } from './backtest.ts';
 import type { ReplayJob } from './replay-worker.ts';
 import { HyperliquidStream, LighterStream, MAX_DEPTH_MARKETS, depthAt, fetchEntropyMarkets, fetchRhMarkets, fetchVarListings,
   type Connect, type DepthSnapshot, type FetchLike, type LiveStream, type TopPoint } from './feeds.ts';
+import { createLeadTester } from './lead-streams.ts';
 import { ACCOUNT_HISTORY_LIMIT, ACCOUNT_HISTORY_WINDOW_MS, COLLATERAL_ASSET, fetchAccount, fetchAccountHistory, type AccountFunding, type AccountHistorySnapshot, type AccountSnapshot, type AccountTrade } from './accounts.ts';
 import { KEY_VENUES, configuredVenues, type DexAccounts, type DexAccountsSource, type KeyVenue } from '../dex/keys.ts';
 import { ASSET_KINDS, COMBOS, DEFAULT_COMBOS, KIND_NAMES, LEG_SYMBOL, LIVE_VENUES, RATIO_MAX, RATIO_MIN, REGIME_NAMES, SAMPLE_FIELDS, SAMPLE_FORMAT, VENUE_IDS, VENUE_NAMES,
@@ -101,7 +102,7 @@ export { COOLDOWN_KEY, SETTINGS_KEY };
 /** v0.107.0 把保存为 null 的默认 Entropy 手续费一次性升级为 0.2 基点（不覆盖已有自定义值或用户之后主动清空的选择）。 */
 export const ENTROPY_FEE_DEFAULT_MIGRATED_KEY = 'entropy_fee_default_02';
 
-export interface EngineOptions { store: VarLighterStore; fetchImpl?: FetchLike; connect?: Connect; now?: () => number; log?: (line: string) => void; /** Var token 询价；不给就只用公开报价。 */ quoter?: VarQuoter; /** 实盘场所账户（docs/dexspread.md 第 12 节）；不给就是没有配置。 */ accounts?: DexAccountsSource;
+export interface EngineOptions { store: VarLighterStore; fetchImpl?: FetchLike; connect?: Connect; now?: () => number; /** 单调时钟（领先测速用；默认随 custom now 或 performance.now()）。 */ monoNow?: () => number; log?: (line: string) => void; /** Var token 询价；不给就只用公开报价。 */ quoter?: VarQuoter; /** 实盘场所账户（docs/dexspread.md 第 12 节）；不给就是没有配置。 */ accounts?: DexAccountsSource;
   /** 页面录入的实盘凭据（第 13 节）；不给就没有实盘。 */ liveKeys?: LiveKeysStore;
   /** 下单连接器（测试里换成替身）。 */ traders?: (venue: KeyVenue, keys: LiveKeys) => VenueTrader;
   /** Lighter 签名器缺什么（测试里换成 null）。 */ signerProblem?: () => string | null;
@@ -183,7 +184,9 @@ interface VenueRuntime {
 }
 interface DepthEntry { leg: LegInfo; snapshot: DepthSnapshot | null; error: string | null }
 
-export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now = Date.now, log = () => {}, quoter, accounts: envAccounts = () => ({ accounts: {}, problem: null }), liveKeys, traders, signerProblem = lighterSignerProblem, lighterSigner, lighterAuth }: EngineOptions) {
+export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now: customNow, monoNow: customMonoNow, log = () => {}, quoter, accounts: envAccounts = () => ({ accounts: {}, problem: null }), liveKeys, traders, signerProblem = lighterSignerProblem, lighterSigner, lighterAuth }: EngineOptions) {
+  const now = customNow ?? Date.now;
+  const monoNow = customMonoNow ?? (customNow ?? (() => performance.now()));
   /** 账户标识的来源：页面录入的凭据优先，没录的场所用安装时录入的账户（keys.env）。页面凭据文件读不懂时按有问题处理。 */
   const accountSource: DexAccountsSource = () => {
     const base = envAccounts(), page = liveKeys?.accounts() ?? {}, pageProblem = liveKeys?.read().problem ?? null;
@@ -361,6 +364,19 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     entropyAccount: entropyAddress,
     assumedFeeBps: () => settings.global.entropyFeeBps,
     markets: () => live.get('entropy')!.markets,
+  });
+  const leadTester = createLeadTester({
+    store,
+    fetchImpl,
+    connect: open,
+    now,
+    monoNow,
+    log,
+    dexMarkets: () => ({
+      lighter: live.get('lighter')!.markets,
+      rh: live.get('rh')!.markets,
+      entropy: live.get('entropy')!.markets,
+    }),
   });
   const traderCache = new Map<KeyVenue, { id: string; trader: VenueTrader }>();
   const lighterSignerCache = new Map<'lighter' | 'rh', { id: string; signer: Promise<LighterSigner> }>();
@@ -1873,7 +1889,12 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
       accounts: accountsView, accountsRefresh: refreshAccountsNow,
       live: liveView, liveKeys: setLiveKeys, liveKeysRemove: removeLiveKeys, liveSettings, liveClose, liveDismiss, liveResume,
       entropyCost: (from?: unknown, to?: unknown, limit?: unknown) => entropyCost.view(from, to, limit),
-      entropyCostSync: () => entropyCost.sync(true) },
+      entropyCostSync: () => entropyCost.sync(true),
+      lead: () => leadTester.view(),
+      leadStart: (body: unknown) => leadTester.start(body),
+      leadStop: (body: unknown) => leadTester.stop(body),
+      leadClear: () => leadTester.clearHistory(),
+      leadRefreshCatalog: () => leadTester.refreshCatalog() },
     /**
      * 后台循环：连上用到的行情流（一档、标记价、资金费与启用配对的盘口都走行情流）并在后台每 10 分钟取各场所目录，然后每分钟拉 Var 报价（连同询价），
      * 每秒检查两腿都是行情流的配对是否到期采样，每小时清理过期样本。
@@ -1940,6 +1961,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
         }
       } finally {
         done = true; running = false; looping = false; clearAllPendingSignals();
+        leadTester.close();
         syncStreams();
         // 停止时掐断在途的下单请求（结果按「不明」落库，重启后先查询再决定，不重发），等这一轮推进收尾后才关库。
         liveStop.abort();
@@ -1952,7 +1974,7 @@ export function createVarLighterEngine({ store, fetchImpl = fetch, connect, now 
     accounts: () => accountSource(),
     live: () => liveTrader,
     close(): void {
-      running = false; clearAllPendingSignals(); if (replayWorker) void replayWorker.terminate(); liveStop.abort();
+      running = false; clearAllPendingSignals(); leadTester.close(); if (replayWorker) void replayWorker.terminate(); liveStop.abort();
       syncStreams(); store.close();
     },
   };

@@ -3,6 +3,7 @@
 import { join } from 'node:path';
 import { createVarLighterEngine, VarLighterError, type VarLighterEngine } from '../varlighter/engine.ts';
 import type { Connect, FetchLike } from '../varlighter/feeds.ts';
+import { LeadError } from '../varlighter/lead.ts';
 import { openVarLighterStore, VARLIGHTER_FILE } from '../varlighter/store.ts';
 import { ParamsError } from '../varlighter/strategy.ts';
 import { createVarQuoter, tokenFileSource, type TokenSource } from '../varlighter/varquote.ts';
@@ -16,7 +17,7 @@ import type { VariationalFetcher } from '../vendor/variational-market.mjs';
  * `variationalFetch`：Var token 询价的传输（默认经 python3 传输脚本），测试里换成替身。`tokenSource`：Var token 的来源；
  * DEX 服务里是执行面推来的内存值，不给就读 `dir` 里的 token 文件（本机测试）。
  */
-export interface VarLighterOptions { liveKeys?: import('../varlighter/livekeys.ts').LiveKeysStore; traders?: import('../varlighter/engine.ts').EngineOptions['traders']; signerProblem?: () => string | null; lighterAuth?: import('../varlighter/engine.ts').EngineOptions['lighterAuth']; fetchImpl?: FetchLike; connect?: Connect; now?: () => number; variationalFetch?: VariationalFetcher; tokenSource?: () => TokenSource; /** 实盘场所账户；不给就是没有配置。 */ accounts?: DexAccountsSource }
+export interface VarLighterOptions { liveKeys?: import('../varlighter/livekeys.ts').LiveKeysStore; traders?: import('../varlighter/engine.ts').EngineOptions['traders']; signerProblem?: () => string | null; lighterAuth?: import('../varlighter/engine.ts').EngineOptions['lighterAuth']; fetchImpl?: FetchLike; connect?: Connect; now?: () => number; monoNow?: () => number; variationalFetch?: VariationalFetcher; tokenSource?: () => TokenSource; /** 实盘场所账户；不给就是没有配置。 */ accounts?: DexAccountsSource }
 export interface VarLighterHolder { engine: VarLighterEngine | null; error: string | null }
 
 export interface VarLighterViews {
@@ -37,6 +38,11 @@ export interface VarLighterViews {
   liveResume(): unknown;
   entropyCost(from: string | null, to: string | null, limit: string | null): unknown;
   entropyCostSync(): unknown;
+  lead(): unknown;
+  leadStart(body: unknown): unknown;
+  leadStop(body: unknown): unknown;
+  leadClear(): unknown;
+  leadRefreshCatalog(): unknown;
   failure(error: unknown): { status: number; body: { code: string; message: string }; internal: boolean };
 }
 
@@ -78,8 +84,13 @@ export function varLighterViews(holder: VarLighterHolder): VarLighterViews {
     liveResume: () => engine().views.liveResume(),
     entropyCost: (from, to, limit) => engine().views.entropyCost(from, to, limit),
     entropyCostSync: () => engine().views.entropyCostSync(),
+    lead: () => engine().views.lead(),
+    leadStart: body => engine().views.leadStart(body),
+    leadStop: body => engine().views.leadStop(body),
+    leadClear: () => engine().views.leadClear(),
+    leadRefreshCatalog: () => engine().views.leadRefreshCatalog(),
     failure(error) {
-      if (error instanceof VarLighterError) return { status: error.status, body: { code: error.code, message: error.message }, internal: false };
+      if (error instanceof VarLighterError || error instanceof LeadError) return { status: error.status, body: { code: error.code, message: error.message }, internal: false };
       if (error instanceof ParamsError) return { status: 400, body: { code: 'invalid_params', message: error.message }, internal: false };
       return { status: 500, body: { code: 'internal', message: 'Var/Lighter 模块内部错误' }, internal: true };
     },
@@ -118,6 +129,11 @@ export async function routePage(views: VarLighterViews, request: DexPageRequest,
     if (method === 'POST' && path === 'live/resume') return { status: 200, body: views.liveResume() };
     if (method === 'GET' && path === 'entropy-cost') return { status: 200, body: views.entropyCost(query.get('from'), query.get('to'), query.get('limit')) };
     if (method === 'POST' && path === 'entropy-cost/sync') return { status: 200, body: await views.entropyCostSync() };
+    if (method === 'GET' && path === 'lead') return { status: 200, body: views.lead() };
+    if (method === 'POST' && path === 'lead/start') return { status: 200, body: views.leadStart(body) };
+    if (method === 'POST' && path === 'lead/stop') return { status: 200, body: views.leadStop(body) };
+    if (method === 'POST' && path === 'lead/clear') return { status: 200, body: views.leadClear() };
+    if (method === 'POST' && path === 'lead/catalog') return { status: 200, body: await views.leadRefreshCatalog() };
   } catch (error) {
     const failure = views.failure(error);
     if (failure.internal) log(`DEX 价差接口 ${path} 出错：${error instanceof Error ? error.message.slice(0, 200) : '未知错误'}`);

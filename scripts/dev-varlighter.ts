@@ -74,10 +74,25 @@ function step(market: Market, t: number): { price: number; basis: number } {
   return { price: value.price, basis: value.basis };
 }
 const half = (price: number, bps: number) => price * bps / 20_000;
-/** 行情流场所的中间价：基准价加偏移，再加几个基点的慢摆动（各场所相位不同），两腿都是行情流的配对也有价差可看。 */
+/** 领先测速预览脉冲：每 2.5 秒产生一个 ±7 bps 跃变，且按各场所预设滞后返回，方便直观验收毫秒延迟与互相关。 */
+const leadPulseBps = (t: number) => {
+  const bucket = Math.floor(t / 2_500);
+  const sign = bucket % 2 === 0 ? 1 : -1;
+  return sign * 7;
+};
+/** 行情流场所的中间价：基准价加偏移，再加几个基点的慢摆动（各场所相位不同）与测速周期脉冲。 */
 const liveMid = (market: Market, venue: LiveVenue, price: number, t: number) => {
   const item = venueItem(market, venue)!, phase = { rh: 0, lighter: 2.1, entropy: 4.2 }[venue];
-  return price * (1 + (item.offset + 4 * Math.sin(t / 420_000 + phase + item.id)) / 10_000);
+  const lagMs = { lighter: 220, entropy: 140, rh: 420 }[venue];
+  const pulse = leadPulseBps(t - lagMs);
+  return price * (1 + (item.offset + pulse + 4 * Math.sin(t / 420_000 + phase + item.id)) / 10_000);
+};
+const binanceTopOf = (market: Market) => {
+  const t = Date.now();
+  const base = step(market, Math.floor(t / 60_000) * 60_000).price;
+  const mid = base * (1 + leadPulseBps(t) / 10_000);
+  const spread = half(mid, crypto(market) ? 0.8 : 2);
+  return { bid: mid - spread, ask: mid + spread, mid };
 };
 const crypto = (market: Market) => kindOf(market.symbol) === 'crypto';
 const VAR_FUNDING_ANNUAL = (market: Market) => crypto(market) ? 0.1095 : 0.05;
@@ -217,14 +232,47 @@ abstract class FakeSocket implements SocketLike {
   onclose: ((event: unknown) => void) | null = null;
   onerror: ((event: unknown) => void) | null = null;
   private timer: ReturnType<typeof setInterval>;
-  constructor() {
-    setTimeout(() => { this.readyState = 1; this.onopen?.({}); }, 50);
-    this.timer = setInterval(() => { if (this.readyState === 1) this.tick(); }, 1_000);
+  constructor(tickMs = 1_000) {
+    setTimeout(() => { this.readyState = 1; this.onopen?.({}); }, 30);
+    this.timer = setInterval(() => { if (this.readyState === 1) this.tick(); }, tickMs);
   }
   protected push(message: unknown) { this.onmessage?.({ data: JSON.stringify(message) }); }
   protected abstract tick(): void;
   abstract send(data: string): void;
   close() { this.readyState = 3; clearInterval(this.timer); this.onclose?.({}); }
+}
+// 替身 Binance bookTicker 行情流：每 100ms 检查，一档变动立即推给订阅的单标的。
+class FakeBinance extends FakeSocket {
+  private readonly subs = new Set<string>();
+  private updateId = 1;
+  private lastBid = new Map<string, string>();
+  constructor() { super(100); }
+  private resolveMarket(streamSym: string): Market | null {
+    const base = streamSym.replace(/(USDT|USDC)$/i, '').toUpperCase();
+    return bySymbol.get(base) ?? (base === 'ANT' ? bySymbol.get('AAPL') ?? null : null);
+  }
+  protected tick() {
+    for (const stream of this.subs) {
+      const sym = stream.replace(/@bookTicker$/i, '').toUpperCase();
+      const market = this.resolveMarket(sym);
+      if (!market) continue;
+      const top = binanceTopOf(market);
+      const b = top.bid.toFixed(4), a = top.ask.toFixed(4);
+      if (this.lastBid.get(sym) === b) continue;
+      this.lastBid.set(sym, b);
+      const now = Date.now();
+      this.push({ e: 'bookTicker', u: ++this.updateId, s: sym, b, B: '5.0', a, A: '5.0', T: now - 5, E: now });
+    }
+  }
+  send(data: string) {
+    const msg = JSON.parse(data) as { method?: string; params?: string[]; id?: number };
+    if (msg.method === 'SUBSCRIBE' && Array.isArray(msg.params)) {
+      for (const p of msg.params) this.subs.add(p);
+      this.push({ result: null, id: msg.id });
+    } else if (msg.method === 'LIST_SUBSCRIPTIONS') {
+      this.push({ result: [...this.subs], id: msg.id });
+    }
+  }
 }
 function topOf(market: Market, venue: LiveVenue) {
   const t = Date.now(), price = liveMid(market, venue, step(market, Math.floor(t / 60_000) * 60_000).price, t), spread = half(price, crypto(market) ? 1 : 3);
@@ -240,16 +288,22 @@ function lighterLevels(market: Market, venue: LiveVenue): { bids: { price: strin
 class FakeLighter extends FakeSocket {
   private readonly venue: LiveVenue;
   private readonly books = new Map<number, { levels: ReturnType<typeof lighterLevels>; nonce: number }>();
-  constructor(venue: LiveVenue) { super(); this.venue = venue; }
+  private lastStatsAt = 0;
+  constructor(venue: LiveVenue) { super(100); this.venue = venue; }
   private stats() {
     return Object.fromEntries(onVenue(this.venue).map(({ market, id }) => { const top = topOf(market, this.venue); return [id, { market_id: id, symbol: market.symbol, best_bid_price: top.bid.toFixed(4), best_ask_price: top.ask.toFixed(4), mark_price: top.price.toFixed(4), index_price: top.price.toFixed(4), current_funding_rate: '0.0005' }]; }));
   }
   protected tick() {
-    this.push({ type: 'update/market_stats', channel: 'market_stats:all', market_stats: this.stats() });
+    const now = Date.now();
+    if (now - this.lastStatsAt >= 1_000) {
+      this.lastStatsAt = now;
+      this.push({ type: 'update/market_stats', channel: 'market_stats:all', market_stats: this.stats() });
+    }
     for (const [id, book] of this.books) {
       const found = onVenue(this.venue).find(item => item.id === id);
       if (!found) continue;
       const next = lighterLevels(found.market, this.venue);
+      if (next.bids[0]?.price === book.levels.bids[0]?.price && next.asks[0]?.price === book.levels.asks[0]?.price) continue;
       const diff = (old: { price: string }[], fresh: { price: string; size: string }[]) => [...old.filter(level => !fresh.some(item => item.price === level.price)).map(level => ({ price: level.price, size: '0.0000' })), ...fresh];
       this.push({ type: 'update/order_book', channel: `order_book:${id}`, order_book: { code: 0, bids: diff(book.levels.bids, next.bids), asks: diff(book.levels.asks, next.asks), begin_nonce: book.nonce, nonce: book.nonce + 1 } });
       this.books.set(id, { levels: next, nonce: book.nonce + 1 });
@@ -277,14 +331,25 @@ class FakeLighter extends FakeSocket {
 // 替身 Entropy（Hyperliquid）行情流：按订阅每秒推 bbo、activeAssetCtx 与 l2Book，l2Book 的 post 立即回应，ping 回 pong。
 class FakeEntropy extends FakeSocket {
   private readonly subscriptions = new Set<string>();
+  private lastSlowAt = 0;
+  private readonly lastBbo = new Map<string, string>();
+  constructor() { super(100); }
   protected tick() {
+    const now = Date.now();
+    const sendSlow = now - this.lastSlowAt >= 1_000;
+    if (sendSlow) this.lastSlowAt = now;
     for (const key of this.subscriptions) {
       const [type, coin] = key.split('|') as [string, string], found = entropyMarket(coin);
       if (!found) continue;
       const top = topOf(found, 'entropy');
-      if (type === 'bbo') this.push({ channel: 'bbo', data: { coin, time: Date.now(), bbo: [{ px: top.bid.toFixed(3), sz: '50', n: 3 }, { px: top.ask.toFixed(3), sz: '50', n: 2 }] } });
-      if (type === 'activeAssetCtx') this.push({ channel: 'activeAssetCtx', data: { coin, ctx: { markPx: top.price.toFixed(3), oraclePx: (top.price * 0.9998).toFixed(3), funding: '0.0000125', openInterest: '1000' } } });
-      if (type === 'l2Book') this.push({ channel: 'l2Book', data: l2Book(coin) });
+      if (type === 'bbo') {
+        const px = top.bid.toFixed(3);
+        if (this.lastBbo.get(coin) === px) continue;
+        this.lastBbo.set(coin, px);
+        this.push({ channel: 'bbo', data: { coin, time: now, bbo: [{ px, sz: '50', n: 3 }, { px: top.ask.toFixed(3), sz: '50', n: 2 }] } });
+      }
+      if (sendSlow && type === 'activeAssetCtx') this.push({ channel: 'activeAssetCtx', data: { coin, ctx: { markPx: top.price.toFixed(3), oraclePx: (top.price * 0.9998).toFixed(3), funding: '0.0000125', openInterest: '1000' } } });
+      if (sendSlow && type === 'l2Book') this.push({ channel: 'l2Book', data: l2Book(coin) });
     }
   }
   send(data: string) {
@@ -311,6 +376,18 @@ const PREVIEW_ACCOUNTS = { lighter: { accountIndex: 1001 }, rh: { accountIndex: 
 const fetchImpl = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
   const url = String(input instanceof Request ? input.url : input);
   const tNow = Date.now();
+  if (url.includes('fapi.binance.com/fapi/v1/exchangeInfo')) {
+    return Response.json({
+      symbols: MARKETS.filter(m => m.symbol !== 'SPCX' && m.symbol !== 'OPENAI').map(m => ({
+        symbol: `${m.symbol}USDT`,
+        baseAsset: m.symbol,
+        quoteAsset: 'USDT',
+        marginAsset: 'USDT',
+        contractType: crypto(m) ? 'PERPETUAL' : 'TRADIFI_PERPETUAL',
+        status: 'TRADING',
+      })),
+    });
+  }
   if (url.includes('/api/v1/account')) {
     const rh = venueOfUrl(url) === 'rh';
     return Response.json({ code: 200, accounts: [{ account_index: rh ? 2002 : 1001, collateral: rh ? '60.00' : '300.25', available_balance: rh ? '60.00' : '250.50',
@@ -390,7 +467,7 @@ const fetchImpl = async (input: string | URL | Request, init?: RequestInit): Pro
 
 // 与安装后的拓扑一样：DEX 价差服务在本机套接字上（Windows 用命名管道），执行服务只转发（docs/dexspread.md 11.10）。
 const socket = process.platform === 'win32' ? `\\\\.\\pipe\\tp-dex-preview-${process.pid}` : join(dir, 'dex.sock');
-const dex = startDex({ socket, stateDir: dir, build: 'development', options: { fetchImpl: fetchImpl as typeof fetch, accounts: () => ({ accounts: PREVIEW_ACCOUNTS, problem: null }), lighterAuth: async venue => venue === 'lighter' ? 'preview-lighter-token' : null, connect: url => venueOfUrl(url) === 'entropy' ? new FakeEntropy() : new FakeLighter(venueOfUrl(url)) } });
+const dex = startDex({ socket, stateDir: dir, build: 'development', options: { fetchImpl: fetchImpl as typeof fetch, accounts: () => ({ accounts: PREVIEW_ACCOUNTS, problem: null }), lighterAuth: async venue => venue === 'lighter' ? 'preview-lighter-token' : null, connect: url => url.includes('binance.com') ? new FakeBinance() : venueOfUrl(url) === 'entropy' ? new FakeEntropy() : new FakeLighter(venueOfUrl(url)) } });
 await dex.ready;
 const client = createDexClient(socket);
 await client.pushToken({ seq: Date.now(), token: '', problem: '' });

@@ -925,3 +925,33 @@ v0.113.0 之后复查实盘链路，剩下四类问题：
 - 用最新构建的 `scripts/dev-varlighter.ts --port 4744`（全部替身行情与模拟成交，不联网、不下单）在独立 Chrome 做页面验收。`1280×900` 与 `390×844` 下持仓表、浮盈/入场价差/出场线、执行质量与盈亏分组可见；示例接口注入的 6 笔发出未成交与 4 笔有成交显示第一腿未成交率 60%、开仓 A 腿成交率 40%。1280 下操作列 `position: sticky; right: 0`，390 下为 `static`，表格在面板内横向滚动；两种宽度的 `document.documentElement.scrollWidth - clientWidth` 都为 0，浏览器未捕获脚本错误。持仓与 marks 是页面内替换 `/live` 应答注入的示例数据，不是交易所真实持仓。
 - 总览实测 `attention: false` 的「带 Var 腿的配对不上实盘」为灰字，`attention: true` 的「规格未确认」为警示色；服务端 `gate` 字段与页面一致。「到线被挡」计数由 `blockedAtEntry` 测试覆盖（新鲜/过期样本、attention 与空 gate）。
 - 未运行：全仓测试（以 Ubuntu CI 为准）、`probes/`、真实服务入口、真实账户与真实订单、ssh/WSL。Lighter 一档滞后数据来自 20.1 的公开行情只读实测；本机预览不能证明真实账户上的成交率会提高多少，待按 [live-results.md](live-results.md) 回填。
+
+## 21. Binance 领先测速子模块（v0.115.0，R2，回滚版本 v0.114.0）
+
+### 21.1 目标与隔离边界
+
+在 DEX 价差页新增 `#/varlighter/lead`（「领先测速」页签），用于按需实测单一 Binance USDⓈ-M 永续合约相对 Lighter 主网（`lighter`）、Lighter RH（`rh`）和 Entropy（`entropy`）的毫秒级价格领先程度，定位并量化潜在跟单延迟。
+
+- **只读与服务隔离**：全部逻辑隔离于 `src/varlighter/{lead,lead-streams,engine,views}.ts`、`src/dex/host.ts` 与前端 `web/src/varlighter/{VarLighterLead.tsx,varlighter-lead-form.ts}`；仅连接公开行情 REST/WebSocket，不触碰下单、划转、持仓或实盘凭据，不修改 SQLite 表结构（仅复用已有 `state` 表的 `lead_history` 键存最近 20 条测试摘要），不引入执行/控制/行情服务（`deploy/component-digests.mjs` 执行面指纹为零泄漏）。
+- **只读 MCP / 白名单保持不变**：不向 `src/read-token.ts` 或 MCP 放行 `/api/varlighter/lead`（避免外部读触发外网请求）。
+
+### 21.2 行情通道与目录匹配（`src/varlighter/lead.ts`、`lead-streams.ts`）
+
+- **Binance 目录**：打开页签或刷新时拉取 `fapi/v1/exchangeInfo`（含 `PERPETUAL` 与 `TRADIFI_PERPETUAL`，`quote === margin` 为 `USDT`/`USDC`），带 10 分钟有效缓存、30 秒失败退避、并发复用、`8 MB` 响应限长与 `7.5 s`（`CATALOG_TIMEOUT_MS`，严格低于 DEX IPC 读超时 `DEX_READ_TIMEOUT_MS = 10 s`，走 `src/any-signal.mjs`）超时保护；按同代码、别名（含 `ANT`/`ANTHROPIC`/`ANTH`、`OPENAI`/`OAI`）及 `1000` 倍缩尺自动匹配三场所已有目录。
+- **按需单标的 WS 流**：仅在一次测速启动到停止/到期/停服期间开启，结束后即刻清理断开，同刻限制单会话（重复启动 409，`stop` 强制校验 `sessionId` 409 防误停，L202）：
+  - **Binance**：订阅 `<lowercase>@bookTicker` 实时逐笔一档（避开 5 秒节流 `!bookTicker`），定期发送 `LIST_SUBSCRIPTIONS` 保活。
+  - **Lighter 主网 / RH**：订阅单市场 `order_book/{marketId}` 增量盘口（避开滞后较明显的 `market_stats/all`），O(1) 维护最优买卖档；盘口倒挂不发错误报价，nonce 断档及裁盘变浅触发退订重订。
+  - **Entropy**：订阅 `bbo` 并在建连时立即发一次 `post l2Book` 补首档；静默超过 `45 s`（`ENTROPY_CONFIRM_MS`）补发 `l2Book` 通过 `confirmAlive` 保活网格与 60 秒基准，不虚增价变计数。
+- **连接态异常保留**：已建连状态下收到交易所协议错误或解析失败帧时在 `lastError` 中保留具体提示并展示，直到收到新一条有效行情时清除。
+
+### 21.3 双算法与单调时钟口径
+
+- **同机单调时钟**：所有跃动判定、超时与延迟均以收到报文时刻的单调时钟 `monoNow`（默认 `performance.now()`）计算，消除跨所时间偏差与墙钟跳变。
+- **同门槛跃动跟随**：Binance 单次变动达标后，向前回溯跨越同跟进门槛（阈值 × `followRatio`）的首个时刻 `bnCrossMono`，并取连续在线、不跨上一事件与 `preFloor`（含静默结转与防反向对齐收敛污染）的稳态起点量测目标场所达到同等跟进幅度的毫秒延迟（正值 = Binance 领先，负值 = DEX 先动）。
+- **100 ms 网格 500 ms 收益率互相关**：连续在线段按 `segId` 隔离对齐至 100 ms 网格，使用按 `gridRevision` 缓存的定长 `Float64Array` 线性计算 `−1000 ms .. +3000 ms` 滞后的 Pearson 相关系数（跨断线与零波动不产生伪相关）；另在同网格按 200 ms 步长（300 点）输出近 60 秒相对涨跌幅曲线，消除多场所面值差异。
+
+### 21.4 接口、验证与未运行项
+
+- **页面接口**：`GET lead`、`POST lead/start`、`POST lead/stop`、`POST lead/clear`、`POST lead/catalog`（经既有 `src/http.ts` `/api/varlighter/*` 与 `src/dex/protocol.ts` 路由转发）。
+- **本地验证**：最终通过 `pnpm check`、`pnpm build:web`、`node deploy/component-digests.mjs .`（执行面/控制面/行情面零新增依赖），定向回归 `test/dex-lead.test.ts`、`web/test/varlighter-form.test.mjs`、`test/varlighter.test.ts`、`test/dex-service.test.ts`、`test/lighter-book-top.test.ts`、`test/workspace-nav.test.ts`、`test/web-css.test.ts` 全量通过；独立只读两轮 R2 审查与 `scripts/dev-varlighter.ts --port 4745` 本地替身双端（`1280×900` 与 `390×844`）浏览器验收通过。
+- **未运行**：真实公网 Binance / Lighter / Entropy Live WS/REST 联调（本机网络/地区限制且不作为本批变更目标）、全仓与 Linux CI 交由 GitHub Actions Ubuntu CI 执行。

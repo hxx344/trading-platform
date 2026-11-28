@@ -6,14 +6,16 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Transaction } from 'ethers';
-import { BASE_CHAIN_ID, FACTORIES, KIND_AERO_V2, USDC, WETH, type FactoryInfo, type TokenInfo } from '../src/mev/chain.ts';
+import { BASE_CHAIN_ID, DEFAULT_MIDDLE_TOKENS, FACTORIES, KIND_AERO_V2, KIND_V2, USDC, WETH, type FactoryInfo, type TokenInfo } from '../src/mev/chain.ts';
 import { AbiReader, addressOf, signTransaction } from '../src/mev/codec.ts';
-import { DEADLINE_BLOCKS, FEE_FLOOR_WINDOW_MS, MevError, REVERIFY_MS, createMevEngine } from '../src/mev/engine.ts';
+import { DEADLINE_BLOCKS, FEE_FLOOR_WINDOW_MS, MevError, REVERIFY_MS, RPC_DOWN_HALT_MS, createMevEngine } from '../src/mev/engine.ts';
 import { createFakeChain, type FakeExecute, type FakePool } from '../src/mev/fake-chain.ts';
 import { DEFAULT_SETTINGS, SettingsError, type Settings } from '../src/mev/risk.ts';
 import { createRpc } from '../src/mev/rpc.ts';
 import { EXPIRE_GRACE_BLOCKS, MISSING_LIMIT } from '../src/mev/sender.ts';
 import { MEV_FILE, openMevStore } from '../src/mev/store.ts';
+import { BATCH_CHUNKS, MAX_TOKENS, MULTICALL_CHUNK, multicall } from '../src/mev/pools.ts';
+import { callData, selector } from '../src/mev/codec.ts';
 
 const KEY = '0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318';
 const OPERATOR = addressOf(KEY), EXECUTOR = '0x00000000000000000000000000000000004d4556', OWNER = '0x000000000000000000000000000000000000b0b0';
@@ -21,7 +23,8 @@ const AERO = '0x940181a94a35a4569e4529a3cdfb74e38fd98631';
 const TOKENS: TokenInfo[] = [{ address: WETH, symbol: 'WETH', decimals: 18 }, { address: USDC, symbol: 'USDC', decimals: 6 }, { address: AERO, symbol: 'AERO', decimals: 18 }];
 const USD: Record<string, number> = { [WETH]: 3_400, [USDC]: 1, [AERO]: 1.1 };
 const decimalsOf = (address: string): number => TOKENS.find(token => token.address === address)!.decimals;
-const [uniswap, slipstream, aeroV2] = FACTORIES as unknown as [FactoryInfo, FactoryInfo, FactoryInfo];
+const factoryNamed = (label: string): FactoryInfo => FACTORIES.find(factory => factory.label === label)!;
+const uniswap = factoryNamed('Uniswap v3'), slipstream = factoryNamed('Aerodrome Slipstream'), aeroV2 = factoryNamed('Aerodrome v2');
 
 function makePools(): FakePool[] {
   let serial = 0;
@@ -30,7 +33,7 @@ function makePools(): FakePool[] {
     const price = USD[token0]! / USD[token1]! * 10 ** (decimalsOf(token1) - decimalsOf(token0)) * (1 + skew);
     const reserve0 = depthUsd / USD[token0]! * 10 ** decimalsOf(token0);
     return { address: '0x' + (0xfeed0000 + ++serial).toString(16).padStart(40, '0'), factory, token0, token1, ...(tier === undefined ? {} : { tier }), fee, price,
-      depth: factory.kind === KIND_AERO_V2 ? reserve0 : reserve0 * Math.sqrt(price) };
+      depth: factory.kind === KIND_AERO_V2 || factory.kind === KIND_V2 ? reserve0 : reserve0 * Math.sqrt(price) };
   };
   // 两个 WETH/USDC 池子之间留了约 32 个基点的价差。
   return [pool(uniswap, WETH, USDC, 500n, 500n, 6_000_000), pool(slipstream, WETH, USDC, 100n, 400n, 4_500_000, 0.0032), pool(aeroV2, WETH, AERO, undefined, 30n, 1_400_000)];
@@ -43,7 +46,7 @@ const profitable = (call: FakeExecute): bigint | null => {
   return usd > 0 ? BigInt(Math.floor(usd / USD[call.start]! * unit)) : null;
 };
 
-function setup(t: TestContext, options: { dir?: string; profit?: (call: FakeExecute) => bigint | null } = {}) {
+function setup(t: TestContext, options: { dir?: string; profit?: (call: FakeExecute) => bigint | null; pools?: FakePool[]; chainTokens?: TokenInfo[] } = {}) {
   let clock = Date.UTC(2026, 10, 25, 12);
   const now = () => clock;
   const dir = options.dir ?? mkdtempSync(join(tmpdir(), 'tp-mev-engine-'));
@@ -52,12 +55,12 @@ function setup(t: TestContext, options: { dir?: string; profit?: (call: FakeExec
     for (const engine of engines) engine.close();
     if (!options.dir) rmSync(dir, { recursive: true, force: true });
   });
-  const chain = createFakeChain({ executor: EXECUTOR, owner: OWNER, operator: OPERATOR, tokens: TOKENS, pools: makePools(), now, profit: options.profit ?? profitable });
+  const chain = createFakeChain({ executor: EXECUTOR, owner: OWNER, operator: OPERATOR, tokens: options.chainTokens ?? TOKENS, pools: options.pools ?? makePools(), now, profit: options.profit ?? profitable });
   const logs: string[] = [], notices: string[] = [];
   const open = (privateKey = KEY) => {
     const store = openMevStore(join(dir, MEV_FILE));
     // 白名单已就绪：不去读默认的中间代币。
-    if (!store.tokens().length) { for (const token of TOKENS) store.putToken(token, now()); store.writeState('seeded', true, now()); }
+    if (!store.tokens().length) { for (const token of TOKENS) store.putToken(token, now()); store.writeState('seeded', true, now()); store.writeState('seededTokens', [...DEFAULT_MIDDLE_TOKENS], now()); }
     const rpc = createRpc({ url: 'https://fake.invalid', fetchImpl: chain.fetchImpl });
     const engine = createMevEngine({ store, rpc, sendRpc: rpc, chainId: BASE_CHAIN_ID, executor: EXECUTOR, owner: OWNER, privateKey, now, log: line => logs.push(line), notify: (_key, text) => { notices.push(text); } });
     engines.add(engine);
@@ -534,4 +537,131 @@ test('参数与白名单：越界的参数整份拒绝；起始代币不能删�
   assert.deepEqual(added.tokens.find(token => token.address === AERO), TOKENS[2]);
   await s.step();
   assert.equal(s.engine.views.state().directory.pools, 3);
+});
+
+test('默认代币：v0.116.0 之前初始化的库补入新加的默认代币，用户移除过的旧默认代币与新移除的都不再加回', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'tp-mev-engine-'));
+  const CBBTC = DEFAULT_MIDDLE_TOKENS[0]!, EURC = DEFAULT_MIDDLE_TOKENS[6]!;
+  // 旧版本的库：只记了 seeded = true；用户当时移除了 cbBTC。
+  const legacy = openMevStore(join(dir, MEV_FILE));
+  for (const token of TOKENS) legacy.putToken(token, Date.UTC(2026, 10, 1));
+  legacy.writeState('seeded', true, Date.UTC(2026, 10, 1));
+  legacy.close();
+  const chainTokens = [...TOKENS, { address: CBBTC, symbol: 'cbBTC', decimals: 8 }, { address: EURC, symbol: 'EURC', decimals: 6 }];
+  const s = setup(t, { dir, chainTokens });
+  // 在 setup 的清理（关库）之后再删目录。
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  await s.ready();
+  const listed = () => s.store.tokens().map(token => token.address);
+  assert.ok(listed().includes(EURC), '新加的默认代币应补入');
+  assert.ok(!listed().includes(CBBTC), '旧默认代币用户移除过，不再加回');
+  assert.deepEqual(new Set(s.store.readState<string[]>('seededTokens')), new Set(DEFAULT_MIDDLE_TOKENS));
+  await s.engine.views.tokens({ action: 'remove', address: EURC });
+  s.advanceClock(11 * 60_000);
+  await s.step();
+  await s.step();
+  assert.ok(!listed().includes(EURC), '移除后刷新目录也不再加回');
+  // 重启后同样不加回。
+  s.closeFirst();
+  const again = s.open();
+  await again.engine.verify();
+  await s.step(again.engine);
+  assert.ok(!again.store.tokens().some(token => token.address === EURC));
+});
+
+test('新池型与目录筛选：Uniswap v2 类池子按登记费率入目录并显示场所名；过浅的池子不进目录，调低深度门槛后下次刷新收进来', async t => {
+  const v2 = FACTORIES.find(factory => factory.label === 'Uniswap v2')!;
+  const pools = makePools();
+  const pool = (factory: FactoryInfo, tier: bigint | undefined, fee: bigint, depthUsd: number, serial: number): FakePool => {
+    const price = USD[WETH]! / USD[USDC]! * 10 ** (6 - 18);
+    const reserve0 = depthUsd / USD[WETH]! * 1e18;
+    return { address: '0x' + (0xbeef0000 + serial).toString(16).padStart(40, '0'), factory, token0: WETH, token1: USDC, ...(tier === undefined ? {} : { tier }), fee, price,
+      depth: factory.kind === KIND_V2 ? reserve0 : reserve0 * Math.sqrt(price) };
+  };
+  const deepV2 = pool(v2, undefined, 0n, 900_000, 1), shallow = pool(uniswap, 3000n, 3000n, 1_000, 2);
+  const s = setup(t, { pools: [...pools, deepV2, shallow] });
+  await s.ready();
+  const view = s.engine.views.state();
+  assert.equal(view.directory.pools, 4, '三个原有池子加 v2 池子；过浅的不进目录');
+  const listed = view.pools.find(entry => entry.address === deepV2.address);
+  assert.ok(listed && listed.kind === 'Uniswap v2' && listed.feePpm === 3_000 && listed.usable, JSON.stringify(listed));
+  assert.ok(!view.pools.some(entry => entry.address === shallow.address));
+  assert.ok(view.pools.some(entry => entry.kind === 'Aerodrome Slipstream'));
+  s.engine.views.settings({ settings: { ...DEFAULT_SETTINGS, minDepthUsd: 1_000 } });
+  s.advanceClock(11 * 60_000);
+  await s.step();
+  assert.ok(s.engine.views.state().pools.some(entry => entry.address === shallow.address), '门槛调低后下次刷新收进目录');
+});
+
+test('合约登记的 v2 类费率与本版本不一致时核对不过', async t => {
+  const s = setup(t);
+  const v2 = FACTORIES.find(factory => factory.kind === KIND_V2)!;
+  s.chain.state.factoryFees.set(v2.address, BigInt(v2.feeBps + 1));
+  await s.ready();
+  assert.match(s.engine.views.state().verification.reason ?? '', new RegExp(`${v2.label} 费率与本版本不一致`));
+  s.chain.state.factoryFees.clear();
+  await s.engine.verify();
+  assert.equal(s.engine.views.state().verification.ok, true);
+});
+
+test('目录刷新时池子状态的子调用失败（推不出美元价）：按刷新失败处理，沿用旧目录并报错，不清空', async t => {
+  const s = setup(t);
+  await s.ready();
+  const before = s.engine.views.state().directory.pools;
+  assert.ok(before > 0);
+  s.chain.state.failPoolState = true;
+  s.advanceClock(11 * 60_000);
+  await s.step();
+  const directory = s.engine.views.state().directory;
+  assert.equal(directory.pools, before);
+  assert.match(directory.error ?? '', /推不出 WETH 的美元价/);
+  assert.equal(s.store.pools().length, before, '库里的目录也没被清空');
+  s.chain.state.failPoolState = false;
+  s.advanceClock(11 * 60_000);
+  await s.step();
+  assert.equal(s.engine.views.state().directory.error, null);
+});
+
+test('实盘中目录刷新很慢（超过节点失联判定）：刷新期间的成功应答算节点可用，不停实盘', async t => {
+  const s = setup(t, { profit: () => null });
+  await s.ready();
+  await s.goLive();
+  await s.engine.views.tokens({ action: 'remove', address: AERO });
+  // 每个 eth_call 走 25 秒：一轮刷新远超 RPC_DOWN_HALT_MS。
+  let elapsed = 0;
+  s.chain.state.hook = method => { if (method === 'eth_call') { s.advanceClock(25_000); elapsed += 25_000; } };
+  await s.step();
+  s.chain.state.hook = null;
+  assert.ok(elapsed > RPC_DOWN_HALT_MS, `刷新只走了 ${elapsed} 毫秒，测不到停机条件`);
+  await s.step();
+  assert.equal(s.engine.isLive(), true, s.engine.views.state().haltReason ?? '');
+});
+
+test('multicall 超过一个批量请求的块数：分批发出，结果按子调用顺序对齐', async () => {
+  const chain = createFakeChain({ executor: EXECUTOR, owner: OWNER, operator: OPERATOR, tokens: TOKENS, pools: makePools() });
+  const rpc = createRpc({ url: 'https://fake.invalid', fetchImpl: chain.fetchImpl });
+  const count = MULTICALL_CHUNK * BATCH_CHUNKS * 2 + 7;
+  // 替身代币的 balanceOf(x) 回显 x：每个子调用的应答都是自己的序号，整块或整批错位都看得出来。
+  const holder = (index: number): string => '0x' + (index + 1).toString(16).padStart(40, '0');
+  const calls = Array.from({ length: count }, (_, index) => ({ target: TOKENS[index % TOKENS.length]!.address, data: callData('balanceOf(address)', ['address'], [holder(index)]) }));
+  const results = await multicall(rpc, calls, 'latest');
+  assert.equal(results.length, count);
+  results.forEach((result, index) => assert.equal(new AbiReader(result.data).uint(0), BigInt(index + 1), `第 ${index} 个`));
+  assert.equal(chain.state.calls.filter(method => method === 'eth_call').length, Math.ceil(count / MULTICALL_CHUNK));
+});
+
+test('手动加代币：读代币期间白名单被补满时，加入前重查上限并拒绝', async t => {
+  const extra = { address: '0x' + 'ab'.repeat(20), symbol: 'EXTRA', decimals: 18 };
+  const s = setup(t, { chainTokens: [...TOKENS, extra] });
+  await s.ready();
+  let filled = false;
+  s.chain.state.hook = method => {
+    if (method !== 'eth_call' || filled) return;
+    filled = true;
+    for (let index = 0; s.store.tokens().length < MAX_TOKENS; index++) s.store.putToken({ address: '0x' + (0xf00d0000 + index).toString(16).padStart(40, '0'), symbol: `F${index}`, decimals: 18 }, 0);
+  };
+  await assert.rejects(async () => s.engine.views.tokens({ action: 'add', address: extra.address }), rejectsWith('too_many', 409));
+  s.chain.state.hook = null;
+  assert.equal(s.store.tokens().length, MAX_TOKENS);
+  assert.ok(!s.store.tokens().some(token => token.address === extra.address));
 });

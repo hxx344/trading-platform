@@ -50,11 +50,11 @@
 - **利润去向**：每笔成功的套利在同一笔交易里把起始代币余额全部转给 owner，合约不留余额。operator 没有任何提币入口。
 - **合约约束**：
   - `execute(hops, amountIn, minProfit, deadlineBlock)` 只有 operator 可调；区块号超过 `deadlineBlock` 回滚（`Expired`）；结束时起始代币增量小于 `minProfit` 回滚（`NoProfit`）。
-  - 每一跳的池子都向登记过的工厂查询核对（v3 用 `getPool(token0, token1, fee)`、Slipstream 用 `getPool(token0, token1, tickSpacing)`、Aerodrome v2 用 `isPool`），对不上回滚（`BadPool`）。没有用初始化代码哈希推算地址，省去一组要核对的常量。
-  - 回调（`uniswapV3SwapCallback`、Aerodrome v2 的 `hook`）只接受当前正在兑换的那个池子，其他调用者回滚（`BadCallback`）。
+  - 每一跳的池子都向登记过的工厂查询核对（v3 用 `getPool(token0, token1, fee)`、Slipstream 用 `getPool(token0, token1, tickSpacing)`、Aerodrome v2 用 `isPool`、v2 类用 `getPair(token0, token1)`），对不上回滚（`BadPool`）。没有用初始化代码哈希推算地址，省去一组要核对的常量。
+  - 回调（`uniswapV3SwapCallback`、`pancakeV3SwapCallback`、Aerodrome v2 的 `hook`、v2 类的 `uniswapV2Call` / `pancakeCall`）只接受当前正在兑换的那个池子，其他调用者回滚（`BadCallback`）。
   - 不可升级、无 `delegatecall`、无任意外部调用入口。
 - **节点地址**：可能带服务商密钥，和私钥一样放在密钥文件的 `mev.rpcUrl`（可另有只用于发送的 `mev.sendRpcUrl`）。须为 https，本机或内网自建节点可用 http。页面、日志、报错里只出现主机名或不出现。
-- **代币**：环路起止只用 WETH 与 USDC；中间代币按白名单，首次启动写入 cbBTC、AERO、cbETH、wstETH、DAI、USDT（从链上读到符号与精度的才加入），页面可增删，最多 24 个。转账收税、可暂停、黑名单类代币即使混入，也由结尾的余额检查拦下（最坏结果是回滚、亏 gas）。
+- **代币**：环路起止只用 WETH 与 USDC；中间代币按白名单，首次启动写入 22 个默认代币（`src/mev/chain.ts` 的 `DEFAULT_MIDDLE_TOKENS`：主流稳定币、LST/LRT、BTC 类与 Base 上流动性较深的生态代币，从链上读到符号与精度的才加入），页面可增删，最多 32 个。v0.116.0 前初始化过的库在目录刷新时补入新加的默认代币，已写入过、用户移除过的不再加回（状态键 `seededTokens`）。转账收税、可暂停、黑名单类代币即使混入，也由结尾的余额检查拦下（最坏结果是回滚、亏 gas）。
 - **不做的事**：不做夹击（sandwich）与抢跑他人交易。本模块只在区块落定后回补池子之间的价差。
 
 ### 1.4 风控
@@ -120,7 +120,7 @@
 
 - 其他链、CEX-DEX 套利、自有库存模式。
 - Flashblocks（200 毫秒预确认）数据源、WebSocket 订阅与自建节点；第一版用 HTTP 轮询最新区块。
-- Uniswap v4、Curve 类池子、Aerodrome v2 的稳定池（曲线不同，现货价粗筛不适用）、聚合器路径、引擎枚举四跳环路。
+- Uniswap v4、Curve 类池子、Balancer、Aerodrome v2 的稳定池（曲线不同，现货价粗筛不适用）、聚合器路径、引擎枚举四跳环路。
 - Aave 等外部闪电贷来源（池子的闪电兑换已经够用，且没有额外费率）。
 - 从工作台导入（工作台没有同类数据）。页面内录入私钥与部署合约已在 v0.86.0 做了（1.9）。
 - 页面启用时另设发送专用节点（`sendRpcUrl`）；需要时仍用 `--set-mev`。
@@ -158,13 +158,29 @@
 
 **改动的文件**：新增 `src/mev/setup.ts`、`web/src/mev/MevSetup.tsx`、`test/mev-setup.test.ts`；改 `src/service/mev.ts`（重写为管理器）、`src/service/main.ts`（模块总是加载）、`src/http.ts`（四个启用接口）、`src/mev/codec.ts`（`to` 可为空的创建交易）、`src/mev/views.ts`、`src/mev/fake-chain.ts`、`src/service/mev-config.ts`（导出 `validRpcUrl`）、`web/src/mev/MevPage.tsx`、`mev-form.ts`、`scripts/dev-mev.ts`。不改合约、引擎、风控、库结构与安装脚本。
 
+### 1.10 更多池子与代币（v0.116.0，R3）
+
+2026-11-28 用户决定：MEV 套利加更多池子和代币；执行合约还没部署，同意连合约一起改。
+
+**范围**（链上只读核对见第 7 节）
+
+- 已有工厂补费率档：Uniswap v3 加 200 / 300 / 400（0.02% / 0.03% / 0.04%），Slipstream 加 tickSpacing 10。
+- 新工厂沿用 v3 池型（`swap` 与回调签名相同）：SushiSwap v3、PancakeSwap v3、Aerodrome Slipstream 的第二个工厂。PancakeSwap v3 的池子回调 `pancakeV3SwapCallback`，合约加这个回调，处理与 `uniswapV3SwapCallback` 共用。
+- 新池型「Uniswap v2 类」（`KIND_V2 = 4`）：Uniswap v2、SushiSwap v2、BaseSwap、AlienBase。合约按工厂登记的固定费率（万分比，部署时写入，owner 可改）用 `getReserves` 算输出；核对池子用工厂的 `getPair`；作第一跳时用闪电兑换，回调 `uniswapV2Call`（BaseSwap 叫 `pancakeCall`），与 Aerodrome v2 的 `hook` 共用处理。
+- 默认中间代币从 6 个加到 22 个，白名单上限从 24 提到 32。已初始化过的库在下次目录刷新时补入新加的默认代币，用户移除过的不再加回。
+- 池子目录：先读一次状态，按深度从高到低最多留 600 个（原 400），低于「池子最小深度」四分之一的不进目录，减少每区块的读取量。读状态时推不出 WETH 的美元价（子调用失败、读取不完整）按刷新失败处理，沿用旧目录；目录刷新期间每个成功的批量应答都算节点可用，刷新慢不会触发实盘的「节点失联」停机。白名单超过上限时先保留 WETH 与 USDC。
+
+**影响面**：执行合约的构造参数与存储布局变了（新增 `factoryFee`），产物重新生成。部署数据、引擎的合约核对（多核对 v2 工厂的费率）、替身节点、`scripts/mev-fork-check.ts` 的状态覆盖随之改。按旧产物部署的合约核对不通过（用户确认尚未部署）。资金边界不变：operator 仍只能调 `execute`，利润仍在同一笔交易里全部转给 owner，不盈利整笔回滚。v2 费率登记错时最坏是兑换回滚（费率登记低）或少换一点（登记高），不会多付。
+
+**回滚**：回到 v0.115.0。尚未部署合约，回滚不涉及链上状态；若已按本版部署，回滚后旧版本核对合约不通过、模块停在核对这一步，不发交易。旧版本白名单上限是 24 个、超出时按地址截断（可能截掉 USDC，美元定价失效、模块等于停摆），回滚前先在页面把白名单减到 24 个以内。
+
 ## 2 机会发现与执行
 
 每一轮（`engine.ts` 的 `tick`）：
 
 1. **读最新区块**，区块没变就不重复计算。
 2. **结清**：读一次热钱包的 nonce、余额与全部未结清交易的回执，能下结论的结清（1.4）。
-3. **池子目录**（每 10 分钟刷新）：白名单代币两两组合，经 Multicall3 向三个工厂按各自的费率档 / tickSpacing 查池子地址，读两种代币与费率，存进 `mev.sqlite`。
+3. **池子目录**（每 10 分钟刷新）：白名单代币两两组合，经 Multicall3 向各工厂（第 7 节）按各自的费率档 / tickSpacing 查池子地址（v2 类用 `getPair`），读两种代币与费率（v2 类用登记表里的固定费率）；再读一次状态，低于「池子最小深度」四分之一的不要，按深度从高到低最多留 600 个，存进 `mev.sqlite`。
 4. **池子状态**：每个区块一次 Multicall3 批量读（v3 类读 `slot0` 与 `liquidity`，v2 读储备）。由池子状态推出代币的美元价与池子深度，过浅的池子不参与。
 5. **粗筛**：对每条环路（两跳与三跳，最多 6000 条，超出时丢的是三跳；合约本身接受 2 到 4 跳）用现货价与手续费算毛收益，取超过门槛的前几条。粗筛只是筛选，不作为发送依据。同一条环路模拟后不盈利的，30 秒内不再模拟。
 6. **模拟定量**：对候选环路取一组输入金额，用 `eth_call` 调执行合约（`from` 为热钱包，`minProfit` 为 0）得到每档的实际利润，围绕最优一档再细分一轮，取最优。
@@ -261,7 +277,7 @@
 
 节点地址须为 https；http 只接受 `localhost`、`127.0.0.1`、`[::1]`、10/8、192.168/16 与 100.64/10。
 
-## 7 链上地址（2026-11-25 核对）
+## 7 链上地址（2026-11-25 核对，2026-11-28 补充）
 
 用 Base 公共节点只读核对（不带任何凭据）：工厂对已知交易对的 `getPool` / `isPool` 有应答、池子实现里有对应的 `swap` 与回调选择器、Multicall3 与 GasPriceOracle 地址上有代码。换链或加工厂时同样先核对再写进 `src/mev/chain.ts`。
 
@@ -271,11 +287,22 @@
 | USDC | `0x833589fcd6edb6e08f4c7c32d4f71b54bda02913` |
 | Multicall3 | `0xca11bde05977b3631167028862be2a173976ca11` |
 | GasPriceOracle（OP 预部署） | `0x420000000000000000000000000000000000000f` |
-| Uniswap v3 工厂（费率档 100 / 500 / 3000 / 10000） | `0x33128a8fc17869897dce68ed026d694621f6fdfd` |
-| Aerodrome Slipstream 工厂（tickSpacing 1 / 50 / 100 / 200 / 2000） | `0x5e7bb104d84c7cb9b682aac2f3d509f5f406809a` |
+| Uniswap v3 工厂（费率档 100 / 200 / 300 / 400 / 500 / 3000 / 10000） | `0x33128a8fc17869897dce68ed026d694621f6fdfd` |
+| SushiSwap v3 工厂（100 / 500 / 3000 / 10000） | `0xc35dadb65012ec5796536bd9864ed8773abc74c4` |
+| PancakeSwap v3 工厂（100 / 500 / 2500 / 10000；回调 `pancakeV3SwapCallback`） | `0x0bfbcf9fa4f9c56b0f40a671ad40e0805a091865` |
+| Aerodrome Slipstream 工厂（tickSpacing 1 / 10 / 50 / 100 / 200 / 2000） | `0x5e7bb104d84c7cb9b682aac2f3d509f5f406809a` |
+| Aerodrome Slipstream 第二个工厂（同上；池子是同一实现的克隆） | `0xade65c38cd4849adba595a4323a8c7ddfe89716a` |
 | Aerodrome v2 工厂（只用波动池） | `0x420dd381b31aef6683db6b902084cb0ffece40da` |
+| Uniswap v2 工厂（费率 30 基点） | `0x8909dc15e40173ff4699343b6eb8132c65e18ec6` |
+| SushiSwap v2 工厂（30 基点） | `0x71524b4f93c58fcbf659783284e38825f0622859` |
+| BaseSwap 工厂（25 基点；回调 `pancakeCall`） | `0xfda619b6d20975be80a10332cd39b9a4b0faa8bb` |
+| AlienBase 工厂（16 基点） | `0x3e84d913803b02a4a7f027165e8ca42c14c0fde7` |
 
-`node scripts/mev-fork-check.ts [--rpc <地址>]` 在真实链状态上只读核对：用 `eth_call` 的状态覆盖把本版本的合约代码放到一个虚构地址上，照引擎的步骤读目录与状态、枚举环路、对价差最大的几条各模拟一组金额并估 gas。不部署、不签名、不发交易、不用任何密钥。它不进 CI，也不进发布包。`--rpc` 的值会留在命令行历史与进程列表里，只填不带密钥的公共节点。
+v2 类的费率写死在池子代码里、工厂上读不到：2026-11-28 从池子字节码里 `swap` 的 K 检查常数核对，并用各自路由的 `getAmountOut` 交叉验证。新增 v2 类工厂时同样两处核对后再登记。
+
+`node scripts/mev-fork-check.ts [--rpc <地址>] [--top <条数>] [--min-depth <美元>]` 在真实链状态上只读核对：用 `eth_call` 的状态覆盖把本版本的合约代码与工厂登记表（种类与 v2 费率）放到一个虚构地址上，照引擎的步骤读目录与状态、枚举环路，对价差最大的几条、再加每个工厂作第一跳与作后面的跳各一条，各模拟一组金额并估 gas。不部署、不签名、不发交易、不用任何密钥。它不进 CI，也不进发布包。`--rpc` 的值会留在命令行历史与进程列表里，只填不带密钥的公共节点。
+
+2026-11-28（区块 63345671 前后，v0.116.0）：目录查到 970 个池子（各工厂都有），默认参数 18/18 条环路走通、每个工厂都作过第一跳与后面的跳（Slipstream 第二个工厂的池子在默认深度 2 万美元下没有达标的，`--top 0 --min-depth 1000` 时 19/19 含它）。附带看到的局限：v3 类按当前价附近的流动性估深度，个别池子（例如 SushiSwap v3 的 TOSHI/WETH）当前价附近有流动性、稍远就没有，现货价差显示上千基点、模拟时输入几乎全亏；这类环路在模拟一步被拦下（30 秒冷却），不会发送，只是占模拟名额。
 
 ## 8 验证与待实测
 
@@ -284,8 +311,8 @@
 | 内容 | 位置 |
 | --- | --- |
 | 编解码与签名对照 `ethers` | `test/mev-codec.test.ts` |
-| 合约：盈利路径利润转给 owner、不盈利与反向回滚且余额不变、Aerodrome v2 作第一跳与后续跳、非 operator / 过期 / 坏路径、未登记与不匹配的池子、伪造回调、`rescue` / `setOperator` / `setFactory` 仅 owner | `test/mev-contract.test.ts`（进程内 EVM） |
-| 引擎：观察、开始实盘的确认（含页面所见已过期时拒绝）、发送与结清、结果不明后过期再同 nonce 加价、加价窗口、停服后不再发送、节点拒收与连续回滚熔断、nonce 被外部占用与故障跨重启、重启接管、合约核对失败、余额与预算、节点不可用与落后、设置与白名单 | `test/mev-engine.test.ts`（替身节点） |
+| 合约：盈利路径利润转给 owner、不盈利与反向回滚且余额不变、Aerodrome v2、Uniswap v2 类（含 BaseSwap 的 `pancakeCall`）与 PancakeSwap v3 作第一跳与后续跳、v2 费率登记偏低回滚与偏高仍可用、伪造的 v2 池子、非 operator / 过期 / 坏路径、未登记与不匹配的池子、伪造回调、`rescue` / `setOperator` / `setFactory` 仅 owner、`setFactory` 的种类与费率校验、构造参数长度不一致 | `test/mev-contract.test.ts`（进程内 EVM） |
+| 引擎：观察、开始实盘的确认（含页面所见已过期时拒绝）、发送与结清、结果不明后过期再同 nonce 加价、加价窗口、停服后不再发送、节点拒收与连续回滚熔断、nonce 被外部占用与故障跨重启、重启接管、合约核对失败（含 v2 费率登记不一致）、旧库补入新默认代币且不加回已移除的、v2 池子进目录与按深度筛目录、余额与预算、节点不可用与落后、设置与白名单 | `test/mev-engine.test.ts`（替身节点） |
 | 风控测算、环路与价格 | `test/mev-risk.test.ts` |
 | 配置与密钥校验、设置助手、部署数据、`/api/mev` | `test/mev-config.test.ts` |
 | 页面启用：表单校验、钱包文件权限与原子替换、录入到部署到引擎启动的全程、部署交易与 `ethers` 解出的内容一致、余额不足、节点拒收、结果不明后同 nonce 加价重发、重发被拒收保留原记录、节点 nonce 倒退或已用掉时不发、并发部署只发一笔、重启后继续核对、部署没成（读不到代码的轮次不算）、沿用已部署的合约（扫描、移除时留下的地址、operator 不符不沿用、应答不全不部署）、部署在途时换节点与移除再录入、换节点与移除（实盘中与停止后拒绝）、由配置文件管理时拒绝、文件损坏、启动时清临时文件与专用钱包复核；私钥与节点地址原文不出现在状态、日志、通知与报错里 | `test/mev-setup.test.ts`（替身节点） |

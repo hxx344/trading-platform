@@ -2,10 +2,10 @@
 // 实盘模式过风控后签名发送。实盘只存在内存里：服务重启后回到观察，须在页面重新开始。
 // 私钥只在本文件签名时使用，不进日志、视图与错误文本。
 import { AbiReader, addressOf, callData, isAddress, lower, quantity, selector, signTransaction, toQuantity } from './codec.ts';
-import { DEFAULT_MIDDLE_TOKENS, FACTORIES, KIND_LABELS, START_TOKENS, USDC, WETH, type TokenInfo } from './chain.ts';
+import { DEFAULT_MIDDLE_TOKENS, FACTORIES, KIND_V2, START_TOKENS, USDC, WETH, factoryLabel, type TokenInfo } from './chain.ts';
 import { enumerateCycles, poolDepthUsd, rankCandidates, tokenPricesUsd, type Candidate, type Cycle } from './cycles.ts';
 import { EXECUTOR_OWNER_OFFSETS, EXECUTOR_RUNTIME_CODE } from './executor-artifact.ts';
-import { discoverPools, readPoolStates, readToken, MAX_TOKENS, type Pool, type PoolState } from './pools.ts';
+import { discoverPools, readPoolStates, readToken, MAX_POOLS, MAX_TOKENS, type Pool, type PoolState } from './pools.ts';
 import { gate, parseSettings, planTransaction, storedSettings, utcDayStart, weiToEth, type Plan, type Settings } from './risk.ts';
 import type { RpcClient } from './rpc.ts';
 import { MAX_OPEN_PER_NONCE, sendRecorded, settleOpen, type ChainAccount } from './sender.ts';
@@ -57,6 +57,11 @@ export const FEE_FLOOR_WINDOW_MS = 10 * 60_000;
 export const REVERIFY_MS = 10 * 60_000;
 /** 定期核对连续多少次读不到结果才按核对不过处理。 */
 export const REVERIFY_FAILURE_LIMIT = 3;
+/** v0.116.0 之前的默认中间代币（DEFAULT_MIDDLE_TOKENS 的前 6 个）：那时的库只记了 seeded = true。 */
+const LEGACY_SEEDED = DEFAULT_MIDDLE_TOKENS.slice(0, 6);
+/** 目录里留下的池子深度至少是「池子最小深度」的这个比例：略浅的池子也读状态，深度回升时当轮就能用。 */
+export const DIRECTORY_DEPTH_RATIO = 0.25;
+
 /** 同一条环路多久记一次机会（发送的那次不受限）。 */
 const RECORD_EVERY_MS = 30_000;
 
@@ -101,7 +106,14 @@ export function createMevEngine({ store, rpc, sendRpc, chainId, executor: execut
 
   // 首次启动：起始代币与默认的中间代币进白名单（中间代币的符号与精度在第一次刷新目录时从链上读）。
   if (!store.tokens().length) for (const token of START_TOKENS) store.putToken(token, now());
-  let seedPending = store.readState<boolean>('seeded') !== true;
+  // 默认中间代币每个只补入一次：用户移除过的不再加回，后来加进默认表的在下次刷新目录时补入。
+  const seeded = new Set(store.readState<string[]>('seededTokens') ?? (store.readState<boolean>('seeded') === true ? LEGACY_SEEDED : []));
+  const seedPending = (): string[] => DEFAULT_MIDDLE_TOKENS.filter(address => !seeded.has(address));
+  const markSeeded = (addresses: readonly string[]): void => {
+    for (const address of addresses) seeded.add(address);
+    store.writeState('seededTokens', [...seeded], now());
+    store.writeState('seeded', true, now());
+  };
 
   // 库绑定热钱包：--set-mev 换了热钱包后，旧钱包留下的未结清交易按新钱包的 nonce 核对不出结论，这里直接结清
   // （旧钱包上它们最多因过期回滚、花旧钱包的 gas），连续回滚计数与故障记录也不带到新钱包；identityAt 之前入库的
@@ -152,7 +164,7 @@ export function createMevEngine({ store, rpc, sendRpc, chainId, executor: execut
         { method: 'eth_getCode', params: [executor, 'latest'] },
         { method: 'eth_call', params: [{ to: executor, data: selector('owner()') }, 'latest'] },
         { method: 'eth_call', params: [{ to: executor, data: selector('operator()') }, 'latest'] },
-        ...FACTORIES.map(factory => ({ method: 'eth_call', params: [{ to: executor, data: callData('factoryKind(address)', ['address'], [factory.address]) }, 'latest'] })),
+        ...FACTORIES.flatMap(factory => ['factoryKind(address)', 'factoryFee(address)'].map(signature => ({ method: 'eth_call', params: [{ to: executor, data: callData(signature, ['address'], [factory.address]) }, 'latest'] }))),
       ]);
       if (stopping || command !== liveCommand) return false;
       const value = (index: number): string => { const entry = outcomes[index]!; if (!entry.ok || typeof entry.result !== 'string') throw new MevError(502, 'verify', '读取执行合约失败（地址上可能不是执行合约）'); return entry.result; };
@@ -163,7 +175,9 @@ export function createMevEngine({ store, rpc, sendRpc, chainId, executor: execut
       if (new AbiReader(value(2)).address(0) !== owner) return fail('执行合约的 owner 不是配置的地址');
       if (new AbiReader(value(3)).address(0) !== operator) return fail('执行合约的 operator 不是配置的热钱包');
       for (const [index, factory] of FACTORIES.entries()) {
-        if (new AbiReader(value(4 + index)).uint(0) !== BigInt(factory.kind)) return fail(`执行合约没有登记 ${KIND_LABELS[factory.kind]} 的工厂`);
+        if (new AbiReader(value(4 + index * 2)).uint(0) !== BigInt(factory.kind)) return fail(`执行合约没有登记 ${factory.label} 的工厂`);
+        // v2 类的输出按登记的费率算，与本版本的费率表不一致时报出来（owner 可用 setFactory 改）。
+        if (new AbiReader(value(5 + index * 2)).uint(0) !== BigInt(factory.kind === KIND_V2 ? factory.feeBps : 0)) return fail(`执行合约登记的 ${factory.label} 费率与本版本不一致`);
       }
       verification = { ok: true, reason: null, checkedAt: at };
       verifyFailures = 0;
@@ -181,17 +195,45 @@ export function createMevEngine({ store, rpc, sendRpc, chainId, executor: execut
   const allowedPools = (list: readonly Pool[]): Pool[] => { const allowed = new Set(store.tokens().map(token => token.address)); return list.filter(pool => allowed.has(pool.token0) && allowed.has(pool.token1)); };
   const rebuildCycles = (): void => { cycles = enumerateCycles(pools, START_TOKENS.map(token => token.address)); cooldownUntil.clear(); recordedAt.clear(); };
 
+  /** 目录刷新用的节点：每个成功的应答都算节点可用。刷新要发十来批请求，整轮可能超过 RPC_DOWN_HALT_MS，不能被当成节点失联而停实盘。 */
+  const directoryRpc: RpcClient = {
+    request: async (method, params, timeout) => { const result = await rpc.request(method, params, timeout); lastOkAt = now(); return result; },
+    batch: async (calls, timeout) => { const results = await rpc.batch(calls, timeout); lastOkAt = now(); return results; },
+  };
+
+  /** 读一次目录里全部池子的状态，留下深度不低于门槛一定比例的，按深度从高到低最多 MAX_POOLS 个。 */
+  async function deepestPools(found: readonly Pool[]): Promise<Pool[]> {
+    if (!found.length) return [];
+    const snapshot = await readPoolStates(directoryRpc, found, 'latest', 10_000);
+    const unit = tokenPricesUsd(found, snapshot, USDC), floor = settings.minDepthUsd * DIRECTORY_DEPTH_RATIO;
+    // 定价锚（WETH 的美元价）推不出来时，所有深度都是 0：这是读取不完整（子调用失败），不是池子都浅，按刷新失败沿用旧目录。
+    if (!(unit.get(WETH)! > 0)) throw new Error('目录筛选时推不出 WETH 的美元价（池子状态读取不完整）');
+    return found.map(pool => ({ pool, depth: poolDepthUsd(pool, snapshot.get(pool.address), unit) }))
+      .filter(entry => entry.depth >= floor && entry.depth > 0).sort((left, right) => right.depth - left.depth).slice(0, MAX_POOLS).map(entry => entry.pool);
+  }
+
   async function refreshDirectory(): Promise<void> {
-    const at = now(), generation = tokenGeneration;
+    const at = now();
+    let generation = tokenGeneration;
     try {
-      if (seedPending) {
-        for (const address of DEFAULT_MIDDLE_TOKENS) { const token = await readToken(rpc, address); if (token) store.putToken(token, at); }
-        persist('seeded', true);
-        seedPending = false;
+      const pending = seedPending();
+      if (pending.length) {
+        const room = (address: string): boolean => { const listed = store.tokens(); return !seeded.has(address) && listed.length < MAX_TOKENS && !listed.some(token => token.address === address); };
+        for (const address of pending) {
+          if (!room(address)) continue;
+          const token = await readToken(directoryRpc, address);
+          // 读的期间用户可能移除了它（移除时记为已补入）或加满了白名单。
+          if (token && room(address)) store.putToken(token, at);
+        }
+        // 读不到的（没有代码、不是 ERC-20）与白名单已满时没加的也记为已补入，不每轮重试。
+        markSeeded(pending);
       }
-      const found = await discoverPools(rpc, store.tokens().map(token => token.address));
-      store.replacePools(found, at);
-      pools = found;
+      // 补入的代币已在名单里，下面的查询按它查：从这里起算名单有没有再变。
+      generation = tokenGeneration;
+      const found = await discoverPools(directoryRpc, store.tokens().map(token => token.address));
+      const kept = await deepestPools(found);
+      store.replacePools(kept, at);
+      pools = kept;
       directoryError = null;
     } catch (error) {
       // 刷新失败沿用上一份目录；下个周期再试。
@@ -216,7 +258,7 @@ export function createMevEngine({ store, rpc, sendRpc, chainId, executor: execut
 
   const pathText = (cycle: Cycle, tokens: ReadonlyMap<string, TokenInfo>): string =>
     [cycle.hops[0]!.tokenIn, ...cycle.hops.map(hop => hop.tokenOut)].map(address => tokens.get(address)?.symbol ?? address.slice(0, 8)).join(' → ')
-    + `（${cycle.hops.map(hop => KIND_LABELS[hop.pool.kind]).join('、')}）`;
+    + `（${cycle.hops.map(hop => factoryLabel(hop.pool.factory)).join('、')}）`;
 
   async function settle(at: number): Promise<void> {
     const result = await settleOpen(rpc, store, operator, executor, at);
@@ -371,7 +413,7 @@ export function createMevEngine({ store, rpc, sendRpc, chainId, executor: execut
         tokens: [...tokens.values()].map(token => ({ ...token, start: START_TOKENS.some(entry => entry.address === token.address), priceUsd: prices.has(token.address) ? prices.get(token.address)! * 10 ** token.decimals : null })),
         directory: { at: directoryAt || null, error: directoryError, pools: pools.length, usable: usable.size, cycles: cycles.length },
         pools: pools.map(pool => ({
-          address: pool.address, kind: KIND_LABELS[pool.kind], token0: tokens.get(pool.token0)?.symbol ?? pool.token0, token1: tokens.get(pool.token1)?.symbol ?? pool.token1,
+          address: pool.address, kind: factoryLabel(pool.factory), token0: tokens.get(pool.token0)?.symbol ?? pool.token0, token1: tokens.get(pool.token1)?.symbol ?? pool.token1,
           feePpm: pool.feePpm, depthUsd: poolDepthUsd(pool, states.get(pool.address), prices), usable: usable.has(pool.address),
         })).sort((left, right) => right.depthUsd - left.depthUsd),
         opportunities: store.recentOpportunities(60).map(entry => ({
@@ -430,11 +472,15 @@ export function createMevEngine({ store, rpc, sendRpc, chainId, executor: execut
       if (START_TOKENS.some(token => token.address === target)) throw new MevError(400, 'start_token', '起始代币固定在白名单里');
       if (action === 'remove') {
         if (!store.removeToken(target)) throw new MevError(404, 'not_found', '白名单里没有这个代币');
+        // 还没补入的默认代币被移除（正在补入的那一轮读到一半）：记为已补入，之后不再加回。
+        if (DEFAULT_MIDDLE_TOKENS.includes(target) && !seeded.has(target)) markSeeded([target]);
       } else if (action === 'add') {
         if (store.tokens().length >= MAX_TOKENS) throw new MevError(409, 'too_many', `白名单最多 ${MAX_TOKENS} 个代币`);
         let token: TokenInfo | null;
         try { token = await readToken(rpc, target); } catch (error) { throw new MevError(502, 'rpc', `读取代币失败：${errorText(error)}`); }
         if (!token) throw new MevError(400, 'not_token', '这个地址上读不到 ERC-20 的符号与精度');
+        // 读的期间目录刷新可能补入了默认代币：重查上限。
+        if (store.tokens().length >= MAX_TOKENS) throw new MevError(409, 'too_many', `白名单最多 ${MAX_TOKENS} 个代币`);
         store.putToken(token, now());
       } else throw new MevError(400, 'invalid_action', 'action 须为 add 或 remove');
       // 移出立即生效：内存里的目录与环路当场按新名单过滤，不等目录刷新成功。加入的代币等下一次刷新查到池子。

@@ -14,7 +14,7 @@ import { createExecutor } from '../src/executor.ts';
 import { createSimulatedVenues } from '../src/simulation.ts';
 import { runExecutor } from '../src/runtime.ts';
 import { loadWebApp } from '../src/web-assets.ts';
-import { FACTORIES, KIND_AERO_V2, USDC, WETH, type FactoryInfo, type TokenInfo } from '../src/mev/chain.ts';
+import { DEFAULT_MIDDLE_TOKENS, FACTORIES, KIND_AERO_V2, KIND_V2, USDC, WETH, type FactoryInfo, type TokenInfo } from '../src/mev/chain.ts';
 import { addressOf } from '../src/mev/codec.ts';
 import { contractAddress } from '../src/mev/setup.ts';
 import { createFakeChain, type FakePool } from '../src/mev/fake-chain.ts';
@@ -37,7 +37,8 @@ const tokens: TokenInfo[] = [
 ];
 const USD: Record<string, number> = { [WETH]: 3_400, [USDC]: 1, [AERO]: 1.1, [CBBTC]: 97_000 };
 const decimalsOf = (address: string): number => tokens.find(token => token.address === address)!.decimals;
-const [uniswap, slipstream, aeroV2] = FACTORIES as unknown as [FactoryInfo, FactoryInfo, FactoryInfo];
+const factoryNamed = (label: string): FactoryInfo => FACTORIES.find(factory => factory.label === label)!;
+const uniswap = factoryNamed('Uniswap v3'), slipstream = factoryNamed('Aerodrome Slipstream'), aeroV2 = factoryNamed('Aerodrome v2'), uniV2 = factoryNamed('Uniswap v2'), pancake = factoryNamed('PancakeSwap v3');
 let serial = 0;
 /** 一个池子：两种代币按地址排序，`skew` 是相对公允价的偏移，`depthUsd` 是单侧深度。 */
 function pool(factory: FactoryInfo, a: string, b: string, tier: bigint | undefined, fee: bigint, depthUsd: number, skew = 0): FakePool {
@@ -45,12 +46,13 @@ function pool(factory: FactoryInfo, a: string, b: string, tier: bigint | undefin
   const price = USD[token0]! / USD[token1]! * 10 ** (decimalsOf(token1) - decimalsOf(token0)) * (1 + skew);
   const reserve0 = depthUsd / USD[token0]! * 10 ** decimalsOf(token0);
   return { address: '0x' + (0xfeed0000 + ++serial).toString(16).padStart(40, '0'), factory, token0, token1, ...(tier === undefined ? {} : { tier }), fee, price,
-    depth: factory.kind === KIND_AERO_V2 ? reserve0 : reserve0 * Math.sqrt(price) };
+    depth: factory.kind === KIND_AERO_V2 || factory.kind === KIND_V2 ? reserve0 : reserve0 * Math.sqrt(price) };
 }
 const pools = [
   pool(uniswap, WETH, USDC, 500n, 500n, 6_000_000), pool(slipstream, WETH, USDC, 100n, 400n, 4_500_000, 0.0032), pool(uniswap, WETH, USDC, 3000n, 3000n, 800_000),
   pool(aeroV2, WETH, USDC, undefined, 30n, 2_200_000), pool(slipstream, WETH, CBBTC, 100n, 300n, 3_000_000), pool(uniswap, USDC, CBBTC, 500n, 500n, 2_500_000, -0.0011),
   pool(aeroV2, WETH, AERO, undefined, 30n, 1_400_000), pool(slipstream, USDC, AERO, 200n, 2500n, 900_000), pool(uniswap, WETH, AERO, 10000n, 10000n, 12_000),
+  pool(uniV2, WETH, USDC, undefined, 0n, 650_000, 0.0008), pool(pancake, WETH, CBBTC, 500n, 500n, 1_100_000),
 ];
 
 const app = loadWebApp();
@@ -75,6 +77,7 @@ if (!values.setup) {
   const store = openMevStore(join(dir, MEV_FILE));
   for (const token of tokens) store.putToken(token, now);
   store.writeState('seeded', true, now);
+  store.writeState('seededTokens', [...DEFAULT_MIDDLE_TOKENS], now);
   const path = 'WETH → USDC → WETH（Uniswap v3、Aerodrome Slipstream）';
   const seed = (nonce: number, minutesAgo: number, status: 'success' | 'reverted', profit: bigint): void => {
     const at = now - minutesAgo * 60_000, hash = '0x' + randomBytes(32).toString('hex'), expected = 1_450_000_000_000_000n;

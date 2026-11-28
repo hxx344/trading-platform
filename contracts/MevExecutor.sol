@@ -12,7 +12,7 @@ interface IPoolTokens {
     function token1() external view returns (address);
 }
 
-/// Uniswap v3 池子；Aerodrome Slipstream 的 CLPool 的 swap 与回调签名相同。
+/// Uniswap v3 池子；SushiSwap v3、PancakeSwap v3（回调名不同）与 Aerodrome Slipstream 的 CLPool 的 swap 签名相同。
 interface IV3Pool {
     function fee() external view returns (uint24);
     function tickSpacing() external view returns (int24);
@@ -22,13 +22,20 @@ interface IV3Pool {
 interface IV3Factory { function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address); }
 interface ISlipstreamFactory { function getPool(address tokenA, address tokenB, int24 tickSpacing) external view returns (address); }
 
-/// Aerodrome v2（Solidly 类）池子。
+/// Aerodrome v2（Solidly 类）池子；Uniswap v2 类池子的 swap 签名与它相同。
 interface IAeroPool {
     function getAmountOut(uint256 amountIn, address tokenIn) external view returns (uint256);
     function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
 }
 
 interface IAeroFactory { function isPool(address pool) external view returns (bool); }
+
+/// Uniswap v2 类池子（Uniswap v2、SushiSwap v2、BaseSwap、AlienBase）：恒定乘积，费率是池子代码里的常数。
+interface IV2Pair {
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+}
+
+interface IV2Factory { function getPair(address tokenA, address tokenB) external view returns (address); }
 
 contract MevExecutor {
     struct Hop {
@@ -42,6 +49,9 @@ contract MevExecutor {
     uint8 public constant KIND_V3 = 1;
     uint8 public constant KIND_SLIPSTREAM = 2;
     uint8 public constant KIND_AERO_V2 = 3;
+    uint8 public constant KIND_V2 = 4;
+    /// v2 类费率的分母（万分比）。
+    uint256 private constant FEE_DENOMINATOR = 10_000;
 
     uint160 private constant MIN_SQRT_RATIO_PLUS_ONE = 4295128740;
     uint160 private constant MAX_SQRT_RATIO_MINUS_ONE = 1461446703485210103287273052203988822378723970341;
@@ -49,13 +59,15 @@ contract MevExecutor {
     address public immutable owner;
     address public operator;
     mapping(address => uint8) public factoryKind;
+    /// v2 类工厂的池子费率（万分比）；其他池型不用，记 0。
+    mapping(address => uint16) public factoryFee;
     /// 当前允许回调的池子；不在兑换中时为零地址。
     address private _expected;
     bool private _running;
 
     event Executed(address indexed startToken, uint256 amountIn, uint256 profit);
     event OperatorChanged(address indexed operator);
-    event FactoryChanged(address indexed factory, uint8 kind);
+    event FactoryChanged(address indexed factory, uint8 kind, uint16 fee);
 
     error NotOwner();
     error NotOperator();
@@ -67,12 +79,12 @@ contract MevExecutor {
     /// 结束时的余额没有达到 before + minProfit。
     error NoProfit(uint256 balanceAfter, uint256 balanceBefore);
 
-    constructor(address owner_, address operator_, address[] memory factories, uint8[] memory kinds) {
-        if (owner_ == address(0) || factories.length != kinds.length) revert BadPath();
+    constructor(address owner_, address operator_, address[] memory factories, uint8[] memory kinds, uint16[] memory fees) {
+        if (owner_ == address(0) || factories.length != kinds.length || factories.length != fees.length) revert BadPath();
         owner = owner_;
         operator = operator_;
         emit OperatorChanged(operator_);
-        for (uint256 i = 0; i < factories.length; i++) _setFactory(factories[i], kinds[i]);
+        for (uint256 i = 0; i < factories.length; i++) _setFactory(factories[i], kinds[i], fees[i]);
     }
 
     modifier onlyOwner() {
@@ -86,8 +98,9 @@ contract MevExecutor {
         emit OperatorChanged(operator_);
     }
 
-    function setFactory(address factory, uint8 kind) external onlyOwner {
-        _setFactory(factory, kind);
+    /// 登记、改登记或注销（kind 为 0）一个工厂；fee 只对 v2 类有意义，其他池型须为 0。
+    function setFactory(address factory, uint8 kind, uint16 fee) external onlyOwner {
+        _setFactory(factory, kind, fee);
     }
 
     /// 把合约里某种代币的全部余额转给 owner（正常情况下合约没有余额）。
@@ -124,8 +137,32 @@ contract MevExecutor {
         emit Executed(start, amountIn, profit);
     }
 
-    /// Uniswap v3 与 Slipstream 池子在 swap 里回调：先走完其余各跳（只有第一跳带着），再付这一跳的输入。
+    /// v3 式池子在 swap 里回调：先走完其余各跳（只有第一跳带着），再付这一跳的输入。
     function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external {
+        _v3Callback(amount0Delta, amount1Delta, data);
+    }
+
+    /// PancakeSwap v3 的池子用这个名字回调，处理相同。
+    function pancakeV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external {
+        _v3Callback(amount0Delta, amount1Delta, data);
+    }
+
+    /// Aerodrome v2 池子在带数据的 swap 里回调（只用于第一跳）。
+    function hook(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _flashCallback(sender, amount0, amount1, data);
+    }
+
+    /// Uniswap v2、SushiSwap v2、AlienBase 的池子在带数据的 swap 里回调（只用于第一跳）。
+    function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _flashCallback(sender, amount0, amount1, data);
+    }
+
+    /// BaseSwap（PancakeSwap v2 的分叉）的池子用这个名字回调。
+    function pancakeCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _flashCallback(sender, amount0, amount1, data);
+    }
+
+    function _v3Callback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) private {
         if (msg.sender != _expected) revert BadCallback();
         _expected = address(0);
         if (amount0Delta <= 0 && amount1Delta <= 0) revert BadCallback();
@@ -136,8 +173,8 @@ contract MevExecutor {
         _send(tokenIn, pool, owed);
     }
 
-    /// Aerodrome v2 池子在带数据的 swap 里回调（只用于第一跳）。
-    function hook(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+    /// 恒定乘积池子的闪电兑换回调：已拿到输出，走完其余各跳后付这一跳的输入。
+    function _flashCallback(address sender, uint256 amount0, uint256 amount1, bytes calldata data) private {
         if (msg.sender != _expected || sender != address(this)) revert BadCallback();
         _expected = address(0);
         (Hop[] memory rest, address tokenIn, uint256 amountIn) = abi.decode(data, (Hop[], address, uint256));
@@ -164,8 +201,8 @@ contract MevExecutor {
             int256 out = zeroForOne ? amount1 : amount0;
             if (out >= 0) revert BadPool();
             amountOut = uint256(-out);
-        } else if (kind == KIND_AERO_V2) {
-            amountOut = IAeroPool(hop.pool).getAmountOut(amountIn, hop.tokenIn);
+        } else if (kind == KIND_AERO_V2 || kind == KIND_V2) {
+            amountOut = kind == KIND_AERO_V2 ? IAeroPool(hop.pool).getAmountOut(amountIn, hop.tokenIn) : _v2AmountOut(hop, amountIn);
             if (amountOut == 0) revert BadPool();
             (uint256 out0, uint256 out1) = hop.tokenIn < hop.tokenOut ? (uint256(0), amountOut) : (amountOut, uint256(0));
             if (flash) {
@@ -182,6 +219,16 @@ contract MevExecutor {
         }
     }
 
+    /// v2 类的输出：按此刻的储备与登记的费率，与池子 swap 里的 K 检查同一个公式。转账收税的代币到账少于 amountIn，
+    /// 池子的 K 检查不过而回滚。
+    function _v2AmountOut(Hop memory hop, uint256 amountIn) private view returns (uint256) {
+        (uint112 reserve0, uint112 reserve1,) = IV2Pair(hop.pool).getReserves();
+        (uint256 reserveIn, uint256 reserveOut) = hop.tokenIn < hop.tokenOut ? (uint256(reserve0), uint256(reserve1)) : (uint256(reserve1), uint256(reserve0));
+        if (reserveIn == 0 || reserveOut == 0) return 0;
+        uint256 withFee = amountIn * (FEE_DENOMINATOR - factoryFee[hop.factory]);
+        return withFee * reserveOut / (reserveIn * FEE_DENOMINATOR + withFee);
+    }
+
     /// 池子必须由登记过的工厂创建，且这一跳的两种代币正是池子的两种代币。
     function _check(Hop calldata hop) private view {
         uint8 kind = factoryKind[hop.factory];
@@ -194,15 +241,20 @@ contract MevExecutor {
             if (ISlipstreamFactory(hop.factory).getPool(token0, token1, IV3Pool(hop.pool).tickSpacing()) != hop.pool) revert BadPool();
         } else if (kind == KIND_AERO_V2) {
             if (!IAeroFactory(hop.factory).isPool(hop.pool)) revert BadPool();
+        } else if (kind == KIND_V2) {
+            if (IV2Factory(hop.factory).getPair(token0, token1) != hop.pool) revert BadPool();
         } else {
             revert BadPool();
         }
     }
 
-    function _setFactory(address factory, uint8 kind) private {
-        if (factory == address(0) || kind > KIND_AERO_V2) revert BadPath();
+    /// v2 类的费率须在 (0, 10%) 之内，其他池型（含注销）须为 0。
+    function _setFactory(address factory, uint8 kind, uint16 fee) private {
+        if (factory == address(0) || kind > KIND_V2) revert BadPath();
+        if (kind == KIND_V2 ? (fee == 0 || fee >= 1_000) : fee != 0) revert BadPath();
         factoryKind[factory] = kind;
-        emit FactoryChanged(factory, kind);
+        factoryFee[factory] = fee;
+        emit FactoryChanged(factory, kind, fee);
     }
 
     /// transfer 不返回值的代币（如 USDT）也接受；返回 false 或调用失败即回滚。

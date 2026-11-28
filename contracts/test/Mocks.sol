@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: UNLICENSED
-// 只用于 test/mev-contract.test.ts 的替身：代币、恒定乘积的 v3 式与 Aerodrome v2 式池子、工厂、作恶池子。
+// 只用于 test/mev-contract.test.ts 的替身：代币、恒定乘积的 v3 式、Aerodrome v2 式与 Uniswap v2 式池子、工厂、作恶池子。
 // 池子的定价是简化的（没有 tick），回调与结算顺序照真实池子：先给输出、再回调、再核对收到的输入。
 pragma solidity 0.8.30;
 
 interface ISwapCallback { function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external; }
+interface IPancakeV3Callback { function pancakeV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata data) external; }
 interface IHookCallee { function hook(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external; }
+interface IV2Callee { function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external; }
+interface IPancakeCallee { function pancakeCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external; }
 
 contract MockToken {
     mapping(address => uint256) public balanceOf;
@@ -36,6 +39,8 @@ contract MockV3Pool {
     uint256 public reserve0;
     uint256 public reserve1;
     bool private locked;
+    /// 为真时按 PancakeSwap v3 的名字回调。
+    bool public pancake;
 
     constructor(address a, address b, uint24 fee_, int24 spacing) {
         (token0, token1) = a < b ? (a, b) : (b, a);
@@ -47,6 +52,8 @@ contract MockV3Pool {
         reserve0 = MockToken(token0).balanceOf(address(this));
         reserve1 = MockToken(token1).balanceOf(address(this));
     }
+
+    function setPancake(bool value) external { pancake = value; }
 
     function swap(address recipient, bool zeroForOne, int256 amountSpecified, uint160, bytes calldata data) external returns (int256 amount0, int256 amount1) {
         require(!locked, "LOK");
@@ -60,7 +67,8 @@ contract MockV3Pool {
         MockToken(zeroForOne ? token1 : token0).transfer(recipient, amountOut);
         (amount0, amount1) = zeroForOne ? (int256(amountIn), -int256(amountOut)) : (-int256(amountOut), int256(amountIn));
         uint256 beforeBalance = MockToken(tokenIn).balanceOf(address(this));
-        ISwapCallback(msg.sender).uniswapV3SwapCallback(amount0, amount1, data);
+        if (pancake) IPancakeV3Callback(msg.sender).pancakeV3SwapCallback(amount0, amount1, data);
+        else ISwapCallback(msg.sender).uniswapV3SwapCallback(amount0, amount1, data);
         require(MockToken(tokenIn).balanceOf(address(this)) >= beforeBalance + amountIn, "IIA");
         reserve0 = MockToken(token0).balanceOf(address(this));
         reserve1 = MockToken(token1).balanceOf(address(this));
@@ -114,10 +122,59 @@ contract MockAeroPool {
     }
 }
 
+/// Uniswap v2 式池子：费率是常数（万分比），K 检查照 Uniswap v2 的写法；`pancake` 为真时按 BaseSwap 的名字回调。
+contract MockV2Pair {
+    address public immutable token0;
+    address public immutable token1;
+    uint256 public immutable feeBps;
+    bool public immutable pancake;
+    uint112 private reserve0;
+    uint112 private reserve1;
+    bool private locked;
+
+    constructor(address a, address b, uint256 feeBps_, bool pancake_) {
+        (token0, token1) = a < b ? (a, b) : (b, a);
+        feeBps = feeBps_;
+        pancake = pancake_;
+    }
+
+    function sync() external {
+        reserve0 = uint112(MockToken(token0).balanceOf(address(this)));
+        reserve1 = uint112(MockToken(token1).balanceOf(address(this)));
+    }
+
+    function getReserves() external view returns (uint112, uint112, uint32) { return (reserve0, reserve1, 0); }
+
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external {
+        require(!locked, "LOK");
+        locked = true;
+        require(amount0Out > 0 || amount1Out > 0, "IOA");
+        require(amount0Out < reserve0 && amount1Out < reserve1, "IL");
+        if (amount0Out > 0) MockToken(token0).transfer(to, amount0Out);
+        if (amount1Out > 0) MockToken(token1).transfer(to, amount1Out);
+        if (data.length > 0) {
+            if (pancake) IPancakeCallee(to).pancakeCall(msg.sender, amount0Out, amount1Out, data);
+            else IV2Callee(to).uniswapV2Call(msg.sender, amount0Out, amount1Out, data);
+        }
+        uint256 balance0 = MockToken(token0).balanceOf(address(this));
+        uint256 balance1 = MockToken(token1).balanceOf(address(this));
+        uint256 in0 = balance0 > reserve0 - amount0Out ? balance0 - (reserve0 - amount0Out) : 0;
+        uint256 in1 = balance1 > reserve1 - amount1Out ? balance1 - (reserve1 - amount1Out) : 0;
+        require(in0 > 0 || in1 > 0, "IIA");
+        uint256 adjusted0 = balance0 * 10_000 - in0 * feeBps;
+        uint256 adjusted1 = balance1 * 10_000 - in1 * feeBps;
+        require(adjusted0 * adjusted1 >= uint256(reserve0) * reserve1 * 100_000_000, "K");
+        reserve0 = uint112(balance0);
+        reserve1 = uint112(balance1);
+        locked = false;
+    }
+}
+
 contract MockFactory {
     mapping(bytes32 => address) private byFee;
     mapping(bytes32 => address) private bySpacing;
     mapping(address => bool) public isPool;
+    mapping(bytes32 => address) private pairs;
 
     function registerFee(address pool) external {
         MockV3Pool target = MockV3Pool(pool);
@@ -131,6 +188,16 @@ contract MockFactory {
 
     function registerPool(address pool) external { isPool[pool] = true; }
 
+    function registerPair(address pool) external {
+        MockV2Pair target = MockV2Pair(pool);
+        pairs[keccak256(abi.encode(target.token0(), target.token1()))] = pool;
+    }
+
+    function getPair(address a, address b) external view returns (address) {
+        (address token0, address token1) = a < b ? (a, b) : (b, a);
+        return pairs[keccak256(abi.encode(token0, token1))];
+    }
+
     function getPool(address a, address b, uint24 fee) external view returns (address) {
         (address token0, address token1) = a < b ? (a, b) : (b, a);
         return byFee[keccak256(abi.encode(token0, token1, fee))];
@@ -142,7 +209,7 @@ contract MockFactory {
     }
 }
 
-/// 不在兑换中时直接调执行合约的两个回调，企图让它付款。
+/// 不在兑换中时直接调执行合约的各个回调，企图让它付款。
 contract EvilPool {
     function callSwapCallback(address executor, bytes calldata data) external {
         ISwapCallback(executor).uniswapV3SwapCallback(int256(1 ether), -int256(1), data);
@@ -150,5 +217,17 @@ contract EvilPool {
 
     function callHook(address executor, bytes calldata data) external {
         IHookCallee(executor).hook(executor, 1, 0, data);
+    }
+
+    function callPancakeV3(address executor, bytes calldata data) external {
+        IPancakeV3Callback(executor).pancakeV3SwapCallback(int256(1 ether), -int256(1), data);
+    }
+
+    function callV2(address executor, bytes calldata data) external {
+        IV2Callee(executor).uniswapV2Call(executor, 1, 0, data);
+    }
+
+    function callPancake(address executor, bytes calldata data) external {
+        IPancakeCallee(executor).pancakeCall(executor, 1, 0, data);
     }
 }

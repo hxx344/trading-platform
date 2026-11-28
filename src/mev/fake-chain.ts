@@ -3,8 +3,9 @@
 // 池子只有现货状态，没有曲线：一条环路模拟出多少利润由调用方的 `profit` 决定。
 import { keccak256 } from '../aster/eip712.ts';
 import { AbiReader, abiEncode, bytesOf, callData, hexOf, lower, selector, toQuantity, type Hex } from './codec.ts';
-import { FACTORIES, GAS_PRICE_ORACLE, KIND_AERO_V2, KIND_SLIPSTREAM, KIND_V3, MULTICALL3, type FactoryInfo, type TokenInfo } from './chain.ts';
+import { FACTORIES, GAS_PRICE_ORACLE, KIND_SLIPSTREAM, KIND_V2, KIND_V3, MULTICALL3, type FactoryInfo, type TokenInfo } from './chain.ts';
 import { expectedRuntimeCode } from './engine.ts';
+import { isReservePool } from './pools.ts';
 import type { FetchLike } from './rpc.ts';
 import { EXECUTED_TOPIC } from './simulate.ts';
 
@@ -12,11 +13,11 @@ export interface FakePool {
   address: string; factory: FactoryInfo; token0: string; token1: string;
   /** v3 的费率档或 Slipstream 的 tickSpacing；v2 不用。 */
   tier?: bigint;
-  /** fee()（百万分比）或工厂 getFee（万分比）的返回值。 */
+  /** fee()（百万分比）或 Aerodrome v2 工厂 getFee（万分比）的返回值；v2 类不读。 */
   fee: bigint;
   /** token1 对 token0 的现货价（最小单位之比）。 */
   price: number;
-  /** v2：token0 的储备（最小单位）；v3 / Slipstream：liquidity。 */
+  /** 恒定乘积池子：token0 的储备（最小单位）；v3 式 / Slipstream：liquidity。 */
   depth: number;
 }
 export interface FakeExecute { /** 第一跳的输入代币，即环路的起始代币。 */ start: string; pools: string[]; amountIn: bigint; minProfit: bigint; deadlineBlock: bigint }
@@ -45,7 +46,8 @@ export function createFakeChain(options: FakeChainOptions) {
     const { factory } = pool, pair = [lower(pool.token0), lower(pool.token1)] as const;
     const data = factory.kind === KIND_V3 ? callData('getPool(address,address,uint24)', ['address', 'address', 'uint'], [...pair, pool.tier ?? 0n])
       : factory.kind === KIND_SLIPSTREAM ? callData('getPool(address,address,int24)', ['address', 'address', 'int'], [...pair, pool.tier ?? 0n])
-        : callData('getPool(address,address,bool)', ['address', 'address', 'bool'], [...pair, false]);
+        : factory.kind === KIND_V2 ? callData('getPair(address,address)', ['address', 'address'], [...pair])
+          : callData('getPool(address,address,bool)', ['address', 'address', 'bool'], [...pair, false]);
     lookups.set(`${factory.address}:${data}`, lower(pool.address));
   }
   const state = {
@@ -56,6 +58,10 @@ export function createFakeChain(options: FakeChainOptions) {
     deployed: true,
     /** 置 true 时 eth_getCode 报错（模拟节点应答不全）。 */
     failCode: false,
+    /** 执行合约 factoryFee(工厂) 的返回值改成这里的（测试登记费率与本版本不一致）。 */
+    factoryFees: new Map<string, bigint>(),
+    /** 置 true 时池子的 slot0() / getReserves() 子调用失败（Multicall 外层仍成功，模拟读取不完整）。 */
+    failPoolState: false,
     /** 置 true 时对执行合约的 operator() 调用报错。 */
     failCall: false,
     /** 每个请求处理前调用（测试用它在请求途中改动状态）。 */
@@ -91,13 +97,16 @@ export function createFakeChain(options: FakeChainOptions) {
     const name = data.slice(0, 10), token = tokens.get(target), pool = pools.get(target);
     if (token) {
       if (name === selector('decimals()')) return word(BigInt(token.decimals));
+      // balanceOf(x) 回显 x：测试 Multicall 的结果对齐时每个子调用的应答都不同。
+      if (name === selector('balanceOf(address)')) return '0x' + data.slice(10, 74);
       if (name === selector('symbol()')) return abiEncode(['bytes'], [hexOf(new TextEncoder().encode(token.symbol))]);
       return null;
     }
     if (pool) {
+      if (state.failPoolState && (name === selector('slot0()') || name === selector('getReserves()'))) return null;
       if (name === selector('token0()')) return word(BigInt(pool.token0));
       if (name === selector('token1()')) return word(BigInt(pool.token1));
-      if (pool.factory.kind === KIND_AERO_V2) return name === selector('getReserves()') ? abiEncode(['uint', 'uint', 'uint'], [BigInt(Math.floor(pool.depth)), BigInt(Math.floor(pool.depth * pool.price)), BigInt(state.timestamp)]) : null;
+      if (isReservePool(pool.factory.kind)) return name === selector('getReserves()') ? abiEncode(['uint', 'uint', 'uint'], [BigInt(Math.floor(pool.depth)), BigInt(Math.floor(pool.depth * pool.price)), BigInt(state.timestamp)]) : null;
       if (name === selector('fee()')) return word(pool.fee);
       if (name === selector('slot0()')) return abiEncode(['uint', 'int', 'uint'], [sqrtX96(pool.price), 0n, 0n]);
       if (name === selector('liquidity()')) return word(BigInt(Math.floor(pool.depth)));
@@ -129,7 +138,11 @@ export function createFakeChain(options: FakeChainOptions) {
     if (target !== executor) return { result: '0x' };
     if (name === selector('owner()')) return { result: word(BigInt(owner)) };
     if (name === selector('operator()')) return state.failCall ? { error: { code: -32005, message: 'limit exceeded' } } : { result: word(BigInt(state.operator)) };
-    if (name === selector('factoryKind(address)')) { const factory = FACTORIES.find(entry => entry.address === new AbiReader('0x' + data.slice(10)).address(0)); return { result: word(BigInt(factory?.kind ?? 0)) }; }
+    if (name === selector('factoryKind(address)') || name === selector('factoryFee(address)')) {
+      const factory = FACTORIES.find(entry => entry.address === new AbiReader('0x' + data.slice(10)).address(0));
+      if (name === selector('factoryFee(address)') && factory && state.factoryFees.has(factory.address)) return { result: word(state.factoryFees.get(factory.address)!) };
+      return { result: word(BigInt(name === selector('factoryKind(address)') ? factory?.kind ?? 0 : factory?.feeBps ?? 0)) };
+    }
     const profit = state.profit(decodeExecute(data));
     return profit === null || profit <= 0n ? { error: reverted } : { result: word(profit) };
   }

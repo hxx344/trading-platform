@@ -1,5 +1,6 @@
 // DEX 价差实盘（docs/dexspread.md 第 13、18 节）：引擎按策略信号开平仓，在两腿都是下单场所（Lighter 主网、Lighter RH、Entropy）的配对上发真实的单。
-// 实盘持仓就是策略持仓（没有模拟盘）。开仓信号 → 先下 A 腿、按 A 的实际成交量下 B 腿，B 没补齐的部分在 A 上反向平掉（单腿）；平仓信号 → 两腿各自只减仓平掉。
+// 实盘持仓就是策略持仓（没有模拟盘）。开仓信号 → 先下第一腿（默认 A，配对里恰好有一条 Entropy 腿时先下它）、按它的实际成交量下第二腿，
+// 第二腿在时限内没补齐的部分在第一腿上反向平掉（单腿）；平仓信号 → 两腿各自只减仓平掉（第 23 节）。
 // 要点：
 // - 每笔单发出前先把意图（pending）与「已走到哪一步」一起写进库；结果未知的单不重发，先按自编号查；查不出来就读账户：
 //   持仓多出来了按多出的量记成交；持仓没变要等这笔单过期之后再读一次账户才算没成交（L039、L093）。
@@ -12,20 +13,22 @@ import type { LighterPrivateStatus } from './lighter-private.ts';
 import type { LiveKeys, LiveKeysStore } from './livekeys.ts';
 import { VENUE_NAMES, type LegInfo, type MarketSpec, type PairInfo, type Regime, type Sample } from './model.ts';
 import { ORDER_EXPIRY_MS, cloidOf, type OrderConfirmSource, type OrderOutcome, type ResolveOutcome, type VenueOrder, type VenueTrader } from './orders.ts';
-import { floorTo, limitPrice, orderPlan } from './plan.ts';
+import { floorTo, hedgeBound, limitPrice, orderPlan } from './plan.ts';
 import { FIRST_LEG_MISSED_NOTE, createLiveSummary, summaryRowOf } from './live-summary.ts';
 import type { LiveSummaryRow } from './store.ts';
 import type { Direction } from './strategy.ts';
 
 export const LIVE_SETTINGS_KEY = 'liveSettings', LIVE_RUNTIME_KEY = 'liveRuntime';
 export const LIVE_EXEC_KEY = 'liveExec', LIVE_SKIP_STATS_KEY = 'liveSkipStats';
+/** v0.118.0 起新增的执行参数另存一个键：liveExec 保持原字段集合，回滚后旧版本仍读得懂它。 */
+export const LIVE_EXEC_MORE_KEY = 'liveExecMore';
 export interface LiveLimits { /** 单笔名义（美元）。 */ perTradeUsd: number; /** 同时持有的实盘笔数。 */ maxOpen: number; /** 当日已实现亏损到这个数就不再开仓。 */ dailyLossUsd: number; /** 开仓对冲腿与平仓的限价保护（基点）。 */ slippageBps: number }
 export interface LiveSettings { on: boolean; pairs: string[]; limits: LiveLimits }
 export const DEFAULT_LIVE_SETTINGS: LiveSettings = { on: false, pairs: [], limits: { perTradeUsd: 100, maxOpen: 1, dailyLossUsd: 20, slippageBps: 30 } };
 export const LIVE_LIMIT_RANGES = { perTradeUsd: [10, 100_000], maxOpen: [1, 20], dailyLossUsd: [1, 100_000], slippageBps: [1, 300] } as const;
 
 export interface LiveExecSettings {
-  /** 开仓 A 腿的限价滑点保护（基点，默认 2）；对冲 B 腿与平仓继续用 limits.slippageBps。 */
+  /** 开仓第一腿的限价滑点保护（基点，默认 2）；第二腿与平仓继续用 limits.slippageBps。 */
   openLegASlippageBps: number;
   /** 开仓信号持续确认毫秒数（默认 0 = 不延迟立即下单）。 */
   confirmMs: number;
@@ -35,9 +38,36 @@ export interface LiveExecSettings {
   autoSizeByBalance: boolean;
   /** 本地名义金额相对可用余额的倍率上限（默认 1，范围 1–5）；>1 时须先在交易所手动设好 >= 该倍率的杠杆并强制按 95% 预留缓冲。 */
   maxLeverage: number;
+  /** 开仓先发哪条腿：a 固定先发 A 腿；entropy（默认）配对里恰好有一条 Entropy 腿时先发它，否则先发 A。 */
+  firstLeg: 'a' | 'entropy';
+  /** 第二腿没补齐时在限价内重试的时限（秒，默认 3）；0 为不重试，立刻回补第一腿。 */
+  hedgeWaitSec: number;
+  /** 第二腿重试的间隔（毫秒，默认 500）。 */
+  hedgeRetryMs: number;
+  /** 等第二腿期间，第一腿场所回补方向的价格比开始等待时不利超过这么多基点就不再等（默认 10）。 */
+  hedgeAbortBps: number;
+  /** 第二腿限价的经济边界：按第一腿实际成交价，对冲后这一对相对基线至少还剩这么多基点（默认 5）。 */
+  hedgeEdgeBps: number;
+  /** 回归平仓的保利限价：两腿按最坏价成交后整笔净额不低于名义的这么多基点（默认 0；取下限 -100 为关闭，与止损等共用滑点）。 */
+  revertMinNetBps: number;
 }
-export const DEFAULT_LIVE_EXEC: LiveExecSettings = { openLegASlippageBps: 2, confirmMs: 0, notFilledCooldownSec: 30, autoSizeByBalance: true, maxLeverage: 1 };
-export const LIVE_EXEC_RANGES = { openLegASlippageBps: [0, 30], confirmMs: [0, 10_000], notFilledCooldownSec: [5, 3_600], maxLeverage: [1, 5] } as const;
+export const DEFAULT_LIVE_EXEC: LiveExecSettings = {
+  openLegASlippageBps: 2, confirmMs: 0, notFilledCooldownSec: 30, autoSizeByBalance: true, maxLeverage: 1,
+  firstLeg: 'entropy', hedgeWaitSec: 3, hedgeRetryMs: 500, hedgeAbortBps: 10, hedgeEdgeBps: 5, revertMinNetBps: 0,
+};
+export const LIVE_EXEC_RANGES = {
+  openLegASlippageBps: [0, 30], confirmMs: [0, 10_000], notFilledCooldownSec: [5, 3_600], maxLeverage: [1, 5],
+  hedgeWaitSec: [0, 30], hedgeRetryMs: [200, 5_000], hedgeAbortBps: [1, 300], hedgeEdgeBps: [0, 100], revertMinNetBps: [-100, 100],
+} as const;
+export const LIVE_FIRST_LEGS = ['a', 'entropy'] as const;
+const LEGACY_EXEC_KEYS: readonly (keyof LiveExecSettings)[] = ['openLegASlippageBps', 'confirmMs', 'notFilledCooldownSec', 'autoSizeByBalance', 'maxLeverage'];
+const INTEGER_EXEC_KEYS: readonly string[] = ['confirmMs', 'notFilledCooldownSec', 'hedgeRetryMs'];
+/** 执行参数分两个键落库：原字段集合与 v0.118.0 起新增的。 */
+function execParts(exec: LiveExecSettings): { legacy: Partial<LiveExecSettings>; more: Partial<LiveExecSettings> } {
+  const legacy: Record<string, unknown> = {}, more: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(exec)) (LEGACY_EXEC_KEYS.includes(key as keyof LiveExecSettings) ? legacy : more)[key] = value;
+  return { legacy, more };
+}
 
 type LegName = 'a' | 'b';
 type Side = 'buy' | 'sell';
@@ -60,12 +90,18 @@ export interface LiveStrategy {
   /** 开仓时执行的保证金倍率上限（仅 > 1 时写入，保持 1× 下策略字段与旧版一致）。 */ maxLeverage?: number;
   /** 自动配置的配对：开仓时的出场、止损与最长持有，之后推荐值变了也不动这笔仓。 */ rules?: { exitBps: number; stopBps: number; maxHoldMinutes: number };
 }
+/** 第二腿的等待窗口（第 23 节）：第一次要发第二腿时建立，之后的重试都在它定下的限价与时限里。 */
+export interface HedgeWindow {
+  since: number; /** 已发出的第二腿笔数。 */ sends: number; /** 第一次发第二腿时定下的限价。 */ limit?: number;
+  /** 开始等待时第一腿场所回补方向的价格。 */ ref?: number; /** 已停止重试：之后只回补第一腿。 */ over?: boolean;
+}
 /** 开仓信号：方向、名义、持续确认时刻与策略读数。 */
 export interface LiveSignal { direction: Direction; notionalUsd: number; signalAt?: number; check?: LiveEntryCheck; strategy: Omit<LiveStrategy, 'notionalUsd'> }
 export interface PendingOrder {
   leg: LegName; purpose: 'open' | 'hedge' | 'flatten' | 'close'; side: Side; qty: number; limit: number; reduceOnly: boolean; clientId: number; sentAt: number;
   expectedPrice?: number; signalAt?: number;
 }
+/** openA、openB 是开仓的第一腿、第二腿（v0.118.0 以前 A 总是第一腿，名字沿用）；单在哪条腿上看 leg。 */
 export type LiveOrderRole = 'openA' | 'openB' | 'flatten' | 'closeA' | 'closeB';
 export interface LiveOrderTelemetry {
   role: LiveOrderRole;
@@ -92,8 +128,11 @@ export type LiveState = 'opening' | 'open' | 'closing' | 'stuck' | 'closed';
 export interface LivePosition {
   id: string; /** 配对键。 */ symbol: string; /** v0.111.2 以前跟随的模拟持仓编号；v0.112.0 起写成持仓自己的编号，只为回滚时旧版本能认出并平掉，本版本不读。 */ paperId?: string; direction: Direction; ratio: number; state: LiveState;
   /** 开仓走到哪一步：a 下第一腿、b 下第二腿、settle 核对两腿并回补。 */ step: 'a' | 'b' | 'settle';
+  /** 第一腿是哪条：只在先发 B 腿时写 b，没有就是 A（第 23 节）。 */ first?: LegName;
+  /** 第二腿的等待窗口。 */ hedge?: HedgeWindow;
   openedAt: number; updatedAt: number; closedAt: number | null;
-  a: LiveLeg; b: LiveLeg; /** 计划的 A 腿数量与限价；bLimit 是预演里 B 腿的限价，发第一腿前 B 的当前价不能比它差；expected 为 A 腿信号预期成交价。 */ plan: { qty: number; limit: number; bLimit?: number; expected?: number };
+  a: LiveLeg; b: LiveLeg; /** 计划的 A 腿数量与限价；bLimit 是预演里 B 腿的限价，发第一腿前 B 的当前价不能比它差；expected 为 A 腿信号预期成交价；bQty、bExpected 是先发 B 腿时它的数量与预期价。 */
+  plan: { qty: number; limit: number; bLimit?: number; expected?: number; bQty?: number; bExpected?: number };
   pending: PendingOrder | null; /** 并发平仓时第二腿的在途意图。 */ pendingB?: PendingOrder | null;
   /** 回补或平仓已经发了几笔单。 */ tries: number; retryAt: number;
   closeReason: string | null; singleLeg: boolean; netUsd: number | null; note: string;
@@ -130,6 +169,8 @@ export interface LiveDeps {
   /** Lighter / RH 私有订单 WS 状态。 */ privateStreams?: () => Partial<Record<'lighter' | 'rh', LighterPrivateStatus>>;
   /** 一笔实盘持仓结束了（含没开成、单腿、人工结束）：引擎据此冷却这个配对。抛错只记日志。 */ onFinished?: (position: LivePosition) => void;
   signalFor(): AbortSignal;
+  /** 过这么多毫秒再推进一次（第二腿的重试间隔比每秒一次的定时推进短）；没有时等定时推进。 */
+  wake?: (delayMs: number) => void;
   /** 记录发出 Entropy 实盘单的关联信息（写盘失败只记日志，不阻止发单）。 */
   onOrderSent?: (info: { venue: KeyVenue; cloid: string; positionId: string; purpose: PendingOrder['purpose']; leg: LegInfo; assumedFeeBps: number; at: number }) => void;
   /** Entropy 实盘成交后触发一次延迟成本同步。 */
@@ -138,6 +179,10 @@ export interface LiveDeps {
 export class LiveError extends Error { readonly code: string; readonly status: number; constructor(code: string, message: string, status = 400) { super(message); this.code = code; this.status = status; } }
 
 const MAX_FLATTEN_TRIES = 3, MAX_CLOSE_TRIES = 10, RETRY_MS = 5_000;
+/** 第二腿在等待窗口里最多发这么多笔。 */
+const MAX_HEDGE_SENDS = 8;
+/** 回归平仓前这么多次按保利限价下单；保利滑点最紧这么多基点（再紧容易一条腿成交、另一条没成交）。 */
+const REVERT_TIGHT_TRIES = 2, REVERT_MIN_SLIPPAGE_BPS = 5;
 /** 实盘页的成交表列这么多笔；被挡下的统计最多这么久落一次库。 */
 export const LIVE_TRADES_SHOWN = 50, SKIP_SAVE_MS = 1_000;
 /** 结果未知的单：发出后过这么久还查不到，就按账户持仓核对；再久仍定不下来就停止。 */
@@ -149,7 +194,7 @@ const INTENT_MAX_AGE_MS = 15_000;
 const NO_QUOTE_ALERT_MS = 60_000, NO_QUOTE_STUCK_MS = 10 * 60_000;
 /** 开仓被实盘检查挡住：同一配对同一原因这么久只记一条事件（信号每次推送都会再来）。 */
 export const SKIP_EVENT_MS = 10 * 60_000;
-/** 第二腿的意图一直落不了库：多久告警、多久转人工（计时只在内存里，进程重启从零开始）。 */
+/** 第二腿、回补单或平仓单的意图一直落不了库：多久告警、多久转人工（计时只在内存里，进程重启从零开始）。 */
 const HEDGE_FAIL_ALERT_MS = 60_000, HEDGE_FAIL_STUCK_MS = 10 * 60_000;
 /** 单还没交给连接器就失败了（停止中、凭据不在、落自编号或意图失败）：这笔单肯定没发出，调用方可以退回进度。其余错误一律不能这样推断。 */
 class NotSentError extends Error {}
@@ -188,7 +233,7 @@ export function readLiveExecSettings(value: unknown, base: LiveExecSettings = DE
   for (const [key, [low, high]] of Object.entries(LIVE_EXEC_RANGES) as [keyof typeof LIVE_EXEC_RANGES, readonly [number, number]][]) {
     if (!(key in value)) continue;
     const raw = value[key];
-    const integer = key === 'confirmMs' || key === 'notFilledCooldownSec';
+    const integer = INTEGER_EXEC_KEYS.includes(key);
     if (typeof raw !== 'number' || !Number.isFinite(raw) || raw < low || raw > high || (integer && !Number.isInteger(raw))) {
       return fail(`实盘执行参数 ${key} 须在 ${low} 到 ${high} 之间`);
     }
@@ -197,6 +242,10 @@ export function readLiveExecSettings(value: unknown, base: LiveExecSettings = DE
   if ('autoSizeByBalance' in value) {
     if (typeof value.autoSizeByBalance !== 'boolean') return fail('按余额自动缩量开关须为布尔值');
     next.autoSizeByBalance = value.autoSizeByBalance;
+  }
+  if ('firstLeg' in value) {
+    if (value.firstLeg !== 'a' && value.firstLeg !== 'entropy') return fail('先发腿须为 a 或 entropy');
+    next.firstLeg = value.firstLeg;
   }
   return next;
 }
@@ -237,8 +286,12 @@ export function createLiveTrader(deps: LiveDeps) {
     try { return saved ? readLiveSettings(saved, () => true) : DEFAULT_LIVE_SETTINGS; } catch { return DEFAULT_LIVE_SETTINGS; }
   })();
   let execSettings: LiveExecSettings = (() => {
-    const saved = store.state<LiveExecSettings>(LIVE_EXEC_KEY);
-    try { return saved ? readLiveExecSettings(saved) : DEFAULT_LIVE_EXEC; } catch { return DEFAULT_LIVE_EXEC; }
+    let next = DEFAULT_LIVE_EXEC;
+    // 两个键各自校验：读不懂的那一组用默认值。
+    for (const key of [LIVE_EXEC_KEY, LIVE_EXEC_MORE_KEY]) {
+      try { const saved = store.state<unknown>(key); if (saved) next = readLiveExecSettings(saved, next); } catch { /* 用默认值 */ }
+    }
+    return next;
   })();
   let skipStats: LiveSkipStats = normalizeSkipStats(store.state<LiveSkipStats>(LIVE_SKIP_STATS_KEY), dayStart(now()));
   const runtime: Runtime = { halt: null, paused: {}, singles: {}, ...(store.state<Runtime>(LIVE_RUNTIME_KEY) ?? {}) };
@@ -285,13 +338,25 @@ export function createLiveTrader(deps: LiveDeps) {
     const leg = position[name];
     return leg.market && leg.code ? { venue: leg.venue, symbol: leg.code, market: leg.market } : null;
   };
-  /** 第一腿已成交、第二腿的意图一直落不了库：不能无限重试，一分钟告警，十分钟转人工（L039、L092）。 */
+  /**
+   * 第一腿已成交后第二腿或回补单的意图、或平仓单的意图一直落不了库：次数会退回去，不能无限重试，一分钟告警，十分钟转人工（L039、L084、L092）。
+   * 从第一次失败算起，中间换成另一种单（第二腿的重试过了时限改去回补）不重新计时；发出一笔或这笔持仓不再需要它们时清掉。
+   */
   const hedgeFailSince = new Map<string, number>();
-  function hedgeBlocked(position: LivePosition, error: unknown): void {
+  function hedgeBlocked(position: LivePosition, error: unknown, what: '第二腿' | '回补单' | '平仓单' = '第二腿'): void {
     const since = hedgeFailSince.get(position.id) ?? now();
     hedgeFailSince.set(position.id, since);
-    if (now() - since >= HEDGE_FAIL_STUCK_MS) { hedgeFailSince.delete(position.id); stuck(position, `第二腿一直没有发出（${message(error).slice(0, 80)}），第一腿没有对冲；修好后先在实盘页核对并处理这笔，再重启服务，否则重启后会按当时报价补发第二腿`); return; }
-    if (now() - since >= HEDGE_FAIL_ALERT_MS) alert(`hedgefail:${position.id}`, `【DEX 价差实盘】${position.symbol} 第一腿已成交，第二腿 ${Math.round((now() - since) / 1000)} 秒仍没有发出（${message(error).slice(0, 80)}）；第一腿没有对冲，请检查服务器磁盘与日志`);
+    const closing = what === '平仓单';
+    if (now() - since >= HEDGE_FAIL_STUCK_MS) {
+      hedgeFailSince.delete(position.id);
+      // 转人工这一次落库也可能失败：库里仍是原状态时，重启后会接着发（平仓单只减仓，接着平是在降风险）。
+      stuck(position, closing
+        ? `平仓单一直没有发出（${message(error).slice(0, 80)}），两腿持仓还在交易所；修好后重启服务，这笔仍显示平仓中的会接着平，仍需人工处理的在交易所平掉两腿后点「已人工处理」`
+        : `${what}一直没有发出（${message(error).slice(0, 80)}），第一腿没有对冲；修好后先在实盘页核对并处理这笔，再重启服务，否则重启后会按当时报价补发${what}`);
+      return;
+    }
+    if (closing) { if (now() - since >= HEDGE_FAIL_ALERT_MS) alert(`closefail:${position.id}`, `【DEX 价差实盘】${position.symbol} 要平仓，平仓单 ${Math.round((now() - since) / 1000)} 秒仍没有发出（${message(error).slice(0, 80)}）；持仓还在交易所，请检查服务器磁盘与日志`); return; }
+    if (now() - since >= HEDGE_FAIL_ALERT_MS) alert(`hedgefail:${position.id}`, `【DEX 价差实盘】${position.symbol} 第一腿已成交，${what} ${Math.round((now() - since) / 1000)} 秒仍没有发出（${message(error).slice(0, 80)}）；第一腿没有对冲，请检查服务器磁盘与日志`);
   }
   /** 一条腿此刻的可成交价是否在限价以内：买看卖一、卖看买一。不在或没有报价时返回原因。 */
   function quoteProblem(info: LegInfo, side: Side, limit: number): string | null {
@@ -300,6 +365,24 @@ export function createLiveTrader(deps: LiveDeps) {
     const price = side === 'buy' ? quote.ask : quote.bid;
     if (!(Number.isFinite(limit) && limit > 0) || (side === 'buy' ? price > limit : price < limit)) return `${VENUE_NAMES[info.venue]} 此刻的${side === 'buy' ? '卖一' : '买一'} ${+price.toFixed(6)} 已越过限价 ${+limit.toFixed(6)}`;
     return null;
+  }
+  /** 回补第一腿的滑点（基点）：每多试一次放宽一档。 */
+  const flattenSlippage = (tries: number) => Math.min(300, Math.max(100, settings.limits.slippageBps * 3) * (tries + 1));
+  /**
+   * 第二腿的限价：滑点边界（一档 ± limits.slippageBps）与经济边界里较宽的一个（第 23 节）。
+   * 经济边界按第一腿实际成交均价算，最多放宽到第一次回补会用的滑点：再宽不如直接回补。第一腿成交价是估的时只用滑点边界。
+   */
+  function hedgeLimit(position: LivePosition, leadName: LegName, hedge: LegInfo, side: Side, top: number): number {
+    const [slip] = limitPrice(hedge, side, top, settings.limits.slippageBps);
+    const leadLeg = position[leadName], baseline = position.strategy?.entryBaseline;
+    if (baseline === undefined || !Number.isFinite(baseline) || !(leadLeg.qty > 0) || leadLeg.estimated) return slip;
+    const bound = hedgeBound(position.direction, leadName, leadLeg.entryQuote / leadLeg.qty, position.ratio, baseline, execSettings.hedgeEdgeBps);
+    if (bound === null) return slip;
+    // 经济边界向保守一侧取整：买不高于它、卖不低于它。Entropy 的 5 位有效数字是四舍五入，可能越过边界不到半个基点：越过时再让 1 基点。
+    let [economic] = limitPrice(hedge, opposite(side), bound, 0);
+    if (side === 'buy' ? economic > bound : economic < bound) [economic] = limitPrice(hedge, opposite(side), bound, 1);
+    const [widest] = limitPrice(hedge, side, top, flattenSlippage(0));
+    return side === 'buy' ? Math.max(slip, Math.min(economic, widest)) : Math.min(slip, Math.max(economic, widest));
   }
   /** 回补或平仓取不到报价：一分钟后告警，十分钟后交给人处理。返回 true 表示已转人工。 */
   function waitQuote(position: LivePosition, venue: KeyVenue): boolean {
@@ -323,6 +406,7 @@ export function createLiveTrader(deps: LiveDeps) {
     if (note) position.note = note;
     save(position);
     active.delete(position.id);
+    hedgeFailSince.delete(position.id);
     closedCache = null;
     const row = summaryRowOf(position);
     if (row) summary?.add(row);
@@ -558,75 +642,135 @@ export function createLiveTrader(deps: LiveDeps) {
       }
       if (position.state === 'open') return;
       if (position.state === 'opening') {
+        // 第一腿与第二腿：默认 A 先 B 后，position.first 为 b 时反过来（docs/dexspread.md 第 23 节）。step 的 a、b 指的是第一腿、第二腿。
+        const leadName: LegName = position.first === 'b' ? 'b' : 'a', hedgeName: LegName = leadName === 'a' ? 'b' : 'a';
+        const lead = leadName === 'a' ? a : b, hedge = leadName === 'a' ? b : a, leadLeg = position[leadName], hedgeLeg = position[hedgeName];
+        const toHedge = (qty: number) => leadName === 'a' ? qty * position.ratio : qty / position.ratio;
+        const toLead = (qty: number) => leadName === 'a' ? qty / position.ratio : qty * position.ratio;
         if (position.step === 'a') {
           // 意图落库后没能马上发出（上一轮还在忙、进程重启）：过期、开关已关、配对已不勾选或已停止时作废，不按旧限价补发。
           if (now() - position.openedAt > INTENT_MAX_AGE_MS || !settings.on || !settings.pairs.includes(position.symbol) || runtime.halt) { finish(position, 'not_filled', '开仓意图已过期，没有下单'); return; }
           const stale = quoteProblem(a, position.a.side, position.plan.limit) ?? (position.plan.bLimit === undefined ? null : quoteProblem(b, position.b.side, position.plan.bLimit));
           const spreadReason = stale ?? (position.strategy?.check ? liveSpreadProblem(a, b, position.ratio, position.direction, position.strategy) : null);
           if (spreadReason) { skip(position.symbol, spreadReason); finish(position, 'not_filled', spreadReason); return; }
+          const qty = leadName === 'a' ? position.plan.qty : position.plan.bQty, limit = leadName === 'a' ? position.plan.limit : position.plan.bLimit;
+          const expectedPrice = (leadName === 'a' ? position.plan.expected : position.plan.bExpected) ?? limit;
+          if (qty === undefined || limit === undefined || expectedPrice === undefined || !(qty > 0 && limit > 0)) { finish(position, 'not_filled', '开仓计划不完整，没有下单'); return; }
           // 先把步骤推进到 b，与 pending 同一次落库：之后无论进程在哪里退出，重启后都只会去查这笔单，不会再发第一腿（L039、L095）。
           const signalAt = position.strategy?.signalBbo?.at ?? position.openedAt;
-          const sentA = await send(
+          const sentFirst = await send(
             position,
-            a,
-            { leg: 'a', purpose: 'open', side: position.a.side, qty: position.plan.qty, limit: position.plan.limit, expectedPrice: position.plan.expected ?? position.plan.limit, signalAt, reduceOnly: false },
+            lead,
+            { leg: leadName, purpose: 'open', side: leadLeg.side, qty, limit, expectedPrice, signalAt, reduceOnly: false },
             () => { position.step = 'b'; },
             () => { position.step = 'a'; },
           );
-          if (!sentA) return;
+          if (!sentFirst) return;
           continue;
         }
-        if (position.a.qty <= 0) { finish(position, 'not_filled', `${VENUE_NAMES[position.a.venue]} ${FIRST_LEG_MISSED_NOTE}，放弃`); return; }
-        if (position.step === 'b') {
-          const target = floorTo(position.a.qty * position.ratio, b.market.sizeDecimals ?? 0), quote = deps.quote(b);
-          if (target >= Math.max(stepOf(b), b.market.minBase) && quote) {
-            const side = position.b.side, expectedPrice = side === 'buy' ? quote.ask : quote.bid;
-            const [limit] = limitPrice(b, side, expectedPrice, settings.limits.slippageBps);
-            const openAConfirmAt = position.orders?.find(item => item.role === 'openA')?.confirmAt ?? now();
-            let sentB: boolean;
-            try {
-              sentB = await send(
-                position,
-                b,
-                { leg: 'b', purpose: 'hedge', side, qty: target, limit, expectedPrice, signalAt: openAConfirmAt, reduceOnly: false },
-                () => { position.step = 'settle'; },
-                () => { position.step = 'b'; },
-              );
-            } catch (error) {
-              if (error instanceof NotSentError) hedgeBlocked(position, error);
-              throw error;
-            }
-            hedgeFailSince.delete(position.id);
-            if (!sentB) { save(position); return; }
-          } else {
-            position.step = 'settle';
-            save(position);
+        if (leadLeg.qty <= 0) { finish(position, 'not_filled', `${VENUE_NAMES[leadLeg.venue]} ${FIRST_LEG_MISSED_NOTE}，放弃`); return; }
+        const hedgeDecimals = hedge.market.sizeDecimals ?? 0, target = floorTo(toHedge(leadLeg.qty), hedgeDecimals), minHedge = Math.max(stepOf(hedge), hedge.market.minBase);
+        const waitMs = execSettings.hedgeWaitSec * 1_000, retryMs = execSettings.hedgeRetryMs;
+        const shortOf = () => floorTo(target - hedgeLeg.qty, hedgeDecimals);
+        /** 没补齐的量还够再发一笔（最小数量与最小金额）。 */
+        const retryable = (price: number) => { const short = shortOf(); return short >= minHedge && short * price >= hedge.market.minQuote; };
+        /** 隔一小段再看第二腿：到点由 wake 或每秒一次的推进接着走。 */
+        const waitHedge = () => { position.retryAt = now() + retryMs; save(position); deps.wake?.(retryMs); };
+        const sendHedge = async (qty: number, limit: number, expectedPrice: number, window: HedgeWindow, stepBack: 'b' | 'settle'): Promise<boolean> => {
+          const beforeLimit = window.limit, signalAt = position.orders?.find(item => item.role === 'openA')?.confirmAt ?? now();
+          try {
+            return await send(
+              position,
+              hedge,
+              { leg: hedgeName, purpose: 'hedge', side: hedgeLeg.side, qty, limit, expectedPrice, signalAt, reduceOnly: false },
+              () => { position.step = 'settle'; window.sends++; window.limit = limit; },
+              () => { position.step = stepBack; window.sends--; if (beforeLimit === undefined) delete window.limit; else window.limit = beforeLimit; },
+            );
+          } catch (error) {
+            if (error instanceof NotSentError) hedgeBlocked(position, error);
+            throw error;
           }
+        };
+        if (position.step === 'b') {
+          const window = position.hedge ??= { since: now(), sends: 0 };
+          const quote = target >= minHedge ? deps.quote(hedge) : null;
+          if (target >= minHedge && !quote && now() - window.since < waitMs) { waitHedge(); return; }
+          if (!quote) {
+            // 第一腿的成交量折不出一笔够最小数量的第二腿，或第二腿到时限仍没有报价：去 settle 回补第一腿。
+            window.over = true; position.step = 'settle';
+            save(position);
+            continue;
+          }
+          if (window.ref === undefined) { const leadQuote = deps.quote(lead); if (leadQuote) window.ref = leadLeg.side === 'buy' ? leadQuote.bid : leadQuote.ask; }
+          const expectedPrice = hedgeLeg.side === 'buy' ? quote.ask : quote.bid;
+          const sentHedge = await sendHedge(target, hedgeLimit(position, leadName, hedge, hedgeLeg.side, expectedPrice), expectedPrice, window, 'b');
+          hedgeFailSince.delete(position.id);
+          if (!sentHedge) { save(position); return; }
+          // 没补齐：隔一个重试间隔再看，不立刻追一笔。
+          if (waitMs > 0 && retryable(expectedPrice)) { position.retryAt = now() + retryMs; deps.wake?.(retryMs); }
           continue;
         }
-        // settle：A 比 B 多出来的部分在 A 上反向平掉。两腿步长不同、乘数除不尽时总会差一点：不到 B 一个步长的等值的余量不算单腿、不回补，
+        // settle 之一：第二腿没补齐时，在时限内按第一次定下的限价重试（第 23 节）；一档在限价之外只等不发。
+        const window = position.hedge;
+        if (window && !window.over) {
+          const short = shortOf();
+          let retry = position.tries === 0 && leadLeg.exitQty === 0 && short >= minHedge && now() - window.since < waitMs && window.sends < MAX_HEDGE_SENDS;
+          if (retry) {
+            const leadQuote = deps.quote(lead), exit = leadQuote ? (leadLeg.side === 'buy' ? leadQuote.bid : leadQuote.ask) : null;
+            // 开始等待时第一腿没有报价：参考价等报价回来再记（随下一次落库保存）。
+            if (window.ref === undefined) { if (exit !== null) window.ref = exit; }
+            // 第一腿所在场所的回补方向价格比开始等待时不利太多：不再等，马上回补。
+            else if (exit !== null && (leadLeg.side === 'buy' ? window.ref - exit : exit - window.ref) / window.ref * 1e4 > execSettings.hedgeAbortBps) retry = false;
+          }
+          if (retry) {
+            const quote = deps.quote(hedge), side = hedgeLeg.side, top = quote ? (side === 'buy' ? quote.ask : quote.bid) : null;
+            const limit = top === null ? null : window.limit ?? hedgeLimit(position, leadName, hedge, side, top);
+            if (top !== null && short * top < hedge.market.minQuote) retry = false;
+            else if (top === null || limit === null || (side === 'buy' ? top > limit : top < limit)) { waitHedge(); return; }
+            else {
+              const sentHedge = await sendHedge(short, limit, top, window, 'settle');
+              hedgeFailSince.delete(position.id);
+              if (!sentHedge) { save(position); return; }
+              if (retryable(top)) { position.retryAt = now() + retryMs; deps.wake?.(retryMs); }
+              continue;
+            }
+          }
+          window.over = true;
+          save(position);
+        }
+        // settle 之二：第一腿比第二腿多出来的部分在第一腿上反向平掉。两腿步长不同、乘数除不尽时总会差一点：不到第二腿一个步长的等值的余量不算单腿、不回补，
         // 留到平仓时两腿各自平掉。比这多的都是真实的单腿敞口，哪怕低于最小下单量也照常回补（只减仓单交易所不收时重试到上限转人工并告警）。
-        // 取整余量只可能出现在 B 已补齐目标时；B 少成交哪怕一个步长，都是真实敞口。
-        const excess = floorTo(remainingOf(position.a) - position.b.qty / position.ratio, a.market.sizeDecimals ?? 0);
-        const dust = position.b.qty > 0 && position.b.qty >= floorTo(position.a.qty * position.ratio, b.market.sizeDecimals ?? 0) - stepOf(b) / 2;
-        if (excess >= stepOf(a) && !dust) {
+        // 取整余量只可能出现在第二腿已补齐目标时；第二腿少成交哪怕一个步长，都是真实敞口。
+        const excess = floorTo(remainingOf(leadLeg) - toLead(hedgeLeg.qty), lead.market.sizeDecimals ?? 0);
+        const dust = hedgeLeg.qty > 0 && hedgeLeg.qty >= target - stepOf(hedge) / 2;
+        if (excess >= stepOf(lead) && !dust) {
           position.singleLeg = true;
-          if (position.tries >= MAX_FLATTEN_TRIES) { stuck(position, `${VENUE_NAMES[position.a.venue]} 多出的 ${excess} 平不掉（第二腿没有补齐）`); return; }
-          const quote = deps.quote(a);
-          if (!quote) { waitQuote(position, position.a.venue); return; }
+          if (position.tries >= MAX_FLATTEN_TRIES) { stuck(position, `${VENUE_NAMES[leadLeg.venue]} 多出的 ${excess} 平不掉（第二腿没有补齐）`); return; }
+          const quote = deps.quote(lead);
+          if (!quote) { waitQuote(position, leadLeg.venue); return; }
           position.waitSince = null;
-          const side = opposite(position.a.side), expectedPrice = side === 'buy' ? quote.ask : quote.bid;
-          const [limit] = limitPrice(a, side, expectedPrice, Math.min(300, Math.max(100, settings.limits.slippageBps * 3) * (position.tries + 1)));
-          const before = position.a.exitQty, beforeTries = position.tries;
-          const signalAt = position.orders?.find(item => item.role === 'openB')?.confirmAt ?? position.updatedAt;
-          if (!await send(position, a, { leg: 'a', purpose: 'flatten', side, qty: excess, limit, expectedPrice, signalAt, reduceOnly: true }, () => { position.tries++; }, () => { position.tries = beforeTries; })) return;
-          if (position.a.exitQty === before) position.retryAt = now() + RETRY_MS;
+          const side = opposite(leadLeg.side), expectedPrice = side === 'buy' ? quote.ask : quote.bid;
+          const [limit] = limitPrice(lead, side, expectedPrice, flattenSlippage(position.tries));
+          const before = leadLeg.exitQty, beforeTries = position.tries;
+          const signalAt = position.orders?.findLast(item => item.role === 'openB')?.confirmAt ?? position.updatedAt;
+          let sentFlatten: boolean;
+          try {
+            sentFlatten = await send(position, lead, { leg: leadName, purpose: 'flatten', side, qty: excess, limit, expectedPrice, signalAt, reduceOnly: true }, () => { position.tries++; }, () => { position.tries = beforeTries; });
+          } catch (error) {
+            // 意图落不了库时次数退回去了，MAX_FLATTEN_TRIES 拦不住：另按时间告警、转人工。
+            if (error instanceof NotSentError) hedgeBlocked(position, error, '回补单');
+            throw error;
+          }
+          hedgeFailSince.delete(position.id);
+          if (!sentFlatten) return;
+          if (leadLeg.exitQty === before) position.retryAt = now() + RETRY_MS;
           continue;
         }
-        if (position.b.qty <= 0) { finish(position, 'single_leg', `${VENUE_NAMES[position.b.venue]} 第二腿没有成交，第一腿已平掉`); return; }
+        hedgeFailSince.delete(position.id);
+        if (hedgeLeg.qty <= 0) { finish(position, 'single_leg', `${VENUE_NAMES[hedgeLeg.venue]} 第二腿没有成交，第一腿已平掉`); return; }
         position.state = 'open'; position.tries = 0; position.waitSince = null;
         save(position);
-        event(position.symbol, `实盘开仓：${VENUE_NAMES[position.a.venue]} ${position.a.side === 'buy' ? '买' : '卖'} ${fmt(remainingOf(position.a), 6)}，${VENUE_NAMES[position.b.venue]} ${position.b.side === 'buy' ? '买' : '卖'} ${fmt(position.b.qty, 6)}${position.singleLeg ? '（第二腿只成交了一部分，多出的已平掉）' : ''}`);
+        event(position.symbol, `实盘开仓：${VENUE_NAMES[position.a.venue]} ${position.a.side === 'buy' ? '买' : '卖'} ${fmt(remainingOf(position.a), 6)}，${VENUE_NAMES[position.b.venue]} ${position.b.side === 'buy' ? '买' : '卖'} ${fmt(remainingOf(position.b), 6)}${position.singleLeg ? '（第二腿只成交了一部分，多出的已平掉）' : ''}`);
         return;
       }
       // closing：两腿各自只减仓并发平掉（L039：先在单次事务落好两腿待发意图再并发下发）。
@@ -644,7 +788,22 @@ export function createLiveTrader(deps: LiveDeps) {
         quotes.set(name, quote);
       }
       position.waitSince = null;
-      const slippage = Math.min(300, Math.max(50, settings.limits.slippageBps) * (1 + Math.floor(position.tries / 2)));
+      const wide = Math.min(300, Math.max(50, settings.limits.slippageBps) * (1 + Math.floor(position.tries / 2)));
+      // 回归平仓在两腿都还没有平仓成交时，前几次按保利限价下单（第 23 节）；止损、超时、手动与一条腿已先成交的都用原来的滑点。
+      const tight = position.closeReason === 'revert' && execSettings.revertMinNetBps > LIVE_EXEC_RANGES.revertMinNetBps[0] && position.tries < REVERT_TIGHT_TRIES && remLegs.length === 2
+        && !position.orders?.some(item => (item.role === 'closeA' || item.role === 'closeB') && item.filledQty > 0);
+      let slippage = wide;
+      if (tight) {
+        let net = 0, gross = 0;
+        for (const [name, info] of remLegs) {
+          const leg = position[name], quote = quotes.get(name)!, remaining = remainingOf(leg), exit = leg.side === 'buy' ? quote.bid : quote.ask;
+          net += (leg.side === 'buy' ? 1 : -1) * (leg.exitQuote + remaining * exit - leg.entryQuote) - leg.feesUsd - remaining * exit * deps.takerFeeBps(info) / 10_000;
+          gross += remaining * exit;
+        }
+        // 两腿各让 s 基点后净额少 gross × s：解出还能保住最低净额的 s。
+        const room = gross > 0 ? (net - (position.strategy?.notionalUsd ?? gross / 2) * execSettings.revertMinNetBps / 10_000) / gross * 1e4 : wide;
+        slippage = Math.min(wide, Math.max(REVERT_MIN_SLIPPAGE_BPS, Number.isFinite(room) ? room : wide));
+      }
       const signalAt = position.closeSignalAt ?? now();
       const specs: SendSpec[] = remLegs.map(([name, info], index) => {
         const leg = position[name], quote = quotes.get(name)!, side = opposite(leg.side);
@@ -657,13 +816,24 @@ export function createLiveTrader(deps: LiveDeps) {
         };
       });
       const beforeExitA = position.a.exitQty, beforeExitB = position.b.exitQty, beforeTries = position.tries;
-      if (!await sendBatch(position, specs, () => { position.tries++; }, () => { position.tries = beforeTries; })) return;
+      let sentClose: boolean;
+      try {
+        sentClose = await sendBatch(position, specs, () => { position.tries++; }, () => { position.tries = beforeTries; });
+      } catch (error) {
+        // 意图落不了库时次数退回去了，MAX_CLOSE_TRIES 拦不住：另按时间告警、转人工。
+        if (error instanceof NotSentError) hedgeBlocked(position, error, '平仓单');
+        throw error;
+      }
+      hedgeFailSince.delete(position.id);
+      if (!sentClose) return;
       const stalledLeg = specs.some(spec => {
         const legName = spec.order.leg;
         const prev = legName === 'a' ? beforeExitA : beforeExitB;
         return remainingOf(position[legName]) >= stepOf(spec.info) - 1e-12 && position[legName].exitQty === prev;
       });
-      if (stalledLeg) { position.retryAt = now() + RETRY_MS; save(position); }
+      // 保利限价下一条腿成交、另一条没成交：不等，下一轮立刻按原来的滑点平剩下的。
+      const moved = position.a.exitQty !== beforeExitA || position.b.exitQty !== beforeExitB;
+      if (stalledLeg && !(tight && moved)) { position.retryAt = now() + RETRY_MS; save(position); }
     }
   }
 
@@ -779,6 +949,8 @@ export function createLiveTrader(deps: LiveDeps) {
     if (todayNet <= -settings.limits.dailyLossUsd) return act(`当日已实现亏损达到上限 ${fmt(settings.limits.dailyLossUsd, 0)} 美元`);
     return { notionalUsd };
   }
+  /** 开仓先发哪条腿（第 23 节）：设置为 entropy 且配对里恰好只有 B 腿是 Entropy 时先发 B，其余先发 A。 */
+  const firstLegOf = (pair: PairInfo): LegName => execSettings.firstLeg === 'entropy' && pair.b.venue === 'entropy' && pair.a.venue !== 'entropy' ? 'b' : 'a';
   function resolveBlocker(pair: PairInfo, requestedUsd: number): string | { notionalUsd: number } {
     const checked = checkOpen(pair, requestedUsd);
     return 'reason' in checked ? checked.reason : checked;
@@ -844,7 +1016,9 @@ export function createLiveTrader(deps: LiveDeps) {
       const checked = resolveBlocker(pair, requestedUsd);
       let reason = typeof checked === 'string' ? checked : null;
       const notionalUsd = typeof checked === 'string' ? requestedUsd : checked.notionalUsd;
-      const plan = reason ? null : orderPlan(pair, sample, signal.direction, notionalUsd, execSettings.openLegASlippageBps, now(), settings.limits.slippageBps);
+      // 预演里第一腿用收紧的滑点，第二腿用 limits.slippageBps（真正发第二腿时按当时的一档与经济边界重算）。
+      const first = firstLegOf(pair), tightBps = execSettings.openLegASlippageBps, wideBps = settings.limits.slippageBps;
+      const plan = reason ? null : orderPlan(pair, sample, signal.direction, notionalUsd, first === 'a' ? tightBps : wideBps, now(), first === 'a' ? wideBps : tightBps, first);
       if (plan && !plan.ready) reason = plan.checks.find(check => !check.ok)?.label ?? '下单预演没有通过';
       // 样本可能有一腿是旧的：两腿此刻的可成交价都不能比预演的限价差，且实时双腿价差仍满足开仓门槛（L100）。
       if (plan && !reason) {
@@ -865,13 +1039,14 @@ export function createLiveTrader(deps: LiveDeps) {
           // paperId 取自己的编号：本版本不读它；回滚到 v0.111.2 时旧版本找不到这个编号的模拟持仓，会立即只减仓平掉（docs/dexspread.md 18.3）。
           id, paperId: id, symbol: pair.key, direction: signal.direction, ratio: pair.ratio, state: 'opening', step: 'a',
           openedAt: time, updatedAt: time, closedAt: null, a: leg(pair.a, legA.side), b: leg(pair.b, legB.side),
-          plan: { qty: Number(legA.qty), limit: Number(legA.limit), bLimit: Number(legB.limit), expected: legA.expected },
+          ...(first === 'b' && { first }),
+          plan: { qty: Number(legA.qty), limit: Number(legA.limit), bLimit: Number(legB.limit), expected: legA.expected, ...(first === 'b' && { bQty: Number(legB.qty), bExpected: legB.expected }) },
           pending: null, tries: 0, retryAt: 0, closeReason: null, singleLeg: false, netUsd: null, note: '',
           strategy: { ...signal.strategy, notionalUsd, ...(execSettings.maxLeverage > 1 && { maxLeverage: execSettings.maxLeverage }), ...(signal.check && { check: signal.check }) },
         };
         store.saveLive(position);
         active.set(position.id, position);
-        event(pair.key, `实盘开仓信号：${signal.direction === 'a_rich' ? '卖 A 买 B' : '买 A 卖 B'}，名义 ${fmt(notionalUsd, 0)} 美元，信号价差 ${fmt(signal.strategy.entrySpread, 1)} 基点，基线 ${fmt(signal.strategy.entryBaseline, 1)}`);
+        event(pair.key, `实盘开仓信号：${signal.direction === 'a_rich' ? '卖 A 买 B' : '买 A 卖 B'}${first === 'b' ? '（先发 B 腿）' : ''}，名义 ${fmt(notionalUsd, 0)} 美元，信号价差 ${fmt(signal.strategy.entrySpread, 1)} 基点，基线 ${fmt(signal.strategy.entryBaseline, 1)}`);
         kick();
       };
     },
@@ -898,6 +1073,8 @@ export function createLiveTrader(deps: LiveDeps) {
     alerts: (): LiveAlert[] => [...alerts],
     settings: () => settings,
     exec: () => execSettings,
+    /** 这个配对开仓先发哪条腿。 */
+    firstLeg: firstLegOf,
     /** 改实盘设置：`on`、`pairs`、`limits` 与执行优化参数 `exec` 分键落库；旧键保持原字段集合。 */
     update(body: unknown, known: (key: string) => boolean): LiveSettings {
       if (!isObject(body)) throw new LiveError('invalid_params', '实盘设置格式无效');
@@ -909,12 +1086,16 @@ export function createLiveTrader(deps: LiveDeps) {
       const nextExec = 'exec' in body ? readLiveExecSettings(execRaw, execSettings) : execSettings;
       const time = now();
       if (hasBase) (store.saveLiveState ?? store.setState)(LIVE_SETTINGS_KEY, next, time);
-      if ('exec' in body) (store.saveLiveState ?? store.setState)(LIVE_EXEC_KEY, nextExec, time);
+      if ('exec' in body) {
+        const { legacy, more } = execParts(nextExec);
+        (store.saveLiveState ?? store.setState)(LIVE_EXEC_KEY, legacy, time);
+        (store.saveLiveState ?? store.setState)(LIVE_EXEC_MORE_KEY, more, time);
+      }
       const turnedOn = next.on && !settings.on;
       settings = next;
       execSettings = nextExec;
       if (hasBase) event(null, `实盘设置已更新：总开关${next.on ? '开' : '关'}，配对 ${next.pairs.length} 个，单笔 ${fmt(next.limits.perTradeUsd, 0)} 美元、最多 ${next.limits.maxOpen} 笔、当日亏损上限 ${fmt(next.limits.dailyLossUsd, 0)} 美元`);
-      if ('exec' in body) event(null, `实盘执行优化已更新：A 腿滑点 ${nextExec.openLegASlippageBps} bps、信号确认 ${nextExec.confirmMs} ms、未成冷却 ${nextExec.notFilledCooldownSec} s、倍率上限 ${nextExec.maxLeverage}×、余额缩量${nextExec.autoSizeByBalance ? '开' : '关'}`);
+      if ('exec' in body) event(null, `实盘执行优化已更新：第一腿滑点 ${nextExec.openLegASlippageBps} bps、信号确认 ${nextExec.confirmMs} ms、未成冷却 ${nextExec.notFilledCooldownSec} s、倍率上限 ${nextExec.maxLeverage}×、余额缩量${nextExec.autoSizeByBalance ? '开' : '关'}、先发${nextExec.firstLeg === 'entropy' ? ' Entropy 腿' : ' A 腿'}、第二腿等待 ${nextExec.hedgeWaitSec} s（间隔 ${nextExec.hedgeRetryMs} ms、不利 ${nextExec.hedgeAbortBps} bps 放弃、经济边界 ${nextExec.hedgeEdgeBps} bps）、回归平仓保利 ${nextExec.revertMinNetBps} bps`);
       if (turnedOn) log('varlighter: 实盘总开关已打开');
       return settings;
     },

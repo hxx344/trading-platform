@@ -491,6 +491,7 @@ export function createVarLighterEngine({ store, leadStoreFile, fetchImpl = fetch
     },
     signalFor: () => anySignal([liveStop.signal], REQUEST_TIMEOUT_MS),
     stopped: () => liveStop.signal.aborted,
+    wake: delayMs => { const timer = setTimeout(() => { if (!liveStop.signal.aborted) liveTrader?.tick(); }, delayMs); timer.unref?.(); },
     onOrderSent: ({ cloid, positionId, purpose, leg, assumedFeeBps, at }) => {
       const address = entropyAddress();
       if (!address) return;
@@ -1372,7 +1373,7 @@ export function createVarLighterEngine({ store, leadStoreFile, fetchImpl = fetch
     const quoted = sample ? spreadOf(sample, bucketOf(params.notionalUsd)) : null;
     const fees = feesOf(pair);
     const protection = slippageBudgetBps(params, { minNetBps: settings.global.minNetBps, aFeeBps: fees?.aFeeBps ?? 0, bFeeBps: fees?.bFeeBps ?? 0 }, quoted ? (quoted.buyA - quoted.sellA) / 2 : 0);
-    const plans: OrderPlan[] = sample ? DIRECTIONS.map(direction => orderPlan(pair, sample, direction, params.notionalUsd, protection, time)) : [];
+    const plans: OrderPlan[] = sample ? DIRECTIONS.map(direction => orderPlan(pair, sample, direction, params.notionalUsd, protection, time, protection, liveTrader?.firstLeg(pair) ?? 'a')) : [];
     const current = held().get(pair.key), position = current ? strategyOf(current) : null;
     return {
       key: pair.key, a: { ...pair.a, name: VENUE_NAMES[pair.a.venue] }, b: { ...pair.b, name: VENUE_NAMES[pair.b.venue] }, ratio: pair.ratio, custom: pair.custom, note: pair.note,

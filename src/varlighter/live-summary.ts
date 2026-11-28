@@ -12,17 +12,17 @@ const emptyCounts = (): LiveOutcomeCounts => ({ traded: 0, notFilled: 0, other: 
 const dayName = (day: number) => new Date(day * DAY_MS).toISOString().slice(0, 10);
 
 /**
- * 第一腿有没有发出去过：有成交，或逐单记录里有开仓 A 腿，或说明写着第一腿没有成交（v0.112.x 没有逐单记录）。
+ * 第一腿有没有发出去过：有成交，或逐单记录里有开仓第一腿（角色 openA），或说明写着第一腿没有成交（v0.112.x 没有逐单记录）。
  * 其余没成交的是发单前就放弃的（意图过期、发单前的报价或实时价差复核没过、凭据不在）。store.liveSummaryRows 的 SQL 与页面的 firstLegSent 同口径。
  */
-export const firstLegSent = (position: Pick<LivePosition, 'a' | 'orders' | 'note'>): boolean =>
-  position.a.qty > 0 || position.orders?.some(order => order.role === 'openA') === true || (position.note ?? '').includes(FIRST_LEG_MISSED_NOTE);
+export const firstLegSent = (position: Pick<LivePosition, 'a' | 'b' | 'orders' | 'note'>): boolean =>
+  position.a.qty > 0 || position.b.qty > 0 || position.orders?.some(order => order.role === 'openA') === true || (position.note ?? '').includes(FIRST_LEG_MISSED_NOTE);
 
-/** 一笔已结束的持仓对应的汇总行；口径与 store.liveSummaryRows 的分组相同（有成交按 A 腿开仓量大于 0，日期按结束时刻的 UTC 日）。 */
+/** 一笔已结束的持仓对应的汇总行；口径与 store.liveSummaryRows 的分组相同（有成交按任一条腿开仓量大于 0：先发 B 腿、A 腿没对冲上的单腿也算，日期按结束时刻的 UTC 日）。 */
 export function summaryRowOf(position: LivePosition): LiveSummaryRow | null {
   if (position.closedAt === null) return null;
   const netUsd = position.netUsd ?? 0;
-  return { symbol: position.symbol, day: Math.floor(position.closedAt / DAY_MS), reason: position.closeReason ?? '', traded: position.a.qty > 0, singleLeg: position.singleLeg === true, sent: firstLegSent(position), count: 1, netUsd, wins: netUsd > 0 ? 1 : 0 };
+  return { symbol: position.symbol, day: Math.floor(position.closedAt / DAY_MS), reason: position.closeReason ?? '', traded: position.a.qty > 0 || position.b.qty > 0, singleLeg: position.singleLeg === true, sent: firstLegSent(position), count: 1, netUsd, wins: netUsd > 0 ? 1 : 0 };
 }
 
 export function createLiveSummary(rows: readonly LiveSummaryRow[]) {

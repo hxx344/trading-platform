@@ -15,7 +15,7 @@ import {
   EMPTY_PAIR_FORM, backtestBody, bps, bytesPerDay, chartRange, chartRows, comboLabel, comboShort, customPairKey, customPairRequest, directionLabel, directionShort, fundingAnnual, globalForm, globalRequest, parseState,
   SIMPLE_SORT_KEYS, directionSides, entryProgress, matchesCombo, pairLabel, readOverviewMode, rebateAudit, settingsBody, signal, sortRows, costBreakdown, symbolForm, symbolRequest, toggleConfirmed, usd, varLighterHref, AUTO_FIELDS, autoBody, autoFormPatch, quickEnableBody,
   VARLIGHTER_TABS, reasonLabel, ACCOUNT_VENUE_FILTERS, accountActivityFoot, filterAccountPositions, filterAccountTrades, filterAccountFunding, selectedEquitySeries, selectedVenuePnlCurve, formatCurrencyAmount, signedCurrencyAmount, formatRatePct, marginModeLabel, tradeDirLabel, accountHealthBadge,
-  liveExecForm, parseLiveExec, tradeTelemetrySummary,
+  liveExecFields, liveExecForm, parseLiveExec, tradeTelemetrySummary,
   baselineMissing, blockedAtEntry, breakdownRows, firstLegMissRate, firstLegMissed, firstLegSent, followServerForm, gateNote, liveLimitsForm, liveOutcomes, liveSwitchForm, msText, orderTelemetryStats, outcomeCounts, outcomeText, parseLiveLimits, positionMarkCells, quantile, rangeFieldErrors, sameLiveForm,
   tradedPositions, untradedPositions, LIVE_EXEC_FIELDS, LIVE_EXEC_RANGES, LIVE_LIMIT_FIELDS, LIVE_LIMIT_RANGES,
 } from '../src/varlighter/varlighter-form.ts';
@@ -343,12 +343,31 @@ test('live exec form round-trips with server readLiveExecSettings and formats tr
   assert.equal(parseLiveExec({ ...form, maxLeverage: '0.5' }).ok, false);
   assert.equal(parseLiveExec({ ...form, maxLeverage: '5.5' }).ok, false);
   assert.equal(parseLiveExec({ ...form, maxLeverage: '' }).ok, false);
+  assert.equal(parseLiveExec({ ...form, hedgeWaitSec: '31' }).ok, false);
+  assert.equal(parseLiveExec({ ...form, hedgeRetryMs: '199' }).ok, false);
+  assert.equal(parseLiveExec({ ...form, hedgeRetryMs: '500.5' }).ok, false);
+  assert.equal(parseLiveExec({ ...form, revertMinNetBps: '-101' }).ok, false);
+  assert.deepEqual(parseLiveExec({ ...form, firstLeg: 'a', hedgeWaitSec: '0', revertMinNetBps: '-100' }), { ok: true, value: { ...DEFAULT_LIVE_EXEC, firstLeg: 'a', hedgeWaitSec: 0, revertMinNetBps: -100 } });
+  assert.deepEqual(parseLiveExec({ ...form, revertMinNetBps: '-0.5' }), { ok: true, value: { ...DEFAULT_LIVE_EXEC, revertMinNetBps: -0.5 } });
+  assert.deepEqual(parseLiveExec({ ...form, revertMinNetBps: '\u22125' }), { ok: true, value: { ...DEFAULT_LIVE_EXEC, revertMinNetBps: -5 } }, '全角减号按负号读');
+  assert.equal(parseLiveExec({ ...form, revertMinNetBps: '-' }).ok, false);
+  const execCases = [{ hedgeWaitSec: '31' }, { hedgeRetryMs: '199' }, { hedgeRetryMs: '500.5' }, { hedgeAbortBps: '0' }, { hedgeEdgeBps: '101' }, { revertMinNetBps: '-101' }];
+  for (const patch of execCases) {
+    assert.equal(parseLiveExec({ ...form, ...patch }).ok, false, JSON.stringify(patch));
+    assert.throws(() => readLiveExecSettings({ ...DEFAULT_LIVE_EXEC, ...Object.fromEntries(Object.entries(patch).map(([key, value]) => [key, Number(value)])) }), undefined, `服务端同样拒绝 ${JSON.stringify(patch)}`);
+  }
+  assert.throws(() => readLiveExecSettings({ ...DEFAULT_LIVE_EXEC, firstLeg: 'b' }), undefined, '服务端拒绝不认识的先发腿');
+  // 旧版 DEX 价差服务的执行参数没有后加的字段：页面只列出、只提交它有的那些。
+  const { firstLeg: _firstLeg, hedgeWaitSec: _wait, hedgeRetryMs: _retry, hedgeAbortBps: _abort, hedgeEdgeBps: _edge, revertMinNetBps: _revert, ...oldExec } = DEFAULT_LIVE_EXEC;
+  assert.deepEqual(liveExecFields(oldExec).map(field => field.key), ['openLegASlippageBps', 'confirmMs', 'notFilledCooldownSec', 'maxLeverage']);
+  assert.equal(liveExecFields(DEFAULT_LIVE_EXEC).length, LIVE_EXEC_FIELDS.length);
+  assert.deepEqual(parseLiveExec(liveExecForm(oldExec), liveExecFields(oldExec)), { ok: true, value: oldExec });
   assert.deepEqual(parseLiveExec({ ...form, maxLeverage: '2.5' }), { ok: true, value: { ...DEFAULT_LIVE_EXEC, maxLeverage: 2.5 } });
   assert.deepEqual(parseLiveExec({ ...form, maxLeverage: '5' }), { ok: true, value: { ...DEFAULT_LIVE_EXEC, maxLeverage: 5 } });
   assert.equal(tradeTelemetrySummary({}), null);
   assert.equal(tradeTelemetrySummary({
     orders: [{ role: 'openA', leg: 'a', venue: 'lighter', side: 'sell', clientId: 1, qty: 1, filledQty: 1, expectedPrice: 100, limitPrice: 99.98, avgPrice: 99.99, slippageBps: 1, signalAt: 1000, sentAt: 1010, ackAt: 1050, confirmAt: 1190, confirmSource: 'ws', status: '已成交' }],
-  }), 'WS · 180 ms · A滑点 +1.0 bps（共 1 笔单）');
+  }), 'WS · 180 ms · 第一腿滑点 +1.0 bps（共 1 笔单）');
   assert.equal(tradeTelemetrySummary({
     orders: [{ role: 'openA', leg: 'a', venue: 'lighter', side: 'sell', clientId: 1, qty: 1, filledQty: 1, expectedPrice: 100, limitPrice: 99.98, avgPrice: null, slippageBps: 280, signalAt: 1000, sentAt: 1010, ackAt: 1050, confirmAt: 1190, confirmSource: 'account', status: '已成交' }],
   }), '对账 · 180 ms（共 1 笔单）', '成交均价是估算时不把限价算出的滑点当成实际滑点');
@@ -396,12 +415,13 @@ test('live limit and exec ranges match the server and reject what it rejects', (
     [{ maxOpen: '21' }, '同时持仓（笔）须在 1 到 20 之间'],
     [{ maxOpen: '1.5' }, '同时持仓（笔）须为整数'],
     [{ dailyLossUsd: '' }, '当日亏损上限（美元）须填数字'],
-    [{ slippageBps: '301' }, 'B 腿与平仓限价保护（基点）须在 1 到 300 之间'],
+    [{ slippageBps: '301' }, '第二腿与平仓限价保护（基点）须在 1 到 300 之间'],
   ];
   for (const [patch, error] of cases) {
     assert.deepEqual(parseLiveLimits({ ...form, ...patch }), { ok: false, error });
     assert.throws(() => readLiveSettings({ on: false, pairs: [], limits: { ...DEFAULT_LIVE_SETTINGS.limits, ...Object.fromEntries(Object.entries(patch).map(([key, value]) => [key, value === '' ? null : Number(value)])) } }, () => true), undefined, `服务端同样拒绝 ${JSON.stringify(patch)}`);
   }
+  assert.deepEqual(parseLiveLimits({ ...form, dailyLossUsd: ' 5e\u22120 ' }), { ok: true, value: { ...DEFAULT_LIVE_SETTINGS.limits, dailyLossUsd: 5 } }, '校验与取值用同一种写法：全角减号当负号');
   assert.deepEqual(rangeFieldErrors(LIVE_LIMIT_FIELDS, form), {});
   assert.deepEqual(rangeFieldErrors(LIVE_LIMIT_FIELDS, { ...form, maxOpen: '0', slippageBps: 'abc' }), { maxOpen: '须为 1 到 20 的整数', slippageBps: '须为 1 到 300 之间的数' });
   assert.deepEqual(rangeFieldErrors(LIVE_EXEC_FIELDS, { ...liveExecForm(DEFAULT_LIVE_EXEC), confirmMs: '10001' }), { confirmMs: '须为 0 到 10000 的整数' });
@@ -422,6 +442,9 @@ test('live switch form follows the server only while the user has no unsaved edi
   assert.equal(followServerForm(submitted, base, afterSave), true, '保存成功：表单与新值一致，跟随');
   assert.equal(followServerForm({ ...submitted, pairs: ['a'] }, base, afterSave), false, '保存期间接着改的保留');
   assert.equal(followServerForm({ ...base, exec: { ...base.exec, autoSizeByBalance: false } }, base, next), false, '勾选框也算修改');
+  const otherLeg = { ...base, exec: { ...base.exec, firstLeg: 'a' } };
+  assert.equal(sameLiveForm(otherLeg, base), false, '先发腿也算修改');
+  assert.equal(followServerForm(otherLeg, base, next), false);
 });
 
 const order = (role, extra = {}) => ({ role, leg: role.endsWith('B') ? 'b' : 'a', venue: 'lighter', side: 'buy', clientId: 1, qty: 1, filledQty: 1, expectedPrice: 100, limitPrice: 100, avgPrice: 100, slippageBps: 1, signalAt: 900, sentAt: 1000, ackAt: 1050, confirmAt: 1200, confirmSource: 'ws', status: '已成交', ...extra });
@@ -443,7 +466,7 @@ test('order telemetry stats by role: counts, fill rate, slippage and latency qua
   ]);
   assert.equal(stats.positions, 3);
   assert.equal(stats.orders, 8);
-  assert.deepEqual(stats.roles.map(item => [item.role, item.label, item.orders]), [['openA', '开仓 A 腿', 3], ['openB', '开仓 B 腿', 2], ['closeA', '平仓 A 腿', 1], ['closeB', '平仓 B 腿', 1], ['flatten', '回补', 1]]);
+  assert.deepEqual(stats.roles.map(item => [item.role, item.label, item.orders]), [['openA', '开仓第一腿', 3], ['openB', '开仓第二腿', 2], ['closeA', '平仓 A 腿', 1], ['closeB', '平仓 B 腿', 1], ['flatten', '回补', 1]]);
   const openA = stats.roles[0];
   assert.deepEqual([openA.slipMean, openA.slipP50, openA.slipP90], [3, 3, 4.6]);
   assert.deepEqual([openA.confirmP50, openA.confirmP90], [400, 560]);
@@ -476,8 +499,8 @@ test('live trades: only filled positions are listed, outcomes are counted with t
   assert.deepEqual(untradedPositions(trades).map(item => item.id), ['nf2', 'nf1', 'o1']);
   assert.deepEqual(outcomeCounts(trades), { traded: 2, notFilled: 2, other: 1, singleLeg: 1, unsent: 1 });
   const abnormal = closed('b-only', now, 0, 1, 'manual');
-  assert.deepEqual(outcomeCounts([abnormal]), { traded: 0, notFilled: 0, other: 1, singleLeg: 0, unsent: 0 }, '异常历史只有 B 腿有量时不算 A 腿成功，与服务端汇总一致');
-  assert.equal(tradedPositions({ trades: [abnormal] }).length, 1, '异常记录仍留在成交表里供人工核对');
+  assert.deepEqual(outcomeCounts([abnormal]), { traded: 1, notFilled: 0, other: 0, singleLeg: 0, unsent: 0 }, '只有 B 腿有量（先发 B 腿、A 腿没对冲上）也算有成交，与服务端汇总一致');
+  assert.equal(tradedPositions({ trades: [abnormal] }).length, 1);
   assert.equal(firstLegSent(trades[0]), true);
   assert.equal(firstLegSent(trades[1]), false);
   assert.equal(firstLegSent({ note: '此刻的卖一已越过限价', orders: [{ role: 'openA' }] }), true, '逐单记录里有开仓 A 腿就是发出去过');

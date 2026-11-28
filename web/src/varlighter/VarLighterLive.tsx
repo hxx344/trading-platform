@@ -10,7 +10,7 @@ import type { LiveExecSettings, LivePosition, LiveState } from '../../../src/var
 import type { EntropyCostView, LiveView } from '../../../src/varlighter/views.ts';
 import { Badge, Metric, stampText, useWrite } from './parts.tsx';
 import {
-  LIVE_EXEC_FIELDS, LIVE_LIMIT_FIELDS, VARLIGHTER_BASE, age, bps, breakdownRows, directionLabel, duration, firstLegMissRate, firstLegMissed, followServerForm, liveOutcomes, liveSwitchForm, msText, orderTelemetryStats, outcomeText, pairLabel, parseLiveExec, sameLiveForm, parseLiveLimits, percent, plain,
+  LIVE_FIRST_LEG_OPTIONS, LIVE_LIMIT_FIELDS, VARLIGHTER_BASE, age, bps, breakdownRows, directionLabel, duration, firstLegMissRate, firstLegMissed, followServerForm, liveExecFields, liveOutcomes, liveSwitchForm, msText, orderTelemetryStats, outcomeText, pairLabel, parseLiveExec, sameLiveForm, parseLiveLimits, percent, plain,
   positionMarkCells, price, rangeFieldErrors, reasonLabel, rebateAudit, signedUsd, tone, tradeTelemetrySummary, tradedPositions, untradedPositions, usd, varLighterHref, venueShort, type BreakdownKind, type LiveSwitchForm,
 } from './varlighter-form.ts';
 
@@ -93,9 +93,10 @@ function SwitchPanel({ view, onChanged }: { view: LiveView; onChanged: () => Pro
   const setPairs = (update: (list: string[]) => string[]) => setForm(value => ({ ...value, pairs: update(value.pairs) }));
   const loadServer = () => { setForm(liveSwitchForm(saved, savedExec)); setDiverged(false); };
   const parsed = parseLiveLimits(limits);
-  const parsedExec = parseLiveExec(execForm);
+  const execFields = liveExecFields(savedExec);
+  const parsedExec = parseLiveExec(execForm, execFields);
   const limitErrors = rangeFieldErrors(LIVE_LIMIT_FIELDS, limits);
-  const execErrors = rangeFieldErrors(LIVE_EXEC_FIELDS, execForm);
+  const execErrors = rangeFieldErrors(execFields, execForm);
   const pairsRef = useRef(pairs);
   pairsRef.current = pairs;
   const parsedRef = useRef(parsed);
@@ -169,9 +170,14 @@ function SwitchPanel({ view, onChanged }: { view: LiveView; onChanged: () => Pro
     </div>
     <h3 className="vl-live-sub">执行优化</h3>
     <div className="vl-fields">
-      {LIVE_EXEC_FIELDS.map(field => { const error = execErrors[field.key]; return <label className="vl-field" key={field.key}>{field.label}
-        <input inputMode="decimal" aria-invalid={error ? true : undefined} value={execForm[field.key]} onChange={event => { const text = event.target.value; setForm(value => ({ ...value, exec: { ...value.exec, [field.key]: text } })); }} />
+      {execFields.map(field => { const error = execErrors[field.key]; return <label className="vl-field" key={field.key}>{field.label}
+        <input inputMode={field.min < 0 ? 'text' : 'decimal'} aria-invalid={error ? true : undefined} value={execForm[field.key]} onChange={event => { const text = event.target.value; setForm(value => ({ ...value, exec: { ...value.exec, [field.key]: text } })); }} />
         <small className={error ? 'vl-warn' : undefined}>{error ?? field.hint}</small></label>; })}
+      {execForm.firstLeg === undefined ? null : <label className="vl-field">开仓先发哪条腿
+        <select value={execForm.firstLeg} disabled={write.busy !== null} onChange={event => { const firstLeg = event.target.value as LiveExecSettings['firstLeg']; setForm(value => ({ ...value, exec: { ...value.exec, firstLeg } })); }}>
+          {LIVE_FIRST_LEG_OPTIONS.map(item => <option key={item.value} value={item.value}>{item.label}</option>)}</select>
+        <small>默认先发 Entropy 腿（下单同步返回成交），另一条腿按它的实际成交量对冲；两腿都不是或都是 Entropy 时先发 A 腿</small>
+      </label>}
       <label className="vl-field vl-live-check"><span>余额自适应</span>
         <span className="vl-live-checkrow"><input type="checkbox" checked={execForm.autoSizeByBalance} disabled={write.busy !== null} onChange={event => { const on = event.target.checked; setForm(value => ({ ...value, exec: { ...value.exec, autoSizeByBalance: on } })); }} />余额不足按 95% 自动缩量</span>
         <small>可用余额 × 倍率上限不足单笔名义时按 95% 自动缩量，避免整笔拒单</small>
@@ -183,7 +189,7 @@ function SwitchPanel({ view, onChanged }: { view: LiveView; onChanged: () => Pro
       {!parsed.ok ? <Callout tone="warning" role="status">{parsed.error}</Callout> : !parsedExec.ok ? <Callout tone="warning" role="status">{parsedExec.error}</Callout> : null}
       {write.message ? <Callout tone={write.message.tone}>{write.message.text}</Callout> : null}
     </div>
-    <p className="vl-note">实盘只用专门的账户：这些账户上不要手动开仓，也不要让别的程序交易，否则持仓对不上会自动停止。第二腿没成交时，第一腿多出的部分会立即反向平掉（记一次单腿）；同一配对连续两次单腿会暂停该配对。</p>
+    <p className="vl-note">实盘只用专门的账户：这些账户上不要手动开仓，也不要让别的程序交易，否则持仓对不上会自动停止。第二腿在等待时限内重试后仍没补齐时，第一腿多出的部分会反向平掉（记一次单腿）；同一配对连续两次单腿会暂停该配对。</p>
   </section>;
 }
 /** 各场所的下单凭据：只写不读，提交后清空输入框。 */
@@ -313,7 +319,7 @@ function TradesPanel({ view, traded }: { view: LiveView; traded: LivePosition[] 
   </div>;
 }
 
-/** 有成交持仓的逐单遥测按角色汇总，加上第一腿未成交率与单腿次数。逐单遥测只有有成交的持仓，开仓 A 腿在里面必然成交，它的成交率改用开仓结果计数算。 */
+/** 有成交持仓的逐单遥测按角色汇总，加上第一腿未成交率与单腿次数。逐单遥测只有有成交的持仓，开仓第一腿在里面必然成交，它的成交率改用开仓结果计数算。 */
 function ExecQualityPanel({ view, traded }: { view: LiveView; traded: LivePosition[] }) {
   const stats = orderTelemetryStats(traded);
   const outcomes = liveOutcomes(view);
@@ -326,7 +332,7 @@ function ExecQualityPanel({ view, traded }: { view: LiveView; traded: LivePositi
       <Metric label="单腿" value={`${total.singleLeg} 次`} tone={total.singleLeg ? 'down' : ''} foot={`有成交 ${total.traded} 笔里（${scope}）`} />
     </section>
     {stats.roles.length ? <div className="vl-table"><table>
-      <thead><tr><th>角色</th><th className="num">笔数</th><th className="num">成交率</th><th className="num" title="逆向滑点（基点）；没成交、缺预期价、成交均价是估算的不计">滑点均值</th><th className="num">滑点 P50 / P90</th><th className="num" title="发出到拿到成交结果">发单→确认 P50 / P90</th><th className="num" title="信号时刻到发出这笔单；开仓 B 腿从 A 腿确认成交算起">信号→发单 P50</th><th>确认来源</th></tr></thead>
+      <thead><tr><th>角色</th><th className="num">笔数</th><th className="num">成交率</th><th className="num" title="逆向滑点（基点）；没成交、缺预期价、成交均价是估算的不计">滑点均值</th><th className="num">滑点 P50 / P90</th><th className="num" title="发出到拿到成交结果">发单→确认 P50 / P90</th><th className="num" title="信号时刻到发出这笔单；开仓第二腿从第一腿确认成交算起">信号→发单 P50</th><th>确认来源</th></tr></thead>
       <tbody>{stats.roles.map(item => <tr key={item.role}>
         <td>{item.label}</td>
         <td className="num">{item.orders}<small>有成交 {item.filled}</small></td>

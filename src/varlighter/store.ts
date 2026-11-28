@@ -237,11 +237,11 @@ export function openVarLighterStore(file: string) {
   const liveActive = db.prepare("SELECT json FROM live_positions WHERE state <> 'closed' ORDER BY opened_at");
   const liveClosed = db.prepare("SELECT json FROM live_positions WHERE state = 'closed' ORDER BY closed_at DESC LIMIT ?");
   const liveNetSince = db.prepare("SELECT COALESCE(SUM(net_usd), 0) AS net FROM live_positions WHERE state = 'closed' AND closed_at >= ?");
-  const liveTotals = db.prepare("SELECT COUNT(*) AS n, COALESCE(SUM(net_usd), 0) AS net, SUM(CASE WHEN net_usd > 0 THEN 1 ELSE 0 END) AS wins FROM live_positions WHERE state = 'closed' AND json_extract(json, '$.a.qty') > 0");
-  const liveTradedClosed = db.prepare("SELECT json FROM live_positions WHERE state = 'closed' AND json_extract(json, '$.a.qty') > 0 ORDER BY closed_at DESC LIMIT ?");
+  const liveTotals = db.prepare("SELECT COUNT(*) AS n, COALESCE(SUM(net_usd), 0) AS net, SUM(CASE WHEN net_usd > 0 THEN 1 ELSE 0 END) AS wins FROM live_positions WHERE state = 'closed' AND (json_extract(json, '$.a.qty') > 0 OR json_extract(json, '$.b.qty') > 0)");
+  const liveTradedClosed = db.prepare("SELECT json FROM live_positions WHERE state = 'closed' AND (json_extract(json, '$.a.qty') > 0 OR json_extract(json, '$.b.qty') > 0) ORDER BY closed_at DESC LIMIT ?");
   const liveSummary = db.prepare(`SELECT symbol, CAST(closed_at / 86400000 AS INTEGER) AS day, COALESCE(json_extract(json, '$.closeReason'), '') AS reason,
-    json_extract(json, '$.a.qty') > 0 AS traded, COALESCE(json_extract(json, '$.singleLeg'), 0) AS single,
-    (json_extract(json, '$.a.qty') > 0 OR instr(COALESCE(json_extract(json, '$.note'), ''), '${FIRST_LEG_MISSED_NOTE}') > 0
+    (json_extract(json, '$.a.qty') > 0 OR json_extract(json, '$.b.qty') > 0) AS traded, COALESCE(json_extract(json, '$.singleLeg'), 0) AS single,
+    (json_extract(json, '$.a.qty') > 0 OR json_extract(json, '$.b.qty') > 0 OR instr(COALESCE(json_extract(json, '$.note'), ''), '${FIRST_LEG_MISSED_NOTE}') > 0
       OR EXISTS (SELECT 1 FROM json_each(live_positions.json, '$.orders') AS sent_order WHERE json_extract(sent_order.value, '$.role') = 'openA')) AS sent,
     COUNT(*) AS n, COALESCE(SUM(net_usd), 0) AS net, SUM(CASE WHEN net_usd > 0 THEN 1 ELSE 0 END) AS wins
     FROM live_positions WHERE state = 'closed' AND closed_at IS NOT NULL GROUP BY 1, 2, 3, 4, 5, 6`);

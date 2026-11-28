@@ -45,7 +45,19 @@ export function limitPrice(leg: LegInfo, side: 'buy' | 'sell', expected: number,
   return [rounded, rounded.toFixed(decimals)];
 }
 
-export function orderPlan(pair: PairInfo, sample: Sample, direction: Direction, notionalUsd: number, maxSlippageBps: number, now: number, legBSlippageBps = maxSlippageBps): OrderPlan {
+/**
+ * 第二腿的经济边界价（第二腿的原价，docs/dexspread.md 第 23 节）：第一腿已按 leadPrice 成交，第二腿成交在这个价以内（买不高于、卖不低于）时，
+ * 这一对的价差相对基线仍留有 edgeBps。价差按 (A − 乘数 × B) ÷ (乘数 × B) 算（基点）；spreadOf 的分母是 B 的中间价，两者只差基点的万分之几。算不出来返回 null。
+ */
+export function hedgeBound(direction: Direction, lead: 'a' | 'b', leadPrice: number, ratio: number, baselineBps: number, edgeBps: number): number | null {
+  const keep = 1 + (direction === 'a_rich' ? baselineBps + edgeBps : baselineBps - edgeBps) / 10_000;
+  if (!(keep > 0 && leadPrice > 0 && ratio > 0)) return null;
+  const bound = lead === 'a' ? leadPrice / (ratio * keep) : leadPrice * ratio * keep;
+  return Number.isFinite(bound) && bound > 0 ? bound : null;
+}
+
+/** maxSlippageBps 与 legBSlippageBps 是 A 腿、B 腿的限价滑点；lead 是两腿都是限价簿时先下哪条（带 Var 腿的配对总是先下 Var）。 */
+export function orderPlan(pair: PairInfo, sample: Sample, direction: Direction, notionalUsd: number, maxSlippageBps: number, now: number, legBSlippageBps = maxSlippageBps, lead: 'a' | 'b' = 'a'): OrderPlan {
   const checks: PlanCheck[] = [], k = pair.ratio, aName = VENUE_NAMES[pair.a.venue], bName = VENUE_NAMES[pair.b.venue];
   const spread = spreadOf(sample, bucketOf(notionalUsd));
   const rich = direction === 'a_rich';
@@ -90,8 +102,8 @@ export function orderPlan(pair: PairInfo, sample: Sample, direction: Direction, 
     { venue: pair.a.venue, side: aSide, qty: aQtyText, expected: aExpected, limit: aLimitText, notionalUsd: aQty * aExpected, fields: legFields(pair.a, aSide, aQty, aQtyText, aLimit, aLimitText, slipA) },
     { venue: pair.b.venue, side: bSide, qty: bQtyText, expected: bExpected, limit: bLimitText, notionalUsd: bQty * bExpected, fields: legFields(pair.b, bSide, bQty, bQtyText, bLimit, bLimitText, slipB) },
   ];
-  // 先下没有盘口、按询价成交的 Var；两腿都是限价簿时先下 A。
-  const [first, second] = !isLive(pair.b.venue) ? [1, 0] : [0, 1];
+  // 先下没有盘口、按询价成交的 Var；两腿都是限价簿时按 lead（默认 A）。
+  const [first, second] = !isLive(pair.b.venue) || (lead === 'b' && isLive(pair.a.venue)) ? [1, 0] : [0, 1];
   const verb = (side: 'buy' | 'sell') => side === 'buy' ? '买入' : '卖出';
   const firstLeg = legs[first], secondLeg = legs[second], firstName = VENUE_NAMES[firstLeg.venue], secondName = VENUE_NAMES[secondLeg.venue];
   const firstText = firstLeg.venue === 'var' ? `1. Var 按询价成交 ${verb(firstLeg.side)} ${firstLeg.qty}，成交价劣于 ${firstLeg.limit} 即放弃本次机会` : `1. ${firstName} 下 IOC 限价单 ${verb(firstLeg.side)} ${firstLeg.qty}，限价 ${firstLeg.limit}，未成交即放弃本次机会`;
@@ -100,8 +112,8 @@ export function orderPlan(pair: PairInfo, sample: Sample, direction: Direction, 
     sequence: [
       firstText,
       `2. 按 ${firstName} 实际成交数量${k === 1 ? '' : `（× 乘数 ${k}）`}在 ${secondName}${isLive(secondLeg.venue) && pair[second === 0 ? 'a' : 'b'].venue !== 'entropy' ? `（市场 ${pair[second === 0 ? 'a' : 'b'].market.id}）` : ''} 下 IOC 限价单 ${verb(secondLeg.side)}，限价 ${secondLeg.limit}`,
-      `3. ${secondName} 未成交或部分成交：剩余数量在 ${firstName} 反向平掉，记一次单腿事件；连续两次单腿暂停该配对`,
-      `4. 平仓顺序相同，${firstName} 先、${secondName} 后，${secondName} 用只减仓（reduce_only）`,
+      `3. ${secondName} 未成交或部分成交：在时限内按同一限价重试，仍没补齐的数量在 ${firstName} 反向平掉，记一次单腿事件；连续两次单腿暂停该配对`,
+      `4. 平仓时两腿同时下只减仓（reduce_only）的 IOC 限价单`,
     ],
   };
 }

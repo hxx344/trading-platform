@@ -436,25 +436,39 @@ export const accountPnlTone = (value: number | null | undefined): 'up' | 'down' 
 // ---- 实盘执行优化与订单遥测 ----
 /** 与 src/varlighter/live.ts 的 LIVE_LIMIT_RANGES、LIVE_EXEC_RANGES 一致（页面不引入后端模块的值，web/test/varlighter-form.test.mjs 断言两边相同）。 */
 export const LIVE_LIMIT_RANGES = { perTradeUsd: [10, 100_000], maxOpen: [1, 20], dailyLossUsd: [1, 100_000], slippageBps: [1, 300] } as const;
-export const LIVE_EXEC_RANGES = { openLegASlippageBps: [0, 30], confirmMs: [0, 10_000], notFilledCooldownSec: [5, 3_600], maxLeverage: [1, 5] } as const;
+export const LIVE_EXEC_RANGES = {
+  openLegASlippageBps: [0, 30], confirmMs: [0, 10_000], notFilledCooldownSec: [5, 3_600], maxLeverage: [1, 5],
+  hedgeWaitSec: [0, 30], hedgeRetryMs: [200, 5_000], hedgeAbortBps: [1, 300], hedgeEdgeBps: [0, 100], revertMinNetBps: [-100, 100],
+} as const;
+/** 开仓先发哪条腿（与 src/varlighter/live.ts 的 LIVE_FIRST_LEGS 一致）。 */
+export const LIVE_FIRST_LEG_OPTIONS: readonly { value: LiveExecSettings['firstLeg']; label: string }[] = [
+  { value: 'entropy', label: '只有一条 Entropy 腿时先发它' }, { value: 'a', label: '固定先发 A 腿' },
+];
 type RangeField<K extends string> = { key: K; label: string; min: number; max: number; integer?: boolean; hint: string };
 export type LiveLimitsForm = Record<keyof LiveLimits, string>;
 export const LIVE_LIMIT_FIELDS: readonly RangeField<keyof LiveLimits>[] = [
   { key: 'perTradeUsd', label: '单笔名义（美元）', min: LIVE_LIMIT_RANGES.perTradeUsd[0], max: LIVE_LIMIT_RANGES.perTradeUsd[1], hint: '10–100000；每笔取它与配对参数里名义金额中较小的一个' },
   { key: 'maxOpen', label: '同时持仓（笔）', min: LIVE_LIMIT_RANGES.maxOpen[0], max: LIVE_LIMIT_RANGES.maxOpen[1], integer: true, hint: '1–20 的整数；到上限后不再开新仓' },
   { key: 'dailyLossUsd', label: '当日亏损上限（美元）', min: LIVE_LIMIT_RANGES.dailyLossUsd[0], max: LIVE_LIMIT_RANGES.dailyLossUsd[1], hint: '1–100000；UTC 日内已实现亏损到这个数就不再开仓' },
-  { key: 'slippageBps', label: 'B 腿与平仓限价保护（基点）', min: LIVE_LIMIT_RANGES.slippageBps[0], max: LIVE_LIMIT_RANGES.slippageBps[1], hint: '1–300；开仓对冲 B 腿与平仓 IOC 限价离预期价最多这么远' },
+  { key: 'slippageBps', label: '第二腿与平仓限价保护（基点）', min: LIVE_LIMIT_RANGES.slippageBps[0], max: LIVE_LIMIT_RANGES.slippageBps[1], hint: '1–300；开仓第二腿与平仓 IOC 限价离一档最多这么远' },
 ];
-export interface LiveExecForm { openLegASlippageBps: string; confirmMs: string; notFilledCooldownSec: string; maxLeverage: string; autoSizeByBalance: boolean }
-export const LIVE_EXEC_FIELDS: readonly RangeField<'openLegASlippageBps' | 'confirmMs' | 'notFilledCooldownSec' | 'maxLeverage'>[] = [
-  { key: 'openLegASlippageBps', label: '开仓 A 腿滑点（基点）', min: LIVE_EXEC_RANGES.openLegASlippageBps[0], max: LIVE_EXEC_RANGES.openLegASlippageBps[1], hint: '默认 2（0–30），收紧第一腿限价减少逆向吃单' },
+type LiveExecNumberKey = keyof typeof LIVE_EXEC_RANGES;
+export type LiveExecForm = Record<LiveExecNumberKey, string> & { autoSizeByBalance: boolean; firstLeg: LiveExecSettings['firstLeg'] | undefined };
+export const LIVE_EXEC_FIELDS: readonly RangeField<LiveExecNumberKey>[] = [
+  { key: 'openLegASlippageBps', label: '开仓第一腿滑点（基点）', min: LIVE_EXEC_RANGES.openLegASlippageBps[0], max: LIVE_EXEC_RANGES.openLegASlippageBps[1], hint: '默认 2（0–30），收紧第一腿限价减少逆向吃单' },
   { key: 'confirmMs', label: '信号持续确认（毫秒）', min: LIVE_EXEC_RANGES.confirmMs[0], max: LIVE_EXEC_RANGES.confirmMs[1], integer: true, hint: '默认 0 不延迟（0–10000 的整数）；设 >0 需信号连续维持该时长才开仓' },
-  { key: 'notFilledCooldownSec', label: 'A 腿未成冷却（秒）', min: LIVE_EXEC_RANGES.notFilledCooldownSec[0], max: LIVE_EXEC_RANGES.notFilledCooldownSec[1], integer: true, hint: '默认 30 秒（5–3600 的整数），与真实成交冷却分离' },
+  { key: 'notFilledCooldownSec', label: '第一腿未成冷却（秒）', min: LIVE_EXEC_RANGES.notFilledCooldownSec[0], max: LIVE_EXEC_RANGES.notFilledCooldownSec[1], integer: true, hint: '默认 30 秒（5–3600 的整数），与真实成交冷却分离' },
   { key: 'maxLeverage', label: '保证金倍率上限', min: LIVE_EXEC_RANGES.maxLeverage[0], max: LIVE_EXEC_RANGES.maxLeverage[1], hint: '默认 1（1–5×），>1 按可用余额 × 倍率 × 95% 估算上限；须先在各交易所设好 >= 该倍率杠杆' },
+  { key: 'hedgeWaitSec', label: '第二腿等待（秒）', min: LIVE_EXEC_RANGES.hedgeWaitSec[0], max: LIVE_EXEC_RANGES.hedgeWaitSec[1], hint: '默认 3（0–30）；第二腿没补齐时在限价内重试这么久再回补第一腿，0 为立刻回补' },
+  { key: 'hedgeRetryMs', label: '第二腿重试间隔（毫秒）', min: LIVE_EXEC_RANGES.hedgeRetryMs[0], max: LIVE_EXEC_RANGES.hedgeRetryMs[1], integer: true, hint: '默认 500（200–5000 的整数）' },
+  { key: 'hedgeAbortBps', label: '等待中放弃（基点）', min: LIVE_EXEC_RANGES.hedgeAbortBps[0], max: LIVE_EXEC_RANGES.hedgeAbortBps[1], hint: '默认 10（1–300）；等第二腿期间第一腿回补价不利超过它就立刻回补' },
+  { key: 'hedgeEdgeBps', label: '第二腿经济边界（基点）', min: LIVE_EXEC_RANGES.hedgeEdgeBps[0], max: LIVE_EXEC_RANGES.hedgeEdgeBps[1], hint: '默认 5（0–100）；按第一腿实际成交价，对冲后离基线至少还剩这么多时可比限价保护更宽' },
+  { key: 'revertMinNetBps', label: '回归平仓保利（基点）', min: LIVE_EXEC_RANGES.revertMinNetBps[0], max: LIVE_EXEC_RANGES.revertMinNetBps[1], hint: '默认 0（-100 到 100）；回归平仓前两次的限价按最坏成交仍保住这么多净利收紧，-100 为关闭' },
 ];
 /** 一个数字输入是否在服务端接受的范围里；不合规时返回带字段名的说明。 */
+const numberText = (raw: string): string => raw.trim().replace(/\u2212/g, '-');
 function rangeError(field: RangeField<string>, raw: string): string | null {
-  const trimmed = raw.trim(), value = Number(trimmed);
+  const trimmed = numberText(raw), value = Number(trimmed);
   if (!trimmed || !Number.isFinite(value)) return `${field.label}须填数字`;
   if (field.integer && !Number.isInteger(value)) return `${field.label}须为整数`;
   if (value < field.min || value > field.max) return `${field.label}须在 ${field.min} 到 ${field.max} 之间`;
@@ -473,23 +487,27 @@ export function parseLiveLimits(form: LiveLimitsForm): Parsed<LiveLimits> {
   for (const field of LIVE_LIMIT_FIELDS) {
     const error = rangeError(field, form[field.key]);
     if (error) return { ok: false, error };
-    out[field.key] = Number(form[field.key].trim());
+    out[field.key] = Number(numberText(form[field.key]));
   }
   return { ok: true, value: out };
 }
-export const liveExecForm = (exec: LiveExecSettings): LiveExecForm => ({
-  openLegASlippageBps: String(exec.openLegASlippageBps),
-  confirmMs: String(exec.confirmMs),
-  notFilledCooldownSec: String(exec.notFilledCooldownSec),
-  maxLeverage: String(exec.maxLeverage),
+/**
+ * 服务端返回的执行参数里有的数字字段。DEX 价差服务比页面旧时（单独回退）没有后加的字段：
+ * 页面不显示也不提交它们，旧服务端会拒绝不认识的键。
+ */
+export const liveExecFields = (exec: Partial<LiveExecSettings>): readonly RangeField<LiveExecNumberKey>[] => LIVE_EXEC_FIELDS.filter(field => exec[field.key] !== undefined);
+export const liveExecForm = (exec: Partial<LiveExecSettings> & Pick<LiveExecSettings, 'autoSizeByBalance'>): LiveExecForm => ({
+  ...Object.fromEntries(LIVE_EXEC_FIELDS.map(field => [field.key, exec[field.key] === undefined ? '' : String(exec[field.key])])) as Record<LiveExecNumberKey, string>,
   autoSizeByBalance: exec.autoSizeByBalance,
+  firstLeg: exec.firstLeg,
 });
-export function parseLiveExec(form: LiveExecForm): Parsed<LiveExecSettings> {
-  const out = { autoSizeByBalance: form.autoSizeByBalance } as LiveExecSettings;
-  for (const field of LIVE_EXEC_FIELDS) {
+/** fields 传 liveExecFields(服务端的执行参数)；不传按全部字段。 */
+export function parseLiveExec(form: LiveExecForm, fields: readonly RangeField<LiveExecNumberKey>[] = LIVE_EXEC_FIELDS): Parsed<LiveExecSettings> {
+  const out = { autoSizeByBalance: form.autoSizeByBalance, ...(form.firstLeg !== undefined && { firstLeg: form.firstLeg }) } as LiveExecSettings;
+  for (const field of fields) {
     const error = rangeError(field, form[field.key]);
     if (error) return { ok: false, error };
-    out[field.key] = Number(form[field.key].trim());
+    out[field.key] = Number(numberText(form[field.key]));
   }
   return { ok: true, value: out };
 }
@@ -498,9 +516,9 @@ export function parseLiveExec(form: LiveExecForm): Parsed<LiveExecSettings> {
 export interface LiveSwitchForm { pairs: string[]; limits: LiveLimitsForm; exec: LiveExecForm }
 export const liveSwitchForm = (settings: Pick<LiveSettings, 'pairs' | 'limits'>, exec: LiveExecSettings): LiveSwitchForm =>
   ({ pairs: [...settings.pairs], limits: liveLimitsForm(settings.limits), exec: liveExecForm(exec) });
-const formValue = (raw: string): number | string => { const trimmed = raw.trim(), value = Number(trimmed); return trimmed && Number.isFinite(value) ? value : trimmed; };
+const formValue = (raw: string): number | string => { const trimmed = numberText(raw), value = Number(trimmed); return trimmed && Number.isFinite(value) ? value : trimmed; };
 const liveFormKey = (form: LiveSwitchForm): string => JSON.stringify([
-  [...new Set(form.pairs)].sort(), LIVE_LIMIT_FIELDS.map(field => formValue(form.limits[field.key])), LIVE_EXEC_FIELDS.map(field => formValue(form.exec[field.key])), form.exec.autoSizeByBalance,
+  [...new Set(form.pairs)].sort(), LIVE_LIMIT_FIELDS.map(field => formValue(form.limits[field.key])), LIVE_EXEC_FIELDS.map(field => formValue(form.exec[field.key])), form.exec.autoSizeByBalance, form.exec.firstLeg,
 ]);
 /** 两份表单代表的设置是否相同（配对不计顺序，「100」与「100.0」相同）。 */
 export const sameLiveForm = (a: LiveSwitchForm, b: LiveSwitchForm): boolean => liveFormKey(a) === liveFormKey(b);
@@ -517,7 +535,7 @@ export function tradeTelemetrySummary(trade: Pick<LivePosition, 'orders'>): stri
   const openA = orders.find(item => item.role === 'openA') ?? orders[0]!;
   const src = CONFIRM_SOURCE_LABEL[openA.confirmSource] ?? openA.confirmSource;
   const ms = Math.max(0, Math.round(openA.confirmAt - openA.sentAt));
-  const slip = openA.slippageBps === null || openA.avgPrice === null ? '' : ` · A滑点 ${openA.slippageBps >= 0 ? '+' : ''}${openA.slippageBps.toFixed(1)} bps`;
+  const slip = openA.slippageBps === null || openA.avgPrice === null ? '' : ` · 第一腿滑点 ${openA.slippageBps >= 0 ? '+' : ''}${openA.slippageBps.toFixed(1)} bps`;
   return `${src} · ${ms} ms${slip}（共 ${orders.length} 笔单）`;
 }
 
@@ -574,7 +592,7 @@ export function outcomeCounts(trades: readonly ClosedPosition[], from = -Infinit
   const counts: LiveOutcomeCounts = { traded: 0, notFilled: 0, other: 0, singleLeg: 0, unsent: 0 };
   for (const item of trades) {
     if (closedTime(item) < from) continue;
-    if (item.a.qty > 0) { counts.traded++; if (item.singleLeg) counts.singleLeg++; }
+    if (hasFill(item)) { counts.traded++; if (item.singleLeg) counts.singleLeg++; }
     else if (item.closeReason === 'not_filled') { counts.notFilled++; if (!firstLegSent(item)) counts.unsent = (counts.unsent ?? 0) + 1; }
     else counts.other++;
   }
@@ -582,7 +600,7 @@ export function outcomeCounts(trades: readonly ClosedPosition[], from = -Infinit
 }
 /**
  * 第一腿没成交的记录里第一腿有没有发出去（与 src/varlighter/live-summary.ts 的 firstLegSent 相同）：
- * 逐单记录里有开仓 A 腿，或说明写着第一腿没有成交（v0.112.x 没有逐单记录）；其余是发单前放弃的（意图过期、发单前复核没过）。
+ * 逐单记录里有开仓第一腿（角色 openA），或说明写着第一腿没有成交（v0.112.x 没有逐单记录）；其余是发单前放弃的（意图过期、发单前复核没过）。
  */
 export const firstLegSent = (position: Pick<LivePosition, 'orders' | 'note'>): boolean =>
   position.orders?.some(order => order.role === 'openA') === true || (position.note ?? '').includes('第一腿没有成交');
@@ -600,7 +618,7 @@ export const firstLegMissRate = (counts: LiveOutcomeCounts): number | null => { 
 
 // ---- 逐单遥测汇总 ----
 export const ORDER_ROLES: readonly { role: LiveOrderRole; label: string }[] = [
-  { role: 'openA', label: '开仓 A 腿' }, { role: 'openB', label: '开仓 B 腿' }, { role: 'closeA', label: '平仓 A 腿' }, { role: 'closeB', label: '平仓 B 腿' }, { role: 'flatten', label: '回补' },
+  { role: 'openA', label: '开仓第一腿' }, { role: 'openB', label: '开仓第二腿' }, { role: 'closeA', label: '平仓 A 腿' }, { role: 'closeB', label: '平仓 B 腿' }, { role: 'flatten', label: '回补' },
 ];
 /** 分位数（线性插值）；没有样本为 null，单个样本就是它本身。 */
 export function quantile(values: readonly number[], q: number): number | null {
